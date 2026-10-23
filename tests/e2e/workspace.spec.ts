@@ -14,6 +14,8 @@ test('seven calibrated views, cuboid edit and persistence across reload', async 
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   await expect(page.locator('.camera-grid .camera-card')).toHaveCount(7);
   await expect(page.getByLabel('三维点云标注视图')).toBeVisible();
   await expect(page.getByText('无法初始化 WebGL', { exact: false })).toHaveCount(0);
@@ -24,6 +26,8 @@ test('seven calibrated views, cuboid edit and persistence across reload', async 
   await page.getByLabel('保存标注', { exact: true }).click();
   expect((await saved).ok()).toBeTruthy();
   await page.reload();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('.object-row').first().click();
   await expect(page.getByLabel('位置X', { exact: true })).toHaveValue('18.75');
   await page.getByLabel('下一帧', { exact: true }).click();
@@ -43,6 +47,8 @@ test('seven calibrated views, cuboid edit and persistence across reload', async 
 test('draw a lane and image polygon and export a semantic mask', async ({ page, request }) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   const clip = await (await request.get('/api/clips/demo')).json();
   const path = `/api/clips/demo/frames/${clip.frames[0].id}/annotations`;
   const before = await (await request.get(path)).json();
@@ -78,15 +84,17 @@ test('draw a lane and image polygon and export a semantic mask', async ({ page, 
 test('map and occupancy jobs produce downloadable geometry', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('.task-button').filter({ hasText: '4D 点云地图' }).click();
-  await page.getByRole('button', { name: '融合 clip 静态地图', exact: true }).click();
-  await expect(page.locator('.job-status.completed small')).toHaveText('map');
+  await page.getByLabel('重建整个场景', {exact:true}).click();
+  await expect(page.locator('.reconstruction-panel .job-status.completed')).toBeVisible();
   const mapDownload = page.waitForEvent('download');
-  await page.getByLabel('导出计算结果', { exact: true }).click();
+  await page.getByLabel('导出场景地图', {exact:true}).click();
   expect((await mapDownload).suggestedFilename()).toContain('map');
   await page.locator('.task-button').filter({ hasText: 'OCC 真值转换' }).click();
-  await page.getByRole('button', { name: '转换当前帧 OCC', exact: true }).click();
-  await expect(page.locator('.job-status.completed small')).toHaveText('occupancy');
+  await page.getByRole('button', { name: '转换当前帧观测 OCC', exact: true }).click();
+  await expect(page.locator('.job-status.completed').filter({hasText: 'occupancy'}).locator('small')).toHaveText('occupancy');
   const occDownload = page.waitForEvent('download');
   await page.getByLabel('导出计算结果', { exact: true }).click();
   expect((await occDownload).suggestedFilename()).toContain('occupancy');
@@ -95,6 +103,8 @@ test('map and occupancy jobs produce downloadable geometry', async ({ page }) =>
 test('point brush edits original point labels and cancelling a frame switch preserves edits', async ({ page, request }) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   const clip = await (await request.get('/api/clips/demo')).json();
   const path = `/api/clips/demo/frames/${clip.frames[0].id}/annotations`;
   const before = await (await request.get(path)).json();
@@ -122,26 +132,28 @@ test('model response fixture remains unsaved until explicit human application an
   const proposal = structuredClone(before);
   proposal.boxes[0].center[0] = 36.6;
   await page.route('**/api/models', route => route.fulfill({ json: { models: [{
-    id: 'external-worker', name: 'Test worker fixture', tasks: ['prelabel-proposals'], available: true,
+    id: 'sam2', name: 'Test worker fixture', tasks: ['prelabel-proposals'], available: true,
     description: 'Browser-only response fixture, no actual model inference.', url: 'https://github.com/shizhenghe/OmniLabel',
   }] } }));
   await page.route('**/api/clips/demo/jobs', async route => {
     if (route.request().postDataJSON().kind !== 'prelabel') return route.continue();
     return route.fulfill({ status: 202, json: {
       id: 'test-proposal', kind: 'prelabel', status: 'completed',
-      result: { proposal, model_id: 'test-worker', model_version: 'test-fixture', review_required: true,
+      result: { proposal, model_id: 'sam2', model_version: 'test-fixture', review_required: true,
         source: 'external-worker', clip_id: 'demo', frame_id: clip.frames[0].id },
     } });
   });
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('.model-link').click();
-  await page.getByLabel('推理模型ID', { exact: true }).fill('test-worker');
-  await page.getByLabel('生成候选标注', { exact: true }).click();
-  await expect(page.getByRole('button', { name: '应用候选标注', exact: true })).toBeVisible();
+  await page.getByLabel('预标注模型', {exact:true}).last().selectOption('sam2');
+  await page.getByLabel('生成候选标注', { exact: true }).last().click();
+  await expect(page.getByRole('button', { name: '应用候选标注', exact: true }).last()).toBeVisible();
   expect(await (await request.get(path)).json()).toEqual(before);
   page.once('dialog', dialog => dialog.accept());
-  await page.getByRole('button', { name: '应用候选标注', exact: true }).click();
+  await page.getByRole('button', { name: '应用候选标注', exact: true }).last().click();
   await expect(page.getByLabel('保存标注', { exact: true })).toBeEnabled();
   expect(await (await request.get(path)).json()).toEqual(before);
   await saveAnnotations(page);
@@ -158,6 +170,8 @@ test('import a user clip through the actual file chooser', async ({ page }) => {
   };
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('input[type=file]').setInputFiles({ name: 'clip.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(clip)) });
   await expect(page.getByLabel('选择clip')).toHaveValue('zz-user-clip');
   await expect(page.locator('.camera-grid .camera-card')).toHaveCount(1);

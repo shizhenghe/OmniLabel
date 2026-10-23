@@ -1,0 +1,9 @@
+# Install inside each model's own environment, after its official dependencies.
+# FastAPI 0.95 also supports the older OpenOccupancy Python environment.
+fastapi==0.95.2
+uvicorn==0.20.0; python_version < "3.8"
+uvicorn==0.22.0; python_version >= "3.8"
+pydantic==1.10.13; python_version < "3.8"
+pydantic==1.10.21; python_version >= "3.8"
+pillow>=9.5.0,<12
+numpy>=1.21.6,<2

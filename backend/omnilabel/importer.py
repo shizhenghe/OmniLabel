@@ -102,7 +102,7 @@ def validate_image(data: bytes, expected_size: tuple[int, int] | None = None) ->
         raise ValueError("invalid image asset") from exc
 
 
-def parse_import(payload: bytes, filename: str, assets_root: Path):
+def parse_import(payload: bytes, filename: str, assets_root: Path, *, include_scene: bool = False):
     """Return validated clip, labels, staged asset directory, final asset namespace.
 
     Caller publishes the directory and clip transactionally; on failure it cleans
@@ -148,7 +148,9 @@ def parse_import(payload: bytes, filename: str, assets_root: Path):
     if not isinstance(clip_raw, dict):
         raise ValueError("clip must be an object")
     # Work on a copy; remove envelope fields when a manifest uses top-level clip fields.
-    clip_raw = {key: value for key, value in clip_raw.items() if key not in ("annotations", "schema_version")}
+    scene_fields = ("scene_annotations", "scene_map", "scene_registration")
+    scene_bundle = {key: raw[key] for key in scene_fields if key in raw}
+    clip_raw = {key: value for key, value in clip_raw.items() if key not in ("annotations", "schema_version", *scene_fields)}
     namespace = f"import-{uuid.uuid4().hex}"
     staging = Path(tempfile.mkdtemp(prefix=".import-", dir=assets_root))
     try:
@@ -198,7 +200,11 @@ def parse_import(payload: bytes, filename: str, assets_root: Path):
             raise ValueError("annotations reference an unknown frame")
         annotations = {frame_id: Annotations.model_validate(value).validate_for_frame(frame_map[frame_id], clip.cameras)
                        for frame_id, value in annotations_raw.items()}
-        return clip, annotations, staging, namespace
+        if scene_bundle:
+            from .scene import validate_scene_import
+            validate_scene_import(clip, scene_bundle.get("scene_annotations"), scene_bundle.get("scene_map"), scene_bundle.get("scene_registration"))
+        base = (clip, annotations, staging, namespace)
+        return (*base, scene_bundle) if include_scene else base
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise

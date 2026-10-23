@@ -12,3 +12,6 @@ playwright-report/
 .env
 .cache/
 .DS_Store
+.model-envs/
+.models/
+model_weights/

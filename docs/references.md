@@ -7,19 +7,19 @@
 | [CVAT](https://github.com/cvat-ai/cvat) | 任务与数据集管理、图像/视频标注、模型辅助标注 | MIT 核心；部分组件有其他条款 | 参考任务切换、人工编辑与标注持久化流程 |
 | [SUSTechPOINTS](https://github.com/naurril/SUSTechPOINTS) | 点云 3D 框、多视图、跟踪 ID、半自动编辑 | GPLv3 | 参考多传感器联动及 3D 框工作流；不复制 GPL 实现 |
 | [LATTE](https://github.com/bernwang/latte) | LiDAR 与图像融合、单击辅助标注、跟踪 | Apache-2.0 | 参考传感器融合和减少重复操作的方法 |
-| [SAM 2](https://github.com/facebookresearch/sam2) | 图像/视频提示分割、跨帧 mask 传播 | Apache-2.0；第三方组件另行核对 | 建议后续独立 GPU 服务提供点击/框提示的分割候选 |
+| [SAM 2](https://github.com/facebookresearch/sam2) | 图像/视频提示分割、跨帧 mask 传播 | Apache-2.0；第三方组件另行核对 | 已实现官方 predictor / automatic generator 适配器，部署远程权重后使用正负点和框提示 |
 | [Grounded SAM 2](https://github.com/IDEA-Research/Grounded-SAM-2) | 文本 grounding、检测后分割、视频对象跟踪 | Apache-2.0 仓库；上游模型/API另行核对 | 建议自然语言类别提示生成图像候选，不直接当作真值 |
 | [SAM 3](https://github.com/facebookresearch/sam3) | 开放词汇的图像/视频检测、分割、跟踪 | 自定义 **SAM License**，并非 Apache-2.0 | 可选候选生成模型；README 已包含 2026-03-27 的 SAM 3.1 更新；先评估条款和算力再部署 |
-| [MMDetection3D](https://github.com/open-mmlab/mmdetection3d) | LiDAR/多模态 3D 检测、3D 语义分割 | Apache-2.0 | 建议服务化部署适配自有传感器的检测器/分割器 |
-| [OpenOccupancy](https://github.com/JeffWang987/OpenOccupancy) | 环视语义 OCC、nuScenes 稠密占据标注、AAP 过程 | Apache-2.0 代码；数据条款单独核对 | 参考多帧几何积累和语义清洗；当前实现不宣称复现其稠密真值流水线 |
+| [MMDetection3D](https://github.com/open-mmlab/mmdetection3d) | LiDAR/多模态 3D 检测、3D 语义分割 | Apache-2.0 | 已实现 init_model / inference_detector / segmentor 适配，需匹配模型配置和权重 |
+| [OpenOccupancy](https://github.com/JeffWang987/OpenOccupancy) | 环视语义 OCC、nuScenes 稠密占据标注、AAP 过程 | Apache-2.0 代码；数据条款单独核对 | 已实现 OccNet.forward_dummy 实际预测适配；不宣称复现 AAP 稠密真值流水线 |
 
 ## 当前实现的边界
 
 - 提供人工 3D 框、同 ID 跨帧处理、车道/地图矢量、图像多边形分割、逐点语义、标定投影、按位姿融合和稀疏 OCC 转换的基础闭环。
 - CPU 几何任务与合成演示可以直接运行；演示的图像、点云和语义来自同一程序化场景，全部明确标为合成数据。
-- 模型目录是集成候选的说明，并不代表已部署推理服务。默认没有下载模型权重或配置模型服务，也不会把合成标注伪装为模型生成结果。可选外部推理工作进程的接入协议见 [模型服务接入](model-worker.md)，需自行部署模型并配置后才可使用。
-- 当前点云地图是**已知 ego 位姿下的多帧配准融合**。不估计未知位姿，不提供 SLAM、回环优化、运动补偿或生产级动态物体重建。
-- 跨帧几何传播保持世界位姿，不会推断移动车辆轨迹；动态目标需逐帧修正或后续接入跟踪模型。图像多边形可确定性栅格化为带类别表的 16 位 PNG 语义 mask；mask 来源是已保存的人工多边形，不是已部署的分割模型。
+- SAM2、MMDetection3D、OpenOccupancy 的实际推理适配器已提供，模型面板显示远程依赖/权重加载状态；当前地址尚未提供，不能声称实际 GPU 推理已经通过。部署和协议见 [模型服务接入](model-worker.md)。
+- 地图支持已知位姿融合及实际局部 ICP 配准，整个 clip 共用世界坐标场景。没有回环优化、逐点去畸变或全局 SLAM 精度保证。静态矢量持续保留，动态框按世界坐标时间关键帧插值。
+- 时间关键帧插值不等于学习型运动跟踪。模型产生的候选仍需人工修正；图像多边形可确定性栅格化为带类别表的 16 位 PNG mask，候选经人工应用和保存后才进入导出结果。
 - 稀疏 OCC 的观测终点是 occupied，观测射线覆盖的体素是 free，未观测空间保持 unknown。它不是由稀疏扫描凭空补全出的完整稠密真值；是否满足训练集标准必须另行质检。
 
 ## 推荐的真实数据预标注流程

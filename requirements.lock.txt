@@ -18,6 +18,7 @@ pydantic-core==2.46.4
 pygments==2.21.0
 pytest==8.4.2
 python-multipart==0.0.32
+scipy==1.16.3
 starlette==1.9.0
 typing-inspection==0.4.4
 typing-extensions==4.16.0

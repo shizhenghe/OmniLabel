@@ -99,7 +99,7 @@ ID 使用字母/数字开头，后续仅字母、数字、`_`、`-`、`.`，长�
 - ZIP 不接受绝对路径、`..` 路径、符号链接、加密项和重复项。图片支持 JPEG、PNG、WebP；不主动下载清单中的外部 URL。
 - JSON 单文件可内联点云，并使用 base64 data-image 图像，或引用**同一服务器已存在**的 `/api/assets/...` 资源。普通本地相对图片路径必须随 ZIP 上传。
 - 已有 clip ID 不会被静默覆盖。复制导入时应先修改 `clip.id`。标注保存携带 revision，旧版本写入会返回 409 冲突，需重新加载并协调修改。
-- JSON 导出 `GET /api/clips/{id}/export` 返回 `{schema_version, clip, annotations}`，包含当前已保存标注，不自动包含未保存编辑。JSON 保留服务器 `/api/assets/...` 引用，可在原服务器重新导入。
+- JSON 导出 `GET /api/clips/{id}/export` 返回 `{schema_version:"1.1", clip, annotations, scene_annotations, scene_registration}`，包含已保存的源帧标注、世界坐标场景及配准变换，不包含未保存编辑。JSON 保留服务器 `/api/assets/...` 引用，可在原服务器重新导入。
 - **可迁移 ZIP**：`GET /api/clips/{id}/export.zip` 同时打包 `manifest.json`、点云及相对路径的图像资源，可以导入另一台 OmniLabel 实例。导入已存在的 clip ID 前应更改 manifest 中的 ID。
 - 输出 3D 框、矢量线/多边形、图像多边形和逐点 label。语义分割可单独导出 PNG，见下节。尚未宣称兼容 COCO、nuScenes、OpenLABEL 或特定 OCC 训练集；这些格式应增加显式转换器和测试。
 
@@ -107,9 +107,11 @@ ID 使用字母/数字开头，后续仅字母、数字、`_`、`-`、`.`，长�
 
 ## 地图和 OCC 输出解释
 
-地图融合使用 `ego_to_world @ lidar_to_ego` 得到世界坐标，依据已保存 3D 动态框和动态类别点标签过滤，再进行体素降采样及类别投票；位姿不准确或动态标注不全时会出现重影。车道线/矢量地图目前是每帧 LiDAR 坐标的矢量，导出后可用上述变换转入统一地图坐标。
+4D 工作区将整个 clip 作为统一世界场景。默认用输入位姿重建，也可执行真实的逐帧 ICP 配准。地图、车道线和矢量标注持续保留，动态目标按世界坐标关键帧插值；时间轴只切换活动时刻和相机。重建后以 `scene_registration.world_from_lidar` 作为实际坐标变换，导入导出会保留它。旧版逐帧标注仍可在单帧模式使用；两套标注不会静默覆盖。细节和 ICP 质量限制见 [4d-scene.md](4d-scene.md)。
 
 OCC 是当前帧 LiDAR 坐标下、指定 voxel size 的稀疏观测转换。`occupied` 表示有扫描终点证据，`free` 表示射线经过，未返回的空间为 `unknown`；占据证据优先于自由证据。语义来自已保存点标注。没有稠密补全、相机可见性 mask 或 benchmark 专用裁剪范围，不能直接作为所有 OCC 模型的完整真值格式。
+
+OpenOccupancy 模型预测单独标记为学习型候选结果，包含其体素网格原点、各轴分辨率与置信度，经人工应用后查看。不会将上述 CPU 射线结果标成大模型预测。模型部署和 7 路相机适配见 [model-worker.md](model-worker.md)。
 
 ## 语义分割 mask PNG
 

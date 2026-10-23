@@ -109,4 +109,28 @@ export interface ModelInfo {
   available: boolean;
   description: string;
   url: string;
+  configured?: boolean;
+  status?: string;
+  status_detail?: string;
+  reason?: string;
+  supports?: {point_prompt?: boolean; box_prompt?: boolean; text_prompt?: boolean; occupancy?: boolean};
 }
+
+export interface SceneKeyframe { frame_id: string; center: Vec3; size: Vec3; yaw: number; }
+export interface SceneTrack { id: string; label: string; mode: 'static' | 'dynamic'; keyframes: SceneKeyframe[]; }
+export interface SceneAnnotations { revision: number; coordinate_frame: 'world'; vectors: Vector[]; tracks: SceneTrack[]; }
+export interface SceneMap {
+  points: number[][];
+  point_labels: Record<string, string>;
+  coordinate_frame: 'world';
+  frame_count: number;
+  point_count: number;
+  trajectory: {frame_id: string; timestamp: number; position: Vec3}[];
+  bounds: {min: Vec3; max: Vec3};
+  method: string;
+  voxel_size: number;
+  scene_revision?: number;
+  world_from_lidar: Record<string, number[][]>;
+  registration?: Record<string, unknown>;
+}
+export interface ModelConnection {model_id: string; endpoint: string; configured?: boolean; source?: string;}

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { BoxTransformGizmo, type BoxTransformMode } from './BoxTransformGizmo';
 import type { Annotations, Box, Frame, Vec3, Voxel } from '../types';
 
 export interface PointCloudViewProps {
@@ -11,6 +12,15 @@ export interface PointCloudViewProps {
   onCreateBox?: (center: Vec3) => void;
   onAddVectorPoint?: (point: Vec3) => void;
   onPaint?: (indices: number[]) => void;
+  onUpdateBox?: (id: string, patch: Partial<Box>) => void;
+  transformMode?: BoxTransformMode;
+  editable?: boolean;
+  onTransformStart?: () => void;
+  onTransformEnd?: () => void;
+  /** All frame.points and annotations are already in world coordinates. */
+  sceneMode?: boolean;
+  trajectory?: {frame_id: string; timestamp: number; position: Vec3}[];
+  activeFrameId?: string;
   tool?: 'select' | 'box' | 'vector' | 'brush';
   view?: 'perspective' | 'top';
   overlayPoints?: number[][];
@@ -19,6 +29,7 @@ export interface PointCloudViewProps {
   /** Show measured free-space cells; unknown cells are deliberately absent. */
   showFree?: boolean;
   voxelSize?: number;
+  voxelDimensions?: Vec3;
   showBoxes?: boolean;
   showVectors?: boolean;
   semantic?: boolean;
@@ -112,6 +123,7 @@ interface Runtime {
   pointsGroup: THREE.Group;
   annotationsGroup: THREE.Group;
   overlaysGroup: THREE.Group;
+  trajectoryGroup: THREE.Group;
   cloud: THREE.Points | null;
   grid: THREE.GridHelper;
 }
@@ -164,8 +176,9 @@ export function PointCloudView(props: PointCloudViewProps) {
     const pointsGroup = new THREE.Group();
     const annotationsGroup = new THREE.Group();
     const overlaysGroup = new THREE.Group();
-    scene.add(pointsGroup, annotationsGroup, overlaysGroup);
-    runtime.current = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, cloud: null, grid };
+    const trajectoryGroup = new THREE.Group();
+    scene.add(pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup);
+    runtime.current = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, cloud: null, grid };
     const resize = () => {
       const { width, height } = host.getBoundingClientRect();
       if (width <= 0 || height <= 0) return;
@@ -225,7 +238,51 @@ export function PointCloudView(props: PointCloudViewProps) {
     const cloud = new THREE.Points(geometry, new THREE.PointsMaterial({ size: 0.095, vertexColors: true, sizeAttenuation: true }));
     rt.pointsGroup.add(cloud);
     rt.cloud = cloud;
-  }, [ready, props.frame, props.annotations.point_labels, props.semantic]);
+  }, [ready, props.frame?.points, props.annotations.point_labels, props.semantic]);
+
+  const fittedScene = useRef<number[][] | null>(null);
+  useEffect(() => {
+    const rt = runtime.current;
+    const points = props.frame?.points;
+    if (!props.sceneMode) { fittedScene.current = null; return; }
+    if (!rt || !points?.length || fittedScene.current === points) return;
+    fittedScene.current = points;
+    const bounds = new THREE.Box3();
+    points.forEach(point => bounds.expandByPoint(new THREE.Vector3(point[0], point[1], point[2])));
+    const center = bounds.getCenter(new THREE.Vector3());
+    const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 12);
+    rt.controls.target.copy(center);
+    if (props.view === 'top') rt.camera.position.copy(center).add(new THREE.Vector3(-0.01, 0, radius * 2.4));
+    else rt.camera.position.copy(center).add(new THREE.Vector3(-1, -1, 0.85).normalize().multiplyScalar(radius * 2.5));
+    rt.controls.maxDistance = Math.max(radius * 20, 800);
+    rt.camera.far = Math.max(radius * 40, 4000);
+    rt.camera.updateProjectionMatrix();
+    rt.controls.update();
+  }, [ready, props.sceneMode, props.frame?.points, props.view]);
+
+  useEffect(() => {
+    const rt = runtime.current;
+    if (!rt) return;
+    disposeObject(rt.trajectoryGroup);
+    rt.trajectoryGroup.clear();
+    if (!props.sceneMode || !props.trajectory?.length) return;
+    const positions = props.trajectory.map(frame => new THREE.Vector3(...frame.position));
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(positions),
+      new THREE.LineBasicMaterial({color: '#7fa8ef', transparent: true, opacity: 0.75, depthTest: false}));
+    rt.trajectoryGroup.add(line);
+    const trajectory = new THREE.Points(new THREE.BufferGeometry().setFromPoints(positions),
+      new THREE.PointsMaterial({color: '#8ba8d6', size: 0.3, depthTest: false}));
+    rt.trajectoryGroup.add(trajectory);
+    const active = props.trajectory.find(frame => frame.frame_id === (props.activeFrameId ?? props.frame?.id));
+    if (active) {
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(0.42, 12, 8), new THREE.MeshBasicMaterial({color: '#fff1a0', depthTest: false}));
+      marker.position.fromArray(active.position);
+      rt.trajectoryGroup.add(marker);
+      const label = makeLabel(`当前时刻 ${active.frame_id}`, '#fff1a0');
+      label.position.fromArray(active.position).add(new THREE.Vector3(0, 0, 1.6));
+      rt.trajectoryGroup.add(label);
+    }
+  }, [ready, props.sceneMode, props.trajectory, props.activeFrameId, props.frame?.id]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -281,8 +338,8 @@ export function PointCloudView(props: PointCloudViewProps) {
       rt.overlaysGroup.add(freeSpace);
     }
     if (voxels?.length) {
-      const size = (props.voxelSize ?? 0.5) * 0.92;
-      const geometry = new THREE.BoxGeometry(size, size, size);
+      const dimensions = props.voxelDimensions ?? [props.voxelSize ?? 0.5, props.voxelSize ?? 0.5, props.voxelSize ?? 0.5];
+      const geometry = new THREE.BoxGeometry(...dimensions.map(value => value * 0.92) as Vec3);
       const material = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.66 });
       const mesh = new THREE.InstancedMesh(geometry, material, voxels.length);
       const transform = new THREE.Matrix4();
@@ -297,7 +354,7 @@ export function PointCloudView(props: PointCloudViewProps) {
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       rt.overlaysGroup.add(mesh);
     }
-  }, [ready, props.overlayPoints, props.overlayPointLabels, props.semantic, props.voxels, props.voxelSize, props.showFree]);
+  }, [ready, props.overlayPoints, props.overlayPointLabels, props.semantic, props.voxels, props.voxelSize, props.showFree, props.voxelDimensions]);
 
   useEffect(() => {
     if (runtime.current) runtime.current.grid.position.z = (props.groundZ ?? -1.7) - 0.05;
@@ -307,15 +364,17 @@ export function PointCloudView(props: PointCloudViewProps) {
     const rt = runtime.current;
     if (!rt) return;
     const target = rt.controls.target;
+    const distance = props.sceneMode ? Math.max(rt.camera.position.distanceTo(target), 20) : 68;
     if (props.view === 'top') {
-      rt.camera.position.set(target.x - 0.01, target.y, target.z + 68);
+      rt.camera.position.set(target.x - 0.01, target.y, target.z + distance);
       rt.controls.enableRotate = false;
     } else {
-      rt.camera.position.set(target.x - 41, target.y - 36, target.z + 35);
+      if (props.sceneMode) rt.camera.position.copy(target).add(new THREE.Vector3(-41, -36, 35).normalize().multiplyScalar(distance));
+      else rt.camera.position.set(target.x - 41, target.y - 36, target.z + 35);
       rt.controls.enableRotate = true;
     }
     rt.controls.update();
-  }, [ready, props.view]);
+  }, [ready, props.view, props.sceneMode]);
 
   const rayAt = (clientX: number, clientY: number) => {
     const rt = runtime.current;
@@ -348,13 +407,13 @@ export function PointCloudView(props: PointCloudViewProps) {
     const coordinates: Vec3 = [point.x, point.y, point.z];
     if (current.tool === 'box') current.onCreateBox?.(coordinates);
     else if (current.tool === 'vector') current.onAddVectorPoint?.(coordinates);
-    else if (current.tool === 'brush') {
+    else if (current.tool === 'brush' && !current.sceneMode) {
       const radius = current.brushRadius ?? 1.5;
       const indices: number[] = [];
       current.frame?.points.forEach((p, index) => {
         if (Math.hypot(p[0] - point.x, p[1] - point.y, p[2] - point.z) <= radius) indices.push(index);
       });
-      current.onPaint?.(indices);
+      if (indices.length) current.onPaint?.(indices);
     }
   };
 
@@ -362,6 +421,9 @@ export function PointCloudView(props: PointCloudViewProps) {
     ref={container}
     className={props.className}
     data-testid="point-cloud-view"
+    data-coordinate-frame={props.sceneMode ? 'world' : 'lidar'}
+    data-cloud-point-count={props.frame?.points.length ?? 0}
+    data-active-frame-id={props.activeFrameId ?? props.frame?.id ?? ''}
     style={{ position: 'relative', width: '100%', height: '100%', minHeight: 240, overflow: 'hidden', cursor: props.tool && props.tool !== 'select' ? 'crosshair' : 'grab' }}
     onPointerDown={(event) => { pointerStart.current = [event.clientX, event.clientY]; }}
     onClick={onClick}
@@ -373,6 +435,12 @@ export function PointCloudView(props: PointCloudViewProps) {
     }}
     onPointerLeave={() => setCursor('')}
   >
+    {ready && runtime.current && props.editable !== false && props.showBoxes !== false &&
+      (props.tool === 'select' || !props.tool) && props.onUpdateBox && props.annotations.boxes.find(box => box.id === props.selectedId) &&
+      <BoxTransformGizmo key={`${props.selectedId}/${props.activeFrameId ?? props.frame?.id ?? ''}`}
+        box={props.annotations.boxes.find(box => box.id === props.selectedId)!}
+        mode={props.transformMode ?? 'translate'} camera={runtime.current.camera} canvas={runtime.current.renderer.domElement}
+        controls={runtime.current.controls} onUpdate={props.onUpdateBox} onStart={props.onTransformStart} onEnd={props.onTransformEnd}/>}
     {error && <div role="alert" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: '#f3c2b2', background: '#0b131f', textAlign: 'center' }}>{error}</div>}
     <div style={{ position: 'absolute', right: 14, bottom: 12, pointerEvents: 'none', color: '#8294a9', font: '10px ui-monospace, monospace', display: 'flex', gap: 16 }}>
       {cursor && <span>{cursor}</span>}<span>X 前 · Y 左 · Z 上</span>
