@@ -30,8 +30,7 @@ class InferenceError(RuntimeError):
     """Safe-to-display worker failure without URLs, tokens or raw responses."""
 
 
-def _worker_url() -> str:
-    value = os.environ.get("OMNILABEL_INFERENCE_URL", "")
+def validate_worker_url(value: str) -> str:
     if not value:
         raise InferenceError("Model worker is not configured. Set OMNILABEL_INFERENCE_URL on the server.")
     try:
@@ -60,10 +59,19 @@ def _worker_url() -> str:
     return value
 
 
-def worker_configured() -> bool:
+def _worker_url(model_id: str | None = None, endpoint: str | None = None) -> str:
+    names = {"sam2": "SAM2", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
+    if endpoint is None:
+        prefix = names.get(model_id)
+        endpoint = os.environ.get(f"OMNILABEL_{prefix}_URL", "") if prefix else ""
+        endpoint = endpoint or os.environ.get("OMNILABEL_INFERENCE_URL", "")
+    return validate_worker_url(endpoint)
+
+
+def worker_configured(model_id: str | None = None, endpoint: str | None = None) -> bool:
     """Whether an endpoint is validly configured, not whether a model is healthy."""
     try:
-        _worker_url()
+        _worker_url(model_id, endpoint)
         return True
     except InferenceError:
         return False
@@ -117,7 +125,9 @@ def _outbound_images(frame: dict, assets_root: Path | None) -> dict:
 
 def infer_proposal(
     clip: dict, frame: dict, annotations: dict, model_id: str, prompt: str,
-    *, assets_root: Path | None = None,
+    *, assets_root: Path | None = None, options: dict | None = None,
+    endpoint: str | None = None, token: str | None = None,
+    scene_context: dict | None = None,
 ) -> dict:
     """Request actual inference and return a validated human-review proposal.
 
@@ -125,7 +135,7 @@ def infer_proposal(
     HTTPS certificate verification remains enabled, and responses are streamed
     with a decompressed byte bound. No annotation persistence occurs here.
     """
-    endpoint = _worker_url()
+    endpoint = _worker_url(model_id, endpoint)
     if not isinstance(model_id, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}", model_id):
         raise InferenceError("model_id must be a short alphanumeric model identifier.")
     if not isinstance(prompt, str) or len(prompt) > 2000:
@@ -146,6 +156,10 @@ def infer_proposal(
         "clip": {"id": clip["id"], "cameras": [camera.model_dump() for camera in cameras]},
         "frame": outbound_frame, "annotations": current.model_dump(),
     }
+    if options:
+        payload["options"] = options
+    if scene_context:
+        payload["scene_context"] = scene_context
     try:
         body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (TypeError, ValueError):
@@ -153,7 +167,10 @@ def infer_proposal(
     if len(body) > MAX_REQUEST_BYTES:
         raise InferenceError("Worker request exceeds 64 MiB; resize images or split the frame.")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    token = os.environ.get("OMNILABEL_INFERENCE_TOKEN", "")
+    if token is None:
+        names = {"sam2": "SAM2", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
+        prefix = names.get(model_id)
+        token = os.environ.get(f"OMNILABEL_{prefix}_TOKEN", os.environ.get("OMNILABEL_INFERENCE_TOKEN", "")) if prefix else os.environ.get("OMNILABEL_INFERENCE_TOKEN", "")
     if token:
         if "\r" in token or "\n" in token:
             raise InferenceError("Invalid model worker authentication configuration.")
@@ -189,8 +206,54 @@ def infer_proposal(
         validated = Annotations.model_validate(proposed).validate_for_frame(frame_model, cameras)
     except (ValidationError, ValueError, KeyError, TypeError):
         raise InferenceError("Model worker returned invalid annotations or model metadata; no annotations were changed.") from None
-    return {
+    output = {
         "proposal": validated.model_dump(), "model_id": model_id,
         "model_version": model_version, "review_required": True,
         "source": "external-worker",
     }
+    if "occupancy" in result:
+        output["occupancy"] = validate_occupancy(result["occupancy"])
+    warnings = result.get("warnings", [])
+    if isinstance(warnings, list) and len(warnings) <= 20 and all(isinstance(w, str) and len(w) <= 2000 for w in warnings):
+        output["warnings"] = warnings
+    confidence = result.get("confidence", {})
+    if isinstance(confidence, dict) and len(confidence) <= 20000:
+        from math import isfinite
+        if all(isinstance(k, str) and isinstance(v, (float, int)) and isfinite(v) and 0 <= v <= 1 for k, v in confidence.items()):
+            output["confidence"] = confidence
+    conversion = result.get("conversion")
+    if isinstance(conversion, list) and len(conversion) <= 256:
+        output["conversion"] = conversion
+    return output
+
+
+def validate_occupancy(value: dict) -> dict:
+    """Validate learned occupancy geometry before it reaches the WebGL view."""
+    try:
+        from math import isfinite
+        if not isinstance(value, dict) or value.get("coordinate_frame") != "lidar":
+            raise ValueError
+        size = float(value["voxel_size"])
+        if not isfinite(size) or not 0.02 <= size <= 10:
+            raise ValueError
+        voxels = value["voxels"]
+        if not isinstance(voxels, list) or len(voxels) > 300_000:
+            raise ValueError
+        seen = set()
+        dimensions = value.get("voxel_dimensions")
+        if dimensions is not None and (not isinstance(dimensions, list) or len(dimensions) != 3 or any(not isfinite(float(d)) or not 0 < float(d) <= 100 for d in dimensions)):
+            raise ValueError
+        for voxel in voxels:
+            index, center = voxel["index"], voxel["center"]
+            if len(index) != 3 or any(type(i) is not int for i in index) or tuple(index) in seen:
+                raise ValueError
+            seen.add(tuple(index))
+            if len(center) != 3 or any(not isfinite(float(x)) for x in center):
+                raise ValueError
+            if voxel["state"] not in ("occupied", "free") or not isinstance(voxel["label"], str) or not 0 < len(voxel["label"]) <= 80:
+                raise ValueError
+        # Preserve range/origin metadata for custom model grids; indices are
+        # grid-relative and need not have an origin at the LiDAR sensor.
+        return value
+    except (ValueError, KeyError, TypeError, OverflowError):
+        raise InferenceError("Model worker returned invalid occupancy geometry; no annotations were changed.") from None

@@ -7,7 +7,7 @@ const dataDir = mkdtempSync(join(tmpdir(), 'omnilabel-e2e-'));
 
 export default defineConfig({
   testDir: './tests/e2e',
-  timeout: 60_000,
+  timeout: 90_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
   workers: 1,

@@ -171,6 +171,24 @@ class ProjectRequest(Model):
     stride: int = Field(default=1, ge=1, le=1000)
 
 
+class InferenceOptions(Model):
+    camera_id: Identifier | None = None
+    label: str = Field(default="object", min_length=1, max_length=80)
+    points: list[tuple[float, float]] = Field(default_factory=list, max_length=256)
+    point_labels: list[Literal[0, 1]] = Field(default_factory=list, max_length=256)
+    box: tuple[float, float, float, float] | None = None
+    score_threshold: float = Field(default=0.3, ge=0, le=1)
+    max_masks: int = Field(default=64, ge=1, le=256)
+
+    @model_validator(mode="after")
+    def validate_prompts(self):
+        if self.point_labels and len(self.points) != len(self.point_labels):
+            raise ValueError("SAM2 points and point_labels must have matching lengths")
+        if self.box and (self.box[2] <= self.box[0] or self.box[3] <= self.box[1]):
+            raise ValueError("SAM2 box must be [left,top,right,bottom] with positive area")
+        return self
+
+
 class JobRequest(Model):
     kind: Literal["map", "occupancy", "propagate", "ground-segmentation", "prelabel"]
     frame_id: Identifier | None = None
@@ -178,6 +196,8 @@ class JobRequest(Model):
     target_frame_id: Identifier | None = None
     model_id: str = Field(default="", max_length=96)
     prompt: str = Field(default="", max_length=2000)
+    options: InferenceOptions | None = None
+    scene_mode: bool = False
 
     @model_validator(mode="after")
     def validate_model(self):

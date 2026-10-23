@@ -1,6 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
-import type { Annotations, Box, Camera, Frame, ProjectionPoint, Vec3 } from '../types';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { Annotations, Camera, Frame, ProjectionPoint } from '../types';
 import { labelColor } from './PointCloudView';
+import { projectAnnotationResults, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
+
+export { projectLidarPoint } from '../geometry/cameraProjection';
 
 export interface CameraViewProps {
   camera: Camera;
@@ -14,44 +17,18 @@ export interface CameraViewProps {
   onFinishPolygon?: () => void;
   draftPolygon?: number[][];
   showProjection?: boolean;
+  /** Annotation results are separate from optional raw point-cloud overlays. */
+  showAnnotationProjection?: boolean;
   showBoxes?: boolean;
+  showVectors?: boolean;
+  modelPromptMode?: 'point' | 'box' | null;
+  onModelPoint?: (point: [number, number], label?: 0 | 1) => void;
+  onModelBox?: (box: [number, number, number, number]) => void;
+  modelPoints?: number[][];
+  modelPointLabels?: number[];
+  modelBox?: number[];
   selectedId?: string | null;
   className?: string;
-}
-
-function transformPoint(matrix: number[][], point: number[]): Vec3 {
-  return [0, 1, 2].map((row) => matrix[row][0] * point[0] + matrix[row][1] * point[1] + matrix[row][2] * point[2] + matrix[row][3]) as Vec3;
-}
-
-/** Shared calibrated pinhole/Brown-Conrady projection, optical +Z in front. */
-export function projectLidarPoint(point: number[], camera: Camera, frame: Frame): [number, number, number] | null {
-  return projectCameraPoint(transformPoint(camera.camera_from_ego, transformPoint(frame.lidar_to_ego, point)), camera);
-}
-
-function projectCameraPoint(point: number[], camera: Camera): [number, number, number] | null {
-  if (point[2] <= 0.05) return null;
-  const x = point[0] / point[2];
-  const y = point[1] / point[2];
-  const [k1 = 0, k2 = 0, p1 = 0, p2 = 0, k3 = 0] = camera.distortion ?? [];
-  const r2 = x * x + y * y;
-  const radial = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3;
-  const xd = x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x);
-  const yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y;
-  const k = camera.intrinsics;
-  const u = k[0][0] * xd + k[0][1] * yd + k[0][2];
-  const v = k[1][0] * xd + k[1][1] * yd + k[1][2];
-  return Number.isFinite(u) && Number.isFinite(v) ? [u, v, point[2]] : null;
-}
-
-const EDGES = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
-
-function boxCorners(box: Box): Vec3[] {
-  const [length, width, height] = box.size.map((size) => size / 2);
-  return [[-length, -width, -height], [length, -width, -height], [length, width, -height], [-length, width, -height], [-length, -width, height], [length, -width, height], [length, width, height], [-length, width, height]].map(([x, y, z]) => [
-    box.center[0] + x * Math.cos(box.yaw) - y * Math.sin(box.yaw),
-    box.center[1] + x * Math.sin(box.yaw) + y * Math.cos(box.yaw),
-    box.center[2] + z,
-  ] as Vec3);
 }
 
 export function CameraView(props: CameraViewProps) {
@@ -61,7 +38,19 @@ export function CameraView(props: CameraViewProps) {
   const fit = useRef({ x: 0, y: 0, width: 0, height: 0 });
   const [imageState, setImageState] = useState<'loading' | 'ready' | 'missing' | 'error'>('loading');
   const [size, setSize] = useState({ width: 0, height: 0 });
+  const modelDrag = useRef<{ start: Pixel; pointerId: number } | null>(null);
+  const [draftModelBox, setDraftModelBox] = useState<number[] | null>(null);
   const source = props.frame?.images[props.camera.id];
+  const results = useMemo(() => props.frame ? projectAnnotationResults(props.annotations, props.camera, props.frame)
+    : { boxes: [], vectors: [], imagePolygons: [] }, [props.annotations, props.camera, props.frame]);
+  const visibleResults = useMemo(() => ({
+    boxes: props.showAnnotationProjection !== false && props.showBoxes !== false ? results.boxes : [],
+    vectors: props.showAnnotationProjection !== false && props.showVectors !== false ? results.vectors : [],
+    imagePolygons: props.showAnnotationProjection !== false ? results.imagePolygons : [],
+  }), [results, props.showAnnotationProjection, props.showBoxes, props.showVectors]);
+  const signature = useMemo(() => projectionSignature(visibleResults), [visibleResults]);
+
+  useEffect(() => { modelDrag.current = null; setDraftModelBox(null); }, [props.modelPromptMode, props.frame?.id, props.camera.id]);
 
   useEffect(() => {
     if (!host.current) return;
@@ -125,7 +114,7 @@ export function CameraView(props: CameraViewProps) {
       ctx.font = '12px system-ui, sans-serif';
       ctx.fillText(imageState === 'loading' ? '加载图像…' : imageState === 'error' ? '图像加载失败' : '此帧未提供图像', displayWidth / 2, displayHeight / 2);
     }
-    if (props.showProjection !== false) {
+    if (props.showProjection === true) {
       for (const point of props.projections ?? []) {
         const [x, y] = xy([point.u, point.v]);
         // Current annotations are authoritative, including erased labels; a
@@ -135,40 +124,37 @@ export function CameraView(props: CameraViewProps) {
         ctx.fillRect(x - 0.85, y - 0.85, 1.7, 1.7);
       }
     }
-    if (props.frame && props.showBoxes !== false) {
-      props.annotations.boxes.forEach((box) => {
-        const points = boxCorners(box).map((point) => transformPoint(props.camera.camera_from_ego, transformPoint(props.frame!.lidar_to_ego, point)));
+    const strokeSegments = (segments: PixelSegment[]) => {
+      ctx.beginPath();
+      segments.forEach(([a, b]) => { ctx.moveTo(...xy(a) as Pixel); ctx.lineTo(...xy(b) as Pixel); });
+      ctx.stroke();
+    };
+    visibleResults.vectors.forEach(vector => {
+      const selected = vector.id === props.selectedId;
+      const color = selected ? '#ffffff' : labelColor(vector.label);
+      if (vector.polygon.length >= 3) {
+        ctx.fillStyle = color;
+        ctx.globalAlpha = selected ? 0.2 : 0.12;
+        ctx.beginPath();
+        vector.polygon.forEach((point, i) => { const p = xy(point) as Pixel; if (!i) ctx.moveTo(...p); else ctx.lineTo(...p); });
+        ctx.closePath(); ctx.fill('evenodd'); ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = color; ctx.lineWidth = selected ? 2.2 : 1.6;
+      strokeSegments(vector.segments);
+    });
+    visibleResults.boxes.forEach(box => {
         const color = box.id === props.selectedId ? '#ffffff' : labelColor(box.label);
         ctx.strokeStyle = color;
         ctx.lineWidth = box.id === props.selectedId ? 1.8 : 1.1;
-        EDGES.forEach(([from, to]) => {
-          let start = [...points[from]];
-          let end = [...points[to]];
-          if (start[2] < 0.06 && end[2] < 0.06) return;
-          if (start[2] < 0.06 || end[2] < 0.06) {
-            if (end[2] < 0.06) [start, end] = [end, start];
-            const t = (0.06 - start[2]) / (end[2] - start[2]);
-            start = start.map((value, axis) => value + t * (end[axis] - value));
-          }
-          const a = projectCameraPoint(start, props.camera);
-          const b = projectCameraPoint(end, props.camera);
-          if (!a || !b) return;
-          ctx.beginPath();
-          ctx.moveTo(...xy(a) as [number, number]);
-          ctx.lineTo(...xy(b) as [number, number]);
-          ctx.stroke();
-        });
-        const center = projectLidarPoint([box.center[0], box.center[1], box.center[2] + box.size[2] / 2], props.camera, props.frame!);
-        if (center && center[0] >= 0 && center[0] <= width && center[1] >= 0 && center[1] <= height) {
+        strokeSegments(box.segments);
+        if (box.anchor) {
           ctx.fillStyle = color;
-          ctx.font = '9px ui-monospace, monospace';
+          ctx.font = '10px ui-monospace, monospace';
           ctx.textAlign = 'left';
-          ctx.fillText(box.track_id, center[0] * scale, center[1] * scale - 5);
+          ctx.fillText(box.trackId, box.anchor[0] * scale + 2, Math.max(12, box.anchor[1] * scale - 5));
         }
-      });
-    }
-    const polygons = props.annotations.image_polygons.filter((polygon) => polygon.camera_id === props.camera.id);
-    polygons.forEach((polygon) => {
+    });
+    visibleResults.imagePolygons.forEach((polygon) => {
       if (!polygon.points.length) return;
       ctx.fillStyle = `${labelColor(polygon.label)}44`;
       // hsl colours need a separate globalAlpha instead of hexadecimal alpha.
@@ -201,27 +187,92 @@ export function CameraView(props: CameraViewProps) {
         ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
       });
     }
+    const promptBox = draftModelBox ?? props.modelBox;
+    if (promptBox?.length === 4) {
+      const a = xy(promptBox.slice(0, 2)), b = xy(promptBox.slice(2));
+      ctx.strokeStyle = '#ffe28b'; ctx.fillStyle = '#ffe28b'; ctx.lineWidth = 1.8; ctx.setLineDash([5, 3]);
+      ctx.strokeRect(a[0], a[1], b[0] - a[0], b[1] - a[1]);
+      ctx.globalAlpha = 0.08; ctx.fillRect(a[0], a[1], b[0] - a[0], b[1] - a[1]); ctx.globalAlpha = 1; ctx.setLineDash([]);
+    }
+    (props.modelPoints ?? []).forEach((point, index) => {
+      const [x, y] = xy(point), positive = (props.modelPointLabels?.[index] ?? 1) === 1;
+      ctx.fillStyle = positive ? '#56efac' : '#ff7684'; ctx.strokeStyle = '#101925'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = '#0b1420'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x - 2.5, y); ctx.lineTo(x + 2.5, y);
+      if (positive) { ctx.moveTo(x, y - 2.5); ctx.lineTo(x, y + 2.5); }
+      ctx.stroke();
+    });
     ctx.restore();
-  }, [props, imageState, size]);
+  }, [props, imageState, size, visibleResults, draftModelBox]);
+
+  const originalPixel = (clientX: number, clientY: number, clamp = false): Pixel | null => {
+    if (!host.current) return null;
+    const rect = host.current.getBoundingClientRect();
+    const { x, y, width, height } = fit.current;
+    if (!width || !height) return null;
+    const px = clientX - rect.left - x, py = clientY - rect.top - y;
+    if (!clamp && (px < 0 || py < 0 || px > width || py > height)) return null;
+    return [Math.max(0, Math.min(width, px)) / width * props.camera.width, Math.max(0, Math.min(height, py)) / height * props.camera.height];
+  };
 
   return <div
     ref={host}
     className={props.className}
     data-testid={`camera-${props.camera.id}`}
-    style={{ position: 'relative', width: '100%', height: '100%', minHeight: 92, overflow: 'hidden', background: '#0b1420', outline: props.selected ? '1px solid #60dbc3' : undefined, outlineOffset: -1, cursor: props.tool === 'polygon' ? 'crosshair' : props.onSelect ? 'pointer' : 'default' }}
+    data-image-state={imageState}
+    data-projected-box-count={visibleResults.boxes.length}
+    data-projected-vector-count={visibleResults.vectors.length}
+    data-projected-polygon-count={visibleResults.imagePolygons.length}
+    data-projection-signature={signature}
+    data-model-point-count={props.modelPoints?.length ?? 0}
+    data-model-box={props.modelBox?.join(',') ?? ''}
+    style={{ position: 'relative', width: '100%', height: '100%', minHeight: 92, overflow: 'hidden', background: '#0b1420', outline: props.selected ? '1px solid #60dbc3' : undefined, outlineOffset: -1, cursor: props.tool === 'polygon' || props.modelPromptMode ? 'crosshair' : props.onSelect ? 'pointer' : 'default' }}
+    onPointerDown={event => {
+      if (props.modelPromptMode !== 'box' || event.button !== 0 || imageState !== 'ready') return;
+      if (props.onSelect?.() === false) return;
+      const point = originalPixel(event.clientX, event.clientY);
+      if (!point) return;
+      event.preventDefault();
+      modelDrag.current = { start: point, pointerId: event.pointerId };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setDraftModelBox([...point, ...point]);
+    }}
+    onPointerMove={event => {
+      if (!modelDrag.current || event.pointerId !== modelDrag.current.pointerId) return;
+      const point = originalPixel(event.clientX, event.clientY, true);
+      if (!point) return;
+      const start = modelDrag.current.start;
+      setDraftModelBox([Math.min(start[0], point[0]), Math.min(start[1], point[1]), Math.max(start[0], point[0]), Math.max(start[1], point[1])]);
+    }}
+    onPointerUp={event => {
+      const drag = modelDrag.current;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      const point = originalPixel(event.clientX, event.clientY, true);
+      modelDrag.current = null;
+      setDraftModelBox(null);
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+      if (!point) return;
+      const box: [number, number, number, number] = [Math.min(drag.start[0], point[0]), Math.min(drag.start[1], point[1]), Math.max(drag.start[0], point[0]), Math.max(drag.start[1], point[1])];
+      if (box[2] - box[0] >= 1 && box[3] - box[1] >= 1) props.onModelBox?.(box);
+    }}
+    onPointerCancel={() => { modelDrag.current = null; setDraftModelBox(null); }}
     onClick={(event) => {
       if (props.onSelect?.() === false) return;
+      if (props.modelPromptMode) {
+        if (props.modelPromptMode === 'point' && imageState === 'ready') {
+          const point = originalPixel(event.clientX, event.clientY);
+          if (point) props.onModelPoint?.(point, event.shiftKey ? 0 : 1);
+        }
+        return;
+      }
       if (props.tool !== 'polygon' || event.detail > 1) return;
-      const rect = event.currentTarget.getBoundingClientRect();
-      const { x, y, width, height } = fit.current;
-      const px = event.clientX - rect.left - x;
-      const py = event.clientY - rect.top - y;
-      if (px < 0 || py < 0 || px > width || py > height || !width || !height) return;
-      props.onAddPolygonPoint?.([px / width * props.camera.width, py / height * props.camera.height]);
+      const point = originalPixel(event.clientX, event.clientY);
+      if (point) props.onAddPolygonPoint?.(point);
     }}
-    onDoubleClick={(event) => { event.preventDefault(); if (props.tool === 'polygon' && props.selected !== false) props.onFinishPolygon?.(); }}
+    onDoubleClick={(event) => { event.preventDefault(); if (!props.modelPromptMode && props.tool === 'polygon' && props.selected !== false) props.onFinishPolygon?.(); }}
   >
-    <canvas ref={canvas} style={{ width: '100%', height: '100%', display: 'block' }} />
+    <canvas ref={canvas} aria-label={`${props.camera.name} 标注投影`} style={{ width: '100%', height: '100%', display: 'block' }} />
     <div style={{ position: 'absolute', top: 7, left: 8, display: 'flex', alignItems: 'center', gap: 5, background: '#0a121ec9', padding: '4px 6px', borderRadius: 3, pointerEvents: 'none', font: '9px ui-monospace, monospace', color: props.selected ? '#65dfc8' : '#d2dce7', letterSpacing: '.055em' }}>
       <span style={{ width: 4, height: 4, borderRadius: '50%', background: imageState === 'ready' ? '#63d4b3' : '#e8ac70' }} />
       {props.camera.name || props.camera.id}

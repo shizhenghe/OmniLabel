@@ -23,6 +23,7 @@ from starlette.background import BackgroundTask
 from .importer import MAX_EXPANDED, MAX_FILES, MAX_UPLOAD, parse_import
 from .models import Annotations, Clip, JobRequest, ProjectRequest
 from .storage import ConflictError, Store
+from .model_connections import ModelConnections, mount_model_routes
 
 LOGGER = logging.getLogger(__name__)
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -69,6 +70,10 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
 
     app = FastAPI(title="OmniLabel API", version="0.1.0", lifespan=lifespan)
     app.state.store = store
+    model_connections = ModelConnections(store)
+    mount_model_routes(app, model_connections)
+    from .scene_routes import mount_scene_routes
+    mount_scene_routes(app, store, executor)
 
     @app.exception_handler(ConflictError)
     async def handle_conflict(request, exc):
@@ -104,7 +109,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
         destination = None
         published = False
         try:
-            clip, labels, staging, namespace = parse_import(payload, file.filename or "", store.root / "assets")
+            clip, labels, staging, namespace, scene_bundle = parse_import(payload, file.filename or "", store.root / "assets", include_scene=True)
             with store.lock:
                 if (store.root / "clips" / f"{clip.id}.json").exists():
                     raise ConflictError("A clip with this ID already exists. Change clip.id before importing.")
@@ -113,6 +118,10 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                 staging = None
                 store.add_clip(clip, labels)
                 published = True
+                if scene_bundle:
+                    from .scene import restore_scene
+                    restore_scene(store, clip, scene_bundle.get("scene_annotations"),
+                                  scene_bundle.get("scene_map"), scene_bundle.get("scene_registration"))
             return clip
         except ConflictError:
             raise
@@ -227,9 +236,22 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                 result = build_occupancy(source.model_dump(), annotations[source.id], request.voxel_size)
             elif request.kind == "prelabel":
                 from .inference import infer_proposal
-                result = infer_proposal(clip_data, source.model_dump(), annotations[source.id],
-                                        request.model_id, request.prompt, assets_root=store.root / "assets")
+                current_annotations = annotations[source.id]
+                scene_revision = None
+                if request.scene_mode:
+                    from .scene import load_scene, evaluate_scene
+                    with store.lock:
+                        scene = load_scene(store, clip)
+                        current_annotations = evaluate_scene(store, clip, source.id, scene)
+                        scene_revision = scene.revision
+                endpoint, _ = model_connections.endpoint(request.model_id)
+                result = infer_proposal(clip_data, source.model_dump(), current_annotations,
+                                        request.model_id, request.prompt, assets_root=store.root / "assets",
+                                        options=request.options.model_dump(exclude_none=True) if request.options else None,
+                                        endpoint=endpoint, token=model_connections.token(request.model_id))
                 result.update(frame_id=source.id, clip_id=clip.id)
+                if scene_revision is not None:
+                    result["scene_revision"] = scene_revision
             else:
                 changes = {}
                 if request.kind == "ground-segmentation":
@@ -261,8 +283,21 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
         clip = get_clip(clip_id)
         if request.kind == "prelabel":
             from .inference import worker_configured
-            if not worker_configured():
-                raise HTTPException(503, "No valid inference worker configured. Set OMNILABEL_INFERENCE_URL on the server; model weights are not bundled.")
+            endpoint, _ = model_connections.endpoint(request.model_id)
+            if not worker_configured(request.model_id, endpoint):
+                raise HTTPException(503, "所选模型未配置有效的推理地址，请在模型面板设置远程 GPU 服务。")
+            source = get_frame(clip, request.frame_id or clip.frames[0].id)
+            if request.options and request.options.camera_id:
+                camera = next((c for c in clip.cameras if c.id == request.options.camera_id), None)
+                if camera is None:
+                    raise HTTPException(422, "Prompt camera does not exist")
+                vertices = list(request.options.points)
+                if request.options.box:
+                    vertices += [(request.options.box[0], request.options.box[1]), (request.options.box[2], request.options.box[3])]
+                if any(not 0 <= x <= camera.width or not 0 <= y <= camera.height for x, y in vertices):
+                    raise HTTPException(422, "SAM2 prompt lies outside the selected image")
+                if request.options.camera_id not in source.images and request.model_id == "sam2":
+                    raise HTTPException(422, "Selected camera has no image in this frame")
         if request.frame_id:
             get_frame(clip, request.frame_id)
         if request.target_frame_id:
@@ -284,7 +319,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     @app.get("/api/clips/{clip_id}/export")
     def export_clip(clip_id: str):
         clip = get_clip(clip_id)
-        return JSONResponse({"schema_version": "1.0", "clip": clip.model_dump(), "annotations": store.all_annotations(clip)},
+        from .scene import scene_export
+        return JSONResponse({"schema_version": "1.1", "clip": clip.model_dump(), "annotations": store.all_annotations(clip), **scene_export(store, clip)},
                             headers={"Content-Disposition": f'attachment; filename="{clip.id}-annotations.json"'})
 
     @app.get("/api/clips/{clip_id}/export.zip")
@@ -315,7 +351,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as archive:
                 for source, name in asset_files.items():
                     archive.write(source, name)
-                envelope = {"schema_version": "1.0", "clip": clip_data, "annotations": annotations}
+                from .scene import scene_export
+                envelope = {"schema_version": "1.1", "clip": clip_data, "annotations": annotations, **scene_export(store, clip)}
                 encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
                 with archive.open("manifest.json", "w") as manifest:
                     for chunk in encoder.iterencode(envelope):
@@ -335,10 +372,22 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     @app.get("/api/models")
     def models():
         from .inference import worker_configured
+        statuses = model_connections.statuses()
+        entries = []
+        for model in MODELS:
+            if model["id"] in statuses:
+                status = statuses[model["id"]]
+                model = {**model, **status}
+                model["description"] = {
+                    "sam2": "SAM2 提示分割：在左侧相机上添加正负点或框选区域，输出可审核的分割候选。",
+                    "mmdetection3d": "MMDetection3D 点云目标检测：按已部署配置和权重预测三维框；使用原始 LiDAR 坐标。",
+                    "openoccupancy": "OpenOccupancy 学习型占用预测：调用已部署的 occupancy 模型，输出语义体素和候选结果。"
+                }[model["id"]]
+            entries.append(model)
         worker = {"id": "external-worker", "name": "外部模型推理服务", "tasks": ["prelabel-proposals"],
                   "available": worker_configured(), "url": "https://github.com/shizhenghe/OmniLabel",
                   "description": "支持统一协议的外部 GPU / 模型服务。已配置仅表示服务地址有效，实际推理须连接验证；候选结果必须人工审核。部署协议见 docs/model-worker.md。"}
-        return {"models": [*MODELS, worker]}
+        return {"models": [*entries, worker]}
 
     @app.get("/api/assets/{asset_path:path}")
     def asset(asset_path: str):
