@@ -18,7 +18,7 @@ GROUND = -1.7
 PALETTE = {
     "road": (63, 76, 94), "sidewalk": (129, 140, 151),
     "vehicle": (45, 188, 207), "pedestrian": (249, 179, 76),
-    "vegetation": (65, 137, 98), "building": (106, 127, 150),
+    "vegetation": (65, 137, 98), "building": (106, 127, 150), "lane_marking": (225, 225, 206),
 }
 CAMERA_NAMES = [
     ("front", "前视"), ("front_left", "左前"), ("left", "左侧"),
@@ -112,6 +112,43 @@ def _clip_near(polygon: np.ndarray, near: float = 0.15) -> np.ndarray:
     return np.asarray(result)
 
 
+def _road_markings() -> list[tuple[np.ndarray, tuple[int, int, int]]]:
+    """One geometry source for synthetic camera paint and LiDAR reflectance."""
+    markings = []
+    for x in range(-36, 73, 6):
+        for y in [-3.6, 0, 3.6]:
+            markings.append((np.array([[x, y - .06, .02], [x + 3, y - .06, .02],
+                                       [x + 3, y + .06, .02], [x, y + .06, .02]]), (225, 225, 206)))
+    for y in [-7.75, 7.75]:
+        markings.append((np.array([[-35, y - .07, .025], [72, y - .07, .025],
+                                   [72, y + .07, .025], [-35, y + .07, .025]]), (230, 184, 91)))
+    for x in [12, 38]:
+        for y in [-1.8, 1.8]:
+            # A filled forward arrow, with the same outline in both modalities.
+            outline = np.array([[-2, -.13], [.6, -.13], [.6, -.55], [2, 0],
+                                [.6, .55], [.6, .13], [-2, .13]]) + [x, y]
+            markings.append((np.column_stack((outline, np.full(len(outline), .02))), (225, 225, 206)))
+    return markings
+
+
+def _marking_points(polygon: np.ndarray) -> np.ndarray:
+    """Sample actual painted surfaces; explicit synthetic data, never inference."""
+    low, high = polygon[:, :2].min(axis=0), polygon[:, :2].max(axis=0)
+    xx, yy = np.meshgrid(np.arange(low[0] + .025, high[0], .09),
+                         np.arange(low[1] + .025, high[1], .055))
+    xy = np.column_stack((xx.ravel(), yy.ravel()))
+    inside = np.zeros(len(xy), dtype=bool)
+    previous = polygon[-1, :2]
+    for current in polygon[:, :2]:
+        # Even/odd crossings, with horizontal edges excluded before division.
+        if current[1] != previous[1]:
+            crossing = ((current[1] > xy[:, 1]) != (previous[1] > xy[:, 1]))
+            crossing &= xy[:, 0] < (previous[0] - current[0]) * (xy[:, 1] - current[1]) / (previous[1] - current[1]) + current[0]
+            inside ^= crossing
+        previous = current
+    return np.column_stack((xy[inside], np.full(int(inside.sum()), polygon[0, 2])))
+
+
 def _render(path: Path, camera: dict[str, Any], pose: np.ndarray,
             objects: list[dict[str, Any]], frame_index: int) -> None:
     # Avoid re-rendering retained assets when reseeding a fresh data database.
@@ -148,13 +185,8 @@ def _render(path: Path, camera: dict[str, Any], pose: np.ndarray,
     for y0, y1 in [(-12.8, -8), (8, 12.8)]:
         add_polygon(np.array([[-60, y0, .16], [95, y0, .16], [95, y1, .16], [-60, y1, .16]]),
                     PALETTE["sidewalk"])
-    for x in range(-60, 95, 6):
-        for y in [-3.6, 0, 3.6]:
-            add_polygon(np.array([[x, y - .06, .02], [x + 3, y - .06, .02],
-                                  [x + 3, y + .06, .02], [x, y + .06, .02]]), (225, 225, 206))
-    for y in [-7.75, 7.75]:
-        add_polygon(np.array([[-60, y - .07, .03], [95, y - .07, .03],
-                              [95, y + .07, .03], [-60, y + .07, .03]]), (230, 184, 91))
+    for polygon, color in _road_markings():
+        add_polygon(polygon, color)
     for obj in objects:
         corners = _corners(obj["center"], obj["size"], obj["yaw"])
         color = PALETTE[obj["label"]]
@@ -177,7 +209,7 @@ def _render(path: Path, camera: dict[str, Any], pose: np.ndarray,
     image.save(path, "JPEG", quality=87, optimize=True)
 
 
-def build_demo(asset_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def build_demo(asset_dir: Path, clip_id: str = "demo") -> tuple[dict[str, Any], dict[str, Any]]:
     """Create a reproducible clip and annotations; only generated RGB assets persist.
 
     Ego and LiDAR are coincident at 1.7m above world ground. World static surfaces
@@ -196,6 +228,8 @@ def build_demo(asset_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     road = np.column_stack((rng.uniform(-35, 72, 4250), rng.uniform(-8, 8, 4250),
                             rng.normal(0, .013, 4250)))
     append(road, "road")
+    for polygon, _ in _road_markings():
+        append(_marking_points(polygon), "lane_marking")
     sidewalk = np.column_stack((rng.uniform(-35, 72, 650),
                                 rng.choice([-1, 1], 650) * rng.uniform(8.1, 12.8, 650),
                                 rng.normal(.16, .012, 650)))
@@ -224,14 +258,15 @@ def build_demo(asset_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         lidar = lidar[visible]
         labels_array = np.asarray(labels)[visible]
         intensities = np.array([{"road": .32, "sidewalk": .5, "vehicle": .86,
-                                "vegetation": .42, "building": .63, "pedestrian": .75}[v]
+                                "vegetation": .42, "building": .63, "pedestrian": .75,
+                                "lane_marking": .96}[v]
                                for v in labels_array])
         points = np.column_stack((lidar, intensities)).round(3).tolist()
         images = {}
         for camera in cameras:
             filename = f"{frame_id}-{camera['id']}.jpg"
             _render(asset_dir / filename, camera, pose, objects, frame_index)
-            images[camera["id"]] = f"/api/assets/demo/{filename}"
+            images[camera["id"]] = f"/api/assets/{clip_id}/{filename}"
         frames.append({"id": frame_id, "timestamp": frame_index / 10,
                        "ego_to_world": pose.round(9).tolist(), "lidar_to_ego": np.eye(4).tolist(),
                        "points": points, "images": images})
@@ -252,7 +287,7 @@ def build_demo(asset_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         annotations[frame_id] = {"boxes": boxes, "vectors": vectors, "image_polygons": [],
                                  "point_labels": {str(i): str(label) for i, label in enumerate(labels_array)},
                                  "revision": 0}
-    clip = {"id": "demo", "name": "滨海大道 · 合成演示",
+    clip = {"id": clip_id, "name": "道路标线 · 强度演示" if clip_id == "demo-ground-detail" else "滨海大道 · 合成演示",
             "description": "12帧 / 7路环视 / 已知标定与位姿。全部图像、点云及标注均为程序生成的合成样例，用于编辑和几何链路验证，不是真实采集数据或模型推理结果。",
             "fps": 10, "cameras": cameras, "frames": frames, "source": "synthetic"}
     return clip, annotations

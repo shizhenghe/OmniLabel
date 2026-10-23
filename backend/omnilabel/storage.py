@@ -62,7 +62,7 @@ class Store:
 
     def summaries(self):
         summaries = []
-        for path in sorted((self.root / "clips").glob("*.json")):
+        for path in sorted((self.root / "clips").glob("*.json"), key=lambda path: path.stem):
             clip = Clip.model_validate_json(path.read_text())
             summaries.append({"id": clip.id, "name": clip.name, "description": clip.description,
                               "fps": clip.fps, "frame_count": len(clip.frames), "camera_count": len(clip.cameras)})

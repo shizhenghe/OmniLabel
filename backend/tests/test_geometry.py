@@ -68,6 +68,30 @@ def test_map_rejects_coordinates_that_would_overflow_voxel_indices():
         fuse_map({"frames": [frame([[1e20, 0, 0], [-1e20, 0, 0]])]}, {}, 0.5)
 
 
+def test_detail_fusion_keeps_measured_paint_reflectance_and_position_within_fine_voxel():
+    points = [[.011, .011, .021, .2], [.031, .021, .022, .95], [.131, .021, .022, .25]]
+    clip = {"frames": [frame(points)]}
+    labels = {"f0": annotations(point_labels={"0": "road", "1": "lane_marking", "2": "road"})}
+    detailed = fuse_map(clip, labels, .5, preserve_detail=True, detail_voxel_size=.05)
+    np.testing.assert_allclose(detailed["points"], [points[1], points[2]])
+    assert detailed["point_labels"] == {"0": "lane_marking", "1": "road"}
+    assert detailed["effective_voxel_size"] == .05 and detailed["voxel_size"] == .5
+    assert detailed["intensity_available"] and detailed["intensity_has_contrast"]
+    assert detailed["intensity_range"] == [.2, .95]
+    assert detailed["point_reduction"] == "brightest-measured-point"
+    # Legacy callers still receive centroids and mean intensity.
+    averaged = fuse_map(clip, labels, .5)
+    np.testing.assert_allclose(averaged["points"], [np.mean(points, axis=0)])
+
+
+def test_detail_fusion_xyz_only_never_invents_intensity_or_extra_points():
+    source = [[.01, 0, 0], [.02, 0, 0], [.1, 0, 0]]
+    result = fuse_map({"frames": [frame(source)]}, {}, .5, preserve_detail=True)
+    assert not result["intensity_available"] and not result["intensity_has_contrast"]
+    assert result["intensity_range"] == [0, 0]
+    assert all(point[:3] in source and point[3] == 0 for point in result["points"])
+
+
 def test_occupancy_negative_coordinates_free_rays_and_occupied_precedence():
     cloud = frame([[2.1, 0.1, 0.1], [1.1, 0.1, 0.1], [-2.1, 0.1, 0.1]])
     result = build_occupancy(cloud, annotations(point_labels={"0": "car"}), 1)

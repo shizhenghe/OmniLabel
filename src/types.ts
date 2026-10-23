@@ -130,6 +130,14 @@ export interface SceneMap {
   method: string;
   voxel_size: number;
   scene_revision?: number;
+  preserve_detail?: boolean;
+  detail_voxel_size?: number;
+  effective_voxel_size?: number;
+  intensity_available?: boolean;
+  intensity_has_contrast?: boolean;
+  intensity_range?: [number, number] | null;
+  fusion_version?: number;
+  point_reduction?: string;
   world_from_lidar: Record<string, number[][]>;
   registration?: Record<string, unknown>;
 }

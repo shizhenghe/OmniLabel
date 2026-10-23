@@ -89,6 +89,26 @@
 .inline-proposal .button {padding:6px; font-size:9px}
 .model-card .field-label input {font-size:9px; padding:7px 5px}
 .model-card .button {font-size:9px; min-height:28px; padding:6px}
+.lane-guide {display:flex; align-items:center; gap:12px; padding:12px; margin-bottom:12px; background:#18332f; border:1px solid #3f7563; border-radius:5px; flex-shrink:0; color:#b0d9c5}
+.lane-guide>div:first-child {flex:1; min-width:0}
+.lane-guide strong {font-size:12px; color:#d2ecdc}
+.lane-guide p {font-size:10px; line-height:1.8; margin:5px 0}
+.lane-guide small {display:block; font-size:9px; line-height:1.7; color:#8bad9e}
+.lane-guide-actions {display:flex; flex-direction:column; gap:4px; flex-shrink:0}
+.lane-guide-actions .button {font-size:10px; padding:7px 9px; min-height:30px}
+.surface-toolbar {display:flex; align-items:center; gap:12px; padding:8px 10px; background:#14212c; border-top:1px solid #2a3d4e; flex-shrink:0; color:#9bafbf; font-size:10px; flex-wrap:wrap}
+.surface-toolbar>label {display:flex; align-items:center; gap:7px}
+.surface-toolbar select {font-size:10px; color:#c0d1db; background:#1c303f; border:1px solid #39505f; border-radius:3px; padding:4px}
+.surface-toolbar input {accent-color:#6ac3a2}
+.surface-toolbar>span {font:9px monospace; color:#7894a5; margin-left:auto}
+.surface-toolbar .intensity-legend {display:flex; align-items:center; gap:5px; margin-left:0}
+.intensity-legend i {display:inline-block; width:45px; height:6px; background:linear-gradient(to right,#27313d,#f5f4dc); border:1px solid #7e8a91}
+.surface-hint {font-size:10px; line-height:1.6; color:#d5bf83; background:#322d21; padding:8px 10px; margin:0; flex-shrink:0}
+.scene-app .drawing-bar {max-width:calc(100% - 24px); flex-wrap:wrap; justify-content:center; white-space:normal; gap:7px}
+.drawing-bar small {width:100%; text-align:center; color:#7b9caa; font-size:8px}
+.drawing-bar button:disabled {opacity:.4; cursor:default}
+@media(max-width:1250px) {.lane-guide {align-items:stretch;flex-direction:column;gap:8px;padding:10px}.lane-guide-actions {flex-direction:row;flex-wrap:wrap}.lane-guide small {font-size:8px}.surface-toolbar {gap:6px;font-size:9px}.surface-toolbar select {max-width:140px;font-size:9px}.surface-toolbar .intensity-legend {display:none}}
+@media(max-height:820px) and (min-width:851px) {.scene-app .view-workspace {overflow-y:auto}.scene-app .scene-panel {flex-shrink:0;min-height:400px}}
 @media(min-width:1750px) {.scene-app .scene-layout {grid-template-columns:290px minmax(0,1fr) 300px}.scene-app .view-workspace {padding:21px}.scene-app .camera-scroll .camera-card {min-height:145px}.scene-app .inspector-section {padding:18px}}
 @media(max-width:1400px) {.scene-app .scene-layout {grid-template-columns:220px minmax(0,1fr) 248px}.scene-app .view-workspace {padding:14px 12px}.scene-space-bar>span {font-size:8px; max-width:150px}.scene-app .scene-footer>span:last-child {display:none}.scene-app .section-header h1 {font-size:17px}.scene-app .inspector-section {padding:13px}.scene-app .scene-toolbar-right .toggle-button {font-size:0}.scene-app .scene-toolbar-right .toggle-button svg {width:13px}.scene-app .dataset-select select {max-width:200px}.scene-app .dataset-metrics {gap:14px}.scene-app .camera-scroll .camera-card {min-height:105px}.scene-app .timeline-title {font-size:7px}}
 @media(max-width:1100px) {.scene-app .scene-layout {grid-template-columns:185px minmax(0,1fr) 220px}.scene-space-bar>span {display:none}.scene-app .scene-toolbar {gap:4px}.scene-app .segmented button {font-size:8px;padding:5px}.scene-app .scene-toolbar .tool-buttons {gap:0}.scene-app .scene-toolbar .icon-button {width:24px}.scene-app .coordinate-tag {display:none}.scene-app .view-workspace {padding:12px 8px}.scene-app .camera-scroll .camera-card {min-height:92px}.camera-rail-heading {padding:14px 9px 10px}.camera-rail-heading h2 {font-size:10px}.camera-overlay-toggles .toggle-button {font-size:8px}.scene-app .dataset-metrics span:last-child {display:none}.scene-app .model-controls {font-size:9px}}

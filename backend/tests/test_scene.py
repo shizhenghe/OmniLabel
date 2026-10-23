@@ -183,6 +183,26 @@ def test_map_cache_invalidates_after_labels_change_but_registered_poses_survive(
     assert registered_poses(store, clip)["f2"][0, 3] == 4
 
 
+def test_old_fusion_cache_requires_refresh_without_losing_registration_or_labels(tmp_path):
+    clip = Clip.model_validate(clip_data())
+    store = Store(tmp_path)
+    store.add_clip(clip)
+    scene = save_scene(store, clip, scene_state())
+    result = reconstruct_scene(clip, {}, ReconstructionRequest())
+    assert result["preserve_detail"] and result["effective_voxel_size"] == .05
+    save_reconstruction(store, clip, result, source_fingerprint(store, clip), scene, source_poses(clip))
+    exported = scene_export(store, clip)
+    assert exported["scene_map"]["point_reduction"] == "brightest-measured-point"
+    path = tmp_path / "scene_maps" / f"{clip.id}.json"
+    old = json.loads(path.read_text())
+    old.pop("fusion_version")
+    path.write_text(json.dumps(old))
+    with pytest.raises(KeyError, match="profile changed"):
+        get_scene_map(store, clip)
+    assert get_scene(store, clip) == scene
+    assert registered_poses(store, clip)["f2"][0, 3] == 4
+
+
 def test_reconstruction_rejects_concurrent_annotation_changes(tmp_path):
     clip = Clip.model_validate(clip_data())
     store = Store(tmp_path)

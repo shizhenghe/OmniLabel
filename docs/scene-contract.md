@@ -13,6 +13,9 @@ interface SceneMap { points:number[][]; point_labels:Record<string,string>;
   coordinate_frame:'world'; frame_count:number; point_count:number;
   trajectory:{frame_id:string;timestamp:number;position:Vec3}[];
   bounds:{min:Vec3;max:Vec3}; method:string; voxel_size:number;
+  preserve_detail:boolean; detail_voxel_size:number; effective_voxel_size:number;
+  point_reduction:'brightest-measured-point'|'centroid-mean'; fusion_version:number;
+  intensity_available:boolean; intensity_has_contrast:boolean; intensity_range:[number,number]|null;
   registration?:Record<string,unknown>; [key:string]:unknown }
 ```
 
@@ -22,11 +25,22 @@ interface SceneMap { points:number[][]; point_labels:Record<string,string>;
 - `GET /api/clips/{id}/scene/frame/{frame_id}`: scene-derived `Annotations` in
   active LiDAR coordinates (keyframe interpolation, persistent world vectors).
 - `POST /api/clips/{id}/scene/reconstruct` JSON
-  `{voxel_size:number,registration:'poses'|'icp',exclude_dynamic:boolean}`:
+  `{voxel_size:number,registration:'poses'|'icp',exclude_dynamic:boolean,
+    preserve_detail?:boolean,detail_voxel_size?:number}`:
   returns persisted job `{id,kind:'reconstruct',status,...}`, polls existing jobs API.
   Pose mode fuses input poses; ICP mode registers scans, reports fit/degeneracy
   and never silently claims SLAM. Successful result is SceneMap and is cached.
+- Detail preservation defaults to true with 0.05m detail voxels (range 0.05–0.2m).
+  Effective voxel resolution is `min(voxel_size,detail_voxel_size)`. The brightest
+  observed sample per cell retains its paired XYZ/intensity/semantic label. Disabling
+  it restores centroids and mean intensity; legacy `fuse_map` callers still default
+  to that behavior. No reflectance or lane geometry absent from input is inferred.
+- `intensity_available` indicates a nonzero signal after filtering, not provenance of
+  the original file: normalized XYZ rows are zero-filled, and native all-zero intensity
+  is likewise treated as unusable. `intensity_has_contrast` reports actual variation.
 - `GET /api/clips/{id}/scene/map`: latest reconstructed SceneMap, 404 if absent.
+  Old fusion-version caches also return 404 to request refresh; saved registered
+  transforms and scene annotations are retained independently.
 - Exports should include `scene_annotations` and optional `scene_map` metadata;
   import validates and restores scene state. Existing source data is preserved.
 
