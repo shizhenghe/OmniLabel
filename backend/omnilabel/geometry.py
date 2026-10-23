@@ -150,13 +150,19 @@ def project_points(
     return {"points": projected, "width": width, "height": height, "occlusion_filtering": False}
 
 
-def fuse_map(clip: dict, annotations_by_frame: dict, voxel_size: float = 0.15) -> dict:
+def fuse_map(clip: dict, annotations_by_frame: dict, voxel_size: float = 0.15, *,
+             preserve_detail: bool = False, detail_voxel_size: float = 0.05) -> dict:
     """Fuse pose-aligned, dynamic-filtered scans into world-space voxel centroids.
 
     This uses supplied calibrated ego poses; it does not estimate SLAM poses.
-    Dynamic exclusion requires saved boxes or point semantic labels.
+    Dynamic exclusion requires saved boxes or point semantic labels. The optional
+    detail profile uses smaller voxels and retains the brightest *measured* XYZI
+    sample, so narrow painted markings are not replaced by an averaged intensity.
+    It cannot recover reflectance or markings absent from the supplied scans.
     """
     size = _voxel_size(voxel_size)
+    detail_size = _voxel_size(detail_voxel_size)
+    effective_size = min(size, detail_size) if preserve_detail else size
     if sum(len(frame.get("points", [])) for frame in clip["frames"]) > MAX_MAP_POINTS:
         raise ValueError(f"Map fusion accepts at most {MAX_MAP_POINTS} input points per job")
     clouds = []
@@ -184,26 +190,45 @@ def fuse_map(clip: dict, annotations_by_frame: dict, voxel_size: float = 0.15) -
     merged = np.concatenate(clouds) if clouds else np.empty((0, 4))
     semantic_labels = {}
     if len(merged):
-        indices = _voxel_indices(merged[:, :3], size)
+        indices = _voxel_indices(merged[:, :3], effective_size)
         _, inverse = np.unique(indices, axis=0, return_inverse=True)
         counts = np.bincount(inverse)
-        downsampled = np.column_stack([
-            np.bincount(inverse, weights=merged[:, axis]) / counts for axis in range(4)
-        ])
-        semantic_votes = defaultdict(Counter)
-        for output_index, label in zip(inverse, cloud_classes):
-            if label not in ("unknown", "unlabeled"):
-                semantic_votes[int(output_index)][label] += 1
-        semantic_labels = {
-            str(index): sorted(votes, key=lambda label: (-votes[label], label))[0]
-            for index, votes in semantic_votes.items()
-        }
+        if preserve_detail:
+            # Stable tie breaking retains an observed position and its paired
+            # intensity/semantic label, rather than inventing a bright centroid.
+            order = np.lexsort((np.arange(len(merged)), -merged[:, 3], inverse))
+            first = np.r_[True, np.diff(inverse[order]) != 0]
+            selected = order[first]
+            downsampled = merged[selected]
+            semantic_labels = {str(index): cloud_classes[source] for index, source in enumerate(selected)
+                               if cloud_classes[source] not in ("unknown", "unlabeled")}
+        else:
+            downsampled = np.column_stack([
+                np.bincount(inverse, weights=merged[:, axis]) / counts for axis in range(4)
+            ])
+            semantic_votes = defaultdict(Counter)
+            for output_index, label in zip(inverse, cloud_classes):
+                if label not in ("unknown", "unlabeled"):
+                    semantic_votes[int(output_index)][label] += 1
+            semantic_labels = {
+                str(index): sorted(votes, key=lambda label: (-votes[label], label))[0]
+                for index, votes in semantic_votes.items()
+            }
     else:
         downsampled = merged
     return {
         "points": downsampled.tolist(), "frame_count": len(clip["frames"]),
         "point_count": len(downsampled), "input_point_count": input_count,
         "excluded_dynamic_points": excluded_count, "voxel_size": size,
+        "preserve_detail": preserve_detail, "detail_voxel_size": detail_size,
+        "effective_voxel_size": effective_size,
+        "point_reduction": "brightest-measured-point" if preserve_detail else "centroid-mean",
+        # Frame normalisation pads XYZ-only input with zero; the schema alone
+        # therefore cannot establish measured reflectance provenance. Zero-only
+        # scans are treated as having no usable signal, including native zeros.
+        "intensity_available": bool(len(merged) and np.any(merged[:, 3] != 0)),
+        "intensity_has_contrast": bool(len(merged) and np.ptp(merged[:, 3]) > 1e-8),
+        "intensity_range": [float(merged[:, 3].min()), float(merged[:, 3].max())] if len(merged) else None,
         "point_labels": semantic_labels,
         "coordinate_frame": "world", "method": "pose-aligned static voxel fusion",
     }

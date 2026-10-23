@@ -61,3 +61,5 @@ class ReconstructionRequest(Model):
     voxel_size: float = Field(default=0.3, ge=0.1, le=5)
     registration: Literal["poses", "icp"] = "poses"
     exclude_dynamic: bool = True
+    preserve_detail: bool = True
+    detail_voxel_size: float = Field(default=0.05, ge=0.05, le=0.2)

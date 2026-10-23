@@ -24,6 +24,7 @@ from .storage import ConflictError, Store, atomic_json, safe_id
 MAX_ICP_POINTS = 3000
 MAX_ICP_ITERATIONS = 35
 MAX_ICP_PAIR_DISTANCE = 3.0
+FUSION_VERSION = 2
 
 
 def _scene_path(store: Store, clip_id: str) -> Path:
@@ -356,7 +357,8 @@ def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: Reconst
     corrected = clip.model_dump()
     for frame in corrected["frames"]:
         frame["ego_to_world"] = (poses[frame["id"]] @ np.linalg.inv(np.asarray(frame["lidar_to_ego"], dtype=float))).tolist()
-    result = fuse_map(corrected, fusion_annotations, request.voxel_size)
+    result = fuse_map(corrected, fusion_annotations, request.voxel_size,
+                      preserve_detail=request.preserve_detail, detail_voxel_size=request.detail_voxel_size)
     result["point_labels"] = {index: label.removeprefix("scene-static:") for index, label in result.get("point_labels", {}).items()}
     points = np.asarray(result["points"], dtype=float)
     if not len(points):
@@ -369,6 +371,7 @@ def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: Reconst
                       "note": "Uses supplied poses" if request.registration == "poses" else "Local sequential point-to-point ICP; no loop closure or global SLAM accuracy guarantee"},
         method="pose-aligned whole-clip static reconstruction" if request.registration == "poses" else "sequential ICP whole-clip static reconstruction",
         exclude_dynamic=request.exclude_dynamic,
+        fusion_version=FUSION_VERSION,
     )
     return result
 
@@ -394,6 +397,8 @@ def get_scene_map(store: Store, clip: Clip) -> dict:
         if not path.exists():
             raise KeyError("Scene map has not been reconstructed")
         value = json.loads(path.read_text())
+        if value.get("fusion_version") != FUSION_VERSION:
+            raise KeyError("Scene fusion profile changed; reconstruct the scene map to retain measured surface detail")
         if value.get("source_fingerprint") != source_fingerprint(store, clip):
             raise KeyError("Scene source annotations changed; reconstruct the scene map to refresh dynamic filtering")
         return value
@@ -434,7 +439,9 @@ def scene_export(store: Store, clip: Clip) -> dict:
     try:
         cached = get_scene_map(store, clip)
         value["scene_map"] = {key: deepcopy(cached[key]) for key in (
-            "coordinate_frame", "frame_count", "point_count", "trajectory", "bounds", "method", "voxel_size", "registration", "exclude_dynamic") if key in cached}
+            "coordinate_frame", "frame_count", "point_count", "trajectory", "bounds", "method", "voxel_size", "registration", "exclude_dynamic",
+            "fusion_version", "preserve_detail", "detail_voxel_size", "effective_voxel_size", "point_reduction",
+            "intensity_available", "intensity_has_contrast", "intensity_range") if key in cached}
     except KeyError:
         pass
     return value

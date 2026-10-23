@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { BoxTransformGizmo, type BoxTransformMode } from './BoxTransformGizmo';
 import type { Annotations, Box, Frame, Vec3, Voxel } from '../types';
+import { groundDrawingPoint, intensityBrightness, intensityRange, visiblePointIndices, type PointColorMode } from '../geometry/pointDisplay';
 
 export interface PointCloudViewProps {
   frame: Frame | null;
@@ -33,6 +34,13 @@ export interface PointCloudViewProps {
   showBoxes?: boolean;
   showVectors?: boolean;
   semantic?: boolean;
+  /** Explicit mode takes precedence over the legacy semantic switch. */
+  colorMode?: PointColorMode;
+  /** Display a height slice around groundZ without modifying the source cloud. */
+  groundOnly?: boolean;
+  groundBand?: number;
+  /** Ground vectors use the drawing plane rather than the first roof/tree hit. */
+  drawOnGround?: boolean;
   draftVector?: Vec3[];
   brushRadius?: number;
   /** Fallback drawing plane in LiDAR metres; surface hits retain measured Z. */
@@ -45,9 +53,9 @@ const COLORS: Record<string, string> = {
   pedestrian: '#f476aa', cyclist: '#aa96ff', bicycle: '#aa96ff',
   road: '#65acff', ground: '#65acff', sidewalk: '#cd9fe8',
   vegetation: '#a3d465', building: '#c39dff', pole: '#f1d36a',
-  lane: '#f7d16a', lane_line: '#f7d16a', lane_marking: '#f7d16a',
+  lane: '#f7d16a', lane_line: '#f7d16a', lane_marking: '#f7d16a', lane_solid: '#f7d16a', lane_dashed: '#f7d16a',
   road_boundary: '#37ddbf', stop_line: '#f476aa',
-  curb: '#ef8d85', crosswalk: '#aa96ff', drivable_area: '#65acff',
+  curb: '#ef8d85', crosswalk: '#aa96ff', direction_arrow: '#aa96ff', drivable_area: '#65acff',
   unknown: '#98a8b8', unlabeled: '#98a8b8', free: '#446f8d',
 };
 
@@ -137,6 +145,9 @@ export function PointCloudView(props: PointCloudViewProps) {
   const [cursor, setCursor] = useState('');
   const [ready, setReady] = useState(false);
   const pointerStart = useRef<[number, number] | null>(null);
+  const colorMode = props.colorMode ?? (props.semantic ? 'semantic' : 'height');
+  const visibleIndices = useMemo(() => visiblePointIndices(props.frame?.points ?? [], props.groundOnly, props.groundZ ?? -1.7, props.groundBand),
+    [props.frame?.points, props.groundOnly, props.groundZ, props.groundBand]);
 
   useEffect(() => {
     const host = container.current;
@@ -217,28 +228,35 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.cloud = null;
     const points = props.frame?.points;
     if (!points?.length) return;
-    const positions = new Float32Array(points.length * 3);
-    const colors = new Float32Array(points.length * 3);
+    const positions = new Float32Array(visibleIndices.length * 3);
+    const colors = new Float32Array(visibleIndices.length * 3);
     const color = new THREE.Color();
-    points.forEach((p, i) => {
-      positions.set(p.slice(0, 3), i * 3);
-      const label = props.annotations.point_labels[String(i)];
-      if (props.semantic && label) color.set(labelColor(label));
-      else if (props.semantic) color.set('#748a9e');
+    const range = colorMode === 'intensity' ? intensityRange(points, visibleIndices) : null;
+    visibleIndices.forEach((sourceIndex, displayIndex) => {
+      const p = points[sourceIndex];
+      positions.set(p.slice(0, 3), displayIndex * 3);
+      const label = props.annotations.point_labels[String(sourceIndex)];
+      if (colorMode === 'semantic' && label) color.set(labelColor(label));
+      else if (colorMode === 'semantic') color.set('#748a9e');
+      else if (colorMode === 'intensity') {
+        const brightness = intensityBrightness(p[3], range);
+        color.setRGB(brightness, brightness, brightness, THREE.SRGBColorSpace);
+      }
       else {
         const height = THREE.MathUtils.clamp((p[2] + 2.2) / 7, 0, 1);
         color.setHSL(0.55 - height * 0.5, 0.64, 0.46 + height * 0.17);
       }
-      colors.set([color.r, color.g, color.b], i * 3);
+      colors.set([color.r, color.g, color.b], displayIndex * 3);
     });
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geometry.computeBoundingSphere();
-    const cloud = new THREE.Points(geometry, new THREE.PointsMaterial({ size: 0.095, vertexColors: true, sizeAttenuation: true }));
+    const cloud = new THREE.Points(geometry, new THREE.PointsMaterial({ size: colorMode === 'intensity' ? 2.5 : .095, vertexColors: true, sizeAttenuation: colorMode !== 'intensity' }));
+    cloud.userData.sourceIndices = visibleIndices;
     rt.pointsGroup.add(cloud);
     rt.cloud = cloud;
-  }, [ready, props.frame?.points, props.annotations.point_labels, props.semantic]);
+  }, [ready, props.frame?.points, props.annotations.point_labels, colorMode, visibleIndices]);
 
   const fittedScene = useRef<number[][] | null>(null);
   useEffect(() => {
@@ -301,7 +319,8 @@ export function PointCloudView(props: PointCloudViewProps) {
         const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(coordinates), new THREE.LineBasicMaterial({ color, depthTest: false }));
         line.userData.vectorId = vector.id;
         rt.annotationsGroup.add(line);
-        const dots = new THREE.Points(new THREE.BufferGeometry().setFromPoints(coordinates), new THREE.PointsMaterial({ color, size: 0.24, sizeAttenuation: true, depthTest: false }));
+        const dots = new THREE.Points(new THREE.BufferGeometry().setFromPoints(coordinates), new THREE.PointsMaterial({ color, size: vector.id === '__draft__' ? 8 : vector.id === props.selectedId ? 7 : 4, sizeAttenuation: false, depthTest: false }));
+        dots.userData.vectorId = vector.id === '__draft__' ? undefined : vector.id;
         rt.annotationsGroup.add(dots);
       });
     }
@@ -402,7 +421,10 @@ export function PointCloudView(props: PointCloudViewProps) {
     }
     const cloudHit = rt.cloud ? raycaster.intersectObject(rt.cloud)[0] : undefined;
     const ground = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -(current.groundZ ?? -1.7)), new THREE.Vector3());
-    const point = cloudHit?.point ?? ground;
+    let point = cloudHit?.point ?? ground;
+    if (current.tool === 'vector' && current.drawOnGround && ground) {
+      point = new THREE.Vector3(...groundDrawingPoint(current.frame?.points ?? [], [ground.x, ground.y, ground.z], current.groundBand));
+    }
     if (!point) return;
     const coordinates: Vec3 = [point.x, point.y, point.z];
     if (current.tool === 'box') current.onCreateBox?.(coordinates);
@@ -410,7 +432,9 @@ export function PointCloudView(props: PointCloudViewProps) {
     else if (current.tool === 'brush' && !current.sceneMode) {
       const radius = current.brushRadius ?? 1.5;
       const indices: number[] = [];
-      current.frame?.points.forEach((p, index) => {
+      const sourceIndices: number[] = rt.cloud?.userData.sourceIndices ?? [];
+      sourceIndices.forEach(index => {
+        const p = current.frame!.points[index];
         if (Math.hypot(p[0] - point.x, p[1] - point.y, p[2] - point.z) <= radius) indices.push(index);
       });
       if (indices.length) current.onPaint?.(indices);
@@ -423,6 +447,8 @@ export function PointCloudView(props: PointCloudViewProps) {
     data-testid="point-cloud-view"
     data-coordinate-frame={props.sceneMode ? 'world' : 'lidar'}
     data-cloud-point-count={props.frame?.points.length ?? 0}
+    data-visible-point-count={visibleIndices.length}
+    data-color-mode={colorMode}
     data-active-frame-id={props.activeFrameId ?? props.frame?.id ?? ''}
     style={{ position: 'relative', width: '100%', height: '100%', minHeight: 240, overflow: 'hidden', cursor: props.tool && props.tool !== 'select' ? 'crosshair' : 'grab' }}
     onPointerDown={(event) => { pointerStart.current = [event.clientX, event.clientY]; }}

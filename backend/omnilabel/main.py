@@ -56,15 +56,20 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     async def lifespan(application):
         # This local store supports one service process (uvicorn --workers 1).
         store.recover_interrupted_jobs()
-        if seed_demo and not (store.root / "clips" / "demo.json").exists():
+        if seed_demo:
             from .demo import build_demo
-            demo_assets = store.root / "assets" / "demo"
-            demo_assets.mkdir(parents=True, exist_ok=True)
-            clip_raw, initial_annotations = build_demo(demo_assets)
-            clip = Clip.model_validate(clip_raw)
-            annotations = {f.id: Annotations.model_validate(initial_annotations.get(f.id, {})).validate_for_frame(f, clip.cameras)
-                           for f in clip.frames}
-            store.add_clip(clip, annotations)
+            # New fixture is additive: never replace an existing editable clip,
+            # its source scans, or a user's saved frame/scene annotations.
+            for clip_id in ("demo", "demo-ground-detail"):
+                if (store.root / "clips" / f"{clip_id}.json").exists():
+                    continue
+                demo_assets = store.root / "assets" / clip_id
+                demo_assets.mkdir(parents=True, exist_ok=True)
+                clip_raw, initial_annotations = build_demo(demo_assets, clip_id=clip_id)
+                clip = Clip.model_validate(clip_raw)
+                annotations = {f.id: Annotations.model_validate(initial_annotations.get(f.id, {})).validate_for_frame(f, clip.cameras)
+                               for f in clip.frames}
+                store.add_clip(clip, annotations)
         yield
         executor.shutdown(wait=True, cancel_futures=True)
 
