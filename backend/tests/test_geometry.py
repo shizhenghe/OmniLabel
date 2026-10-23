@@ -1,0 +1,153 @@
+import numpy as np
+import pytest
+
+import omnilabel.geometry as geometry
+
+from omnilabel.geometry import (
+    build_occupancy, fuse_map, project_points, propagate_annotations, segment_ground,
+)
+
+
+def frame(points, frame_id="f0", translation=(0, 0, 0)):
+    pose = np.eye(4)
+    pose[:3, 3] = translation
+    return {"id": frame_id, "points": points, "ego_to_world": pose.tolist(),
+            "lidar_to_ego": np.eye(4).tolist(), "images": {}, "timestamp": 0}
+
+
+def annotations(**kwargs):
+    return {"boxes": [], "vectors": [], "image_polygons": [], "point_labels": {}, "revision": 0, **kwargs}
+
+
+def camera(**kwargs):
+    return {"id": "front", "width": 100, "height": 100,
+            "intrinsics": [[10, 0, 50], [0, 10, 50], [0, 0, 1]],
+            "camera_from_ego": np.eye(4).tolist(), **kwargs}
+
+
+def test_projection_positive_depth_pixel_bounds_stride_and_original_indices():
+    cloud = frame([[0, 0, 2, 1], [0, 0, -2, 1], [2, 0, 2, 1], [100, 0, 1, 1]])
+    result = project_points(cloud, camera(), annotations(point_labels={"2": "car"}))
+    assert [(p["index"], p["u"], p["v"]) for p in result["points"]] == [(0, 50, 50), (2, 60, 50)]
+    assert result["points"][1]["label"] == "car"
+    assert [p["index"] for p in project_points(cloud, camera(), stride=2)["points"]] == [0, 2]
+
+
+def test_projection_composes_lidar_extrinsic_and_radial_tangential_distortion():
+    cloud = frame([[0, 1, 2]])
+    cloud["lidar_to_ego"][0][3] = 1
+    result = project_points(cloud, camera(distortion=[0.1, 0, 0.02, 0.03, 0]))
+    # x=y=.5; radial=1.05; dx=.01+.03; dy=.02+.015.
+    assert result["points"][0]["u"] == pytest.approx(55.65)
+    assert result["points"][0]["v"] == pytest.approx(55.60)
+
+
+def test_projection_empty_and_bad_transform():
+    assert project_points(frame([]), camera())["points"] == []
+    invalid = camera()
+    invalid["camera_from_ego"][0][0] = 2
+    with pytest.raises(ValueError, match="orthonormal"):
+        project_points(frame([[1, 2, 3]]), invalid)
+
+
+def test_world_map_uses_ego_and_lidar_transform_voxel_centroids_and_dynamic_exclusion():
+    a = frame([[1, 0, 0, 0.2], [10, 0, 0, 0.8]], "a")
+    a["lidar_to_ego"][0][3] = 1
+    b = frame([[0.1, 0, 0, 0.6]], "b", (2, 0, 0))
+    box = {"center": [10, 0, 0], "size": [2, 2, 2], "yaw": 0, "label": "car"}
+    result = fuse_map({"frames": [a, b]}, {"a": annotations(boxes=[box], point_labels={"0": "road"})}, 0.5)
+    assert result["excluded_dynamic_points"] == 1
+    assert result["frame_count"] == 2
+    assert result["coordinate_frame"] == "world"
+    np.testing.assert_allclose(result["points"], [[2.05, 0, 0, 0.4]])
+    assert result["point_labels"] == {"0": "road"}
+
+
+def test_map_rejects_coordinates_that_would_overflow_voxel_indices():
+    with pytest.raises(ValueError, match="safe voxel-index range"):
+        fuse_map({"frames": [frame([[1e20, 0, 0], [-1e20, 0, 0]])]}, {}, 0.5)
+
+
+def test_occupancy_negative_coordinates_free_rays_and_occupied_precedence():
+    cloud = frame([[2.1, 0.1, 0.1], [1.1, 0.1, 0.1], [-2.1, 0.1, 0.1]])
+    result = build_occupancy(cloud, annotations(point_labels={"0": "car"}), 1)
+    cells = {tuple(cell["index"]): cell for cell in result["voxels"]}
+    assert cells[(2, 0, 0)]["label"] == "car"
+    assert cells[(1, 0, 0)]["state"] == "occupied"
+    assert cells[(0, 0, 0)]["state"] == "free"
+    assert cells[(-1, 0, 0)]["state"] == "free"
+    assert cells[(-3, 0, 0)]["state"] == "occupied"
+    assert (2, 2, 2) not in cells  # unobserved is unknown, never free
+    assert not result["truncated"]
+
+
+def test_occupancy_diagonal_ray_does_not_mark_touching_cells_free():
+    result = build_occupancy(frame([[2.1, 2.1, 0.1]]), annotations(), 1)
+    free = {tuple(cell["index"]) for cell in result["voxels"] if cell["state"] == "free"}
+    assert (1, 1, 0) in free
+    assert (1, 0, 0) not in free
+
+
+def test_occupancy_semantic_box_fallback_and_out_of_range():
+    box = {"center": [1, 0, 0], "size": [2, 2, 2], "yaw": 0, "label": "vehicle"}
+    result = build_occupancy(frame([[1, 0, 0], [1000, 0, 0]]), annotations(boxes=[box]), 0.5)
+    assert result["out_of_range_points"] == 1
+    assert next(v for v in result["voxels"] if v["state"] == "occupied")["label"] == "vehicle"
+    with pytest.raises(ValueError, match="voxel_size"):
+        build_occupancy(frame([]), annotations(), 0)
+
+
+def test_occupancy_budget_is_explicit_and_does_not_remove_occupied_endpoints(monkeypatch):
+    monkeypatch.setattr(geometry, "MAX_RAY_VISITS", 1)
+    result = build_occupancy(frame([[10, 0, 0], [20, 0, 0]]), annotations(), 1)
+    assert result["truncated"]
+    assert result["traced_rays"] == 0
+    assert result["occupied_count"] == 2
+    assert result["total_rays"] == 2
+
+
+def test_ground_segmentation_preserves_manual_edits_and_separates_raised_points():
+    ground = [[x, y, -1.5, 1] for x in range(-3, 4) for y in range(-3, 4)]
+    cloud = frame(ground + [[0, 0, 0, 1]])
+    source = annotations(point_labels={"0": "road"})
+    result = segment_ground(cloud, source)
+    assert result["point_labels"]["0"] == "road"
+    assert result["point_labels"]["1"] == "ground"
+    assert result["point_labels"][str(len(ground))] == "obstacle"
+    assert source["point_labels"] == {"0": "road"}
+
+
+def test_propagation_compensates_ego_motion_and_preserves_target_annotations():
+    box = {"id": "b0", "track_id": "track-1", "label": "car", "center": [10, 0, 1],
+           "size": [4, 2, 2], "yaw": 0}
+    vector = {"id": "v0", "label": "lane", "points": [[0, 2, 0], [10, 2, 0]], "closed": False}
+    source = annotations(boxes=[box], vectors=[vector], point_labels={"0": "car"})
+    target = annotations(image_polygons=[{"id": "p0"}], point_labels={"5": "road"})
+    result = propagate_annotations(frame([], "a"), frame([], "b", (2, 0, 0)), source, target)
+    assert result["boxes"][0]["center"] == pytest.approx([8, 0, 1])
+    assert result["boxes"][0]["track_id"] == "track-1"
+    assert result["vectors"][0]["points"][0] == pytest.approx([-2, 2, 0])
+    assert result["point_labels"] == {"5": "road"}
+    assert result["image_polygons"] == [{"id": "p0"}]
+    again = propagate_annotations(frame([], "a"), frame([], "b", (2, 0, 0)), source, result)
+    assert len(again["boxes"]) == 1
+    assert len(again["vectors"]) == 1
+    assert target["boxes"] == []
+
+
+def test_propagation_rotates_heading_and_centers():
+    target = frame([], "b")
+    target["ego_to_world"] = [[0, -1, 0, 0], [1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    box = {"id": "b0", "track_id": "t", "label": "car", "center": [10, 0, 0], "size": [4, 2, 2], "yaw": 0}
+    result = propagate_annotations(frame([], "a"), target, annotations(boxes=[box]))
+    assert result["boxes"][0]["center"] == pytest.approx([0, -10, 0])
+    assert result["boxes"][0]["yaw"] == pytest.approx(-np.pi / 2)
+
+
+def test_propagation_vector_id_collision_with_other_annotation_type_is_safe_and_idempotent():
+    source = annotations(vectors=[{"id": "shared", "label": "lane", "points": [[0, 0, 0], [1, 0, 0]], "closed": False}])
+    target = annotations(image_polygons=[{"id": "shared"}])
+    result = propagate_annotations(frame([], "a"), frame([], "b"), source, target)
+    assert result["vectors"][0]["id"] != "shared"
+    again = propagate_annotations(frame([], "a"), frame([], "b"), source, result)
+    assert len(again["vectors"]) == 1
