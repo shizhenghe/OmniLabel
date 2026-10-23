@@ -13,7 +13,10 @@ python -m pip install -r model_workers/requirements-worker.txt
 case "$model" in
   sam2)
     python -c 'import sys; assert sys.version_info >= (3,10), "SAM2 requires Python 3.10+"'
-    python -m pip install "git+https://github.com/facebookresearch/sam2.git@${SAM2_SOURCE_REF:-2b90b9f5ceec907a1c18123530e92e794ad901a4}"
+    python -m pip install 'setuptools>=64' wheel
+    # Use the already selected torch build for model compilation. Build isolation
+    # otherwise downloads another torch runtime from SAM2's build requirements.
+    python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/sam2.git@${SAM2_SOURCE_REF:-2b90b9f5ceec907a1c18123530e92e794ad901a4}"
     ;;
   mmdetection3d)
     python -m pip install openmim

@@ -18,6 +18,7 @@ interface Props {
 
 interface Handle {
   id: string;
+  action: BoxTransformMode;
   label: string;
   color: string;
   world: THREE.Vector3;
@@ -38,6 +39,7 @@ interface Drag {
 }
 
 const AXES = ['x', 'y', 'z'];
+const DIMENSIONS = ['长', '宽', '高'];
 const COLORS = ['#ff8080', '#7de2aa', '#78adff'];
 
 export function normalizeYaw(value: number) {
@@ -59,7 +61,7 @@ function makeHandles(box: Box, mode: BoxTransformMode): Handle[] {
   const center = new THREE.Vector3(...box.center);
   if (mode === 'rotate') {
     const radius = Math.max(box.size[0], box.size[1]) * 0.7 + 1;
-    return [{ id: 'rotate-z', label: '拖动旋转航向角', color: '#f7d16a',
+    return [{ id: 'rotate-z', action: 'rotate', label: '拖动旋转航向角', color: '#f7d16a',
       world: center.clone().add(new THREE.Vector3(Math.cos(box.yaw), Math.sin(box.yaw), 0).multiplyScalar(radius)),
       axis: new THREE.Vector3(0, 0, 1) }];
   }
@@ -68,18 +70,22 @@ function makeHandles(box: Box, mode: BoxTransformMode): Handle[] {
     return [
       ...AXES.map((name, dimension) => {
         const axis = new THREE.Vector3().setComponent(dimension, 1);
-        return { id: `translate-${name}`, label: `拖动沿 ${name.toUpperCase()} 平移`, color: COLORS[dimension],
+        return { id: `translate-${name}`, action: 'translate' as const, label: `拖动沿 ${name.toUpperCase()} 平移`, color: COLORS[dimension],
           world: center.clone().addScaledVector(axis, length), axis, dimension };
       }),
-      { id: 'translate-xy', label: '拖动在水平面平移', color: '#ffffff', world: center, axis: new THREE.Vector3() },
+      { id: 'translate-xy', action: 'translate', label: '拖动在水平面平移', color: '#ffffff', world: center, axis: new THREE.Vector3() },
     ];
   }
-  return AXES.flatMap((name, dimension) => [-1, 1].map(sign => {
+  const faces: Handle[] = AXES.flatMap((name, dimension) => [-1, 1].map(sign => {
     const axis = new THREE.Vector3().setComponent(dimension, sign);
     axis.applyAxisAngle(new THREE.Vector3(0, 0, 1), box.yaw);
-    return { id: `scale-${name}${sign < 0 ? '-negative' : ''}`, label: `拖动调整 ${name.toUpperCase()}${sign < 0 ? '负' : '正'}侧尺寸`,
+    return { id: `scale-${name}${sign < 0 ? '-negative' : ''}`, action: 'scale' as const, label: `拖动调整 ${name.toUpperCase()}${sign < 0 ? '负' : '正'}侧尺寸`,
       color: COLORS[dimension], world: center.clone().addScaledVector(axis, box.size[dimension] / 2), axis, dimension };
   }));
+  // The default resize tool also exposes a center grip, so moving and sizing
+  // a selected box require no tool switch or property-panel input.
+  return [...faces, {id: 'translate-xy', action: 'translate', label: '拖动在水平面平移',
+    color: '#ffffff', world: center, axis: new THREE.Vector3()}];
 }
 
 function pointerRay(event: {clientX: number; clientY: number}, props: Props) {
@@ -131,13 +137,39 @@ export function BoxTransformGizmo(props: Props) {
         // Keep handles usable while inspecting a large world map. The line
         // extends the projected face/axis; all drag deltas still use the true
         // world-space plane rather than a screen-pixel scale approximation.
-        const minimum = p.mode === 'scale' ? 27 : 40;
-        if (screenLength > 1.5 && screenLength < minimum) {
+        const minimum = handle.action === 'scale' ? 44 : 40;
+        if (screenLength > 1e-4 && screenLength < minimum) {
           x = centerX + dx / screenLength * minimum;
           y = centerY + dy / screenLength * minimum;
         }
         return { ...handle, x, y,
-          visible: pixel.z > -1 && pixel.z < 1 && (length < 0.001 || screenLength > 1.5) };
+          visible: pixel.z > -1 && pixel.z < 1 && (length < 0.001 || screenLength > 1e-4) };
+      });
+      // Narrow boxes can project a face to a fraction of one pixel at world-map
+      // zoom. Keep that grip and separate overlapping labels in screen space;
+      // the measured face positions and world-space drag planes stay unchanged.
+      const centerGrip = handles.find(handle => handle.id === 'translate-xy');
+      const placed: ScreenHandle[] = centerGrip?.visible ? [centerGrip] : [];
+      const dimensions = (handle: ScreenHandle) => handle.action === 'scale' ? [34, 26] : [25, 25];
+      handles.filter(handle => handle.visible && handle.id !== 'translate-xy').forEach(handle => {
+        const dx = handle.x - (center.x + 1) * rect.width / 2;
+        const dy = handle.y - (1 - center.y) * rect.height / 2;
+        const length = Math.max(Math.hypot(dx, dy), 1e-4);
+        const tangent = {x: -dy / length, y: dx / length};
+        const size = dimensions(handle);
+        const offsets = [0, 42, -42, 84, -84, 126, -126];
+        const desired = {x: handle.x, y: handle.y};
+        for (const offset of offsets) {
+          const x = desired.x + tangent.x * offset, y = desired.y + tangent.y * offset;
+          if (placed.some(other => {
+            const otherSize = dimensions(other);
+            return Math.abs(x - other.x) < (size[0] + otherSize[0]) / 2 + 5 &&
+              Math.abs(y - other.y) < (size[1] + otherSize[1]) / 2 + 5;
+          })) continue;
+          handle.x = x; handle.y = y;
+          break;
+        }
+        placed.push(handle);
       });
       const next = { center: {x: (center.x + 1) * rect.width / 2, y: (1 - center.y) * rect.height / 2},
         handles, width: rect.width, height: rect.height };
@@ -165,7 +197,7 @@ export function BoxTransformGizmo(props: Props) {
     p.controls.enableDamping = damping;
     const center = new THREE.Vector3(...p.box.center);
     let normal: THREE.Vector3;
-    if (p.mode === 'rotate' || handle.id === 'translate-xy') normal = new THREE.Vector3(0, 0, 1);
+    if (handle.action === 'rotate' || handle.id === 'translate-xy') normal = new THREE.Vector3(0, 0, 1);
     else {
       normal = p.camera.getWorldDirection(new THREE.Vector3());
       normal.addScaledVector(handle.axis, -normal.dot(handle.axis));
@@ -175,7 +207,7 @@ export function BoxTransformGizmo(props: Props) {
       if (normal.lengthSq() < 1e-6) return;
       normal.normalize();
     }
-    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, p.mode === 'rotate' ? center : handle.world);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, handle.action === 'rotate' ? center : handle.world);
     const start = pointerRay(event, p).intersectPlane(plane, new THREE.Vector3());
     if (!start) return;
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -194,11 +226,11 @@ export function BoxTransformGizmo(props: Props) {
     if (!hit) return;
     const delta = hit.clone().sub(current.start);
     let patch: Partial<Box>;
-    if (latest.current.mode === 'rotate') {
+    if (current.handle.action === 'rotate') {
       const origin = new THREE.Vector3(...current.box.center);
       const first = current.start.clone().sub(origin), now = hit.clone().sub(origin);
       patch = {yaw: normalizeYaw(current.box.yaw + Math.atan2(now.y, now.x) - Math.atan2(first.y, first.x))};
-    } else if (latest.current.mode === 'scale') {
+    } else if (current.handle.action === 'scale') {
       const dimension = current.handle.dimension!;
       patch = resizeBoxFace(current.box, dimension, current.handle.id.endsWith('-negative') ? -1 : 1, delta.dot(current.handle.axis));
     } else {
@@ -218,19 +250,20 @@ export function BoxTransformGizmo(props: Props) {
         stroke={handle.color} strokeWidth={active === handle.id ? 3 : 1.6} opacity={0.85} />)}
     </svg>
     {layout.handles.map(handle => <button key={handle.id} type="button" title={handle.label} aria-label={handle.label}
-      data-testid={`box-handle-${handle.id}`} data-world-x={handle.world.x} data-world-y={handle.world.y} data-world-z={handle.world.z}
+      data-testid={`box-handle-${handle.id}`} data-action={handle.action} data-world-x={handle.world.x} data-world-y={handle.world.y} data-world-z={handle.world.z}
       onPointerDown={event => begin(event, handle)} onPointerMove={move}
       onPointerUp={event => {event.stopPropagation(); endDrag();}}
       onPointerCancel={endDrag} onLostPointerCapture={() => {if (drag.current) endDrag();}}
       onClick={event => {event.preventDefault(); event.stopPropagation();}}
       style={{position: 'absolute', left: handle.x, top: handle.y, transform: 'translate(-50%,-50%)',
-        width: handle.id === 'translate-xy' ? 20 : 19, height: handle.id === 'translate-xy' ? 20 : 19,
+        width: handle.action === 'scale' ? 34 : 25, height: handle.action === 'scale' ? 26 : 25,
         display: handle.visible || active === handle.id ? 'grid' : 'none', placeItems: 'center', padding: 0,
         background: active === handle.id ? handle.color : '#0d1927e8', color: active === handle.id ? '#10212e' : handle.color,
-        border: `2px solid ${handle.color}`, borderRadius: props.mode === 'scale' ? 2 : '50%',
+        border: `2px solid ${handle.color}`, borderRadius: handle.action === 'scale' ? 3 : '50%',
         boxShadow: '0 0 0 2px #09111bcc', pointerEvents: 'auto', touchAction: 'none', cursor: active ? 'grabbing' : 'grab',
         font: '700 10px ui-monospace,monospace', userSelect: 'none'}}>
-      {handle.id === 'translate-xy' ? '↔' : props.mode === 'rotate' ? '↻' : AXES[handle.dimension!].toUpperCase()}
+      {handle.id === 'translate-xy' ? '↔' : handle.action === 'rotate' ? '↻' : handle.action === 'scale'
+        ? `${DIMENSIONS[handle.dimension!]}${handle.id.endsWith('-negative') ? '−' : '+'}` : AXES[handle.dimension!].toUpperCase()}
     </button>)}
   </div>;
 }

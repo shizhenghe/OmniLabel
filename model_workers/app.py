@@ -32,6 +32,10 @@ def create_app(model_id=None, adapter=None, eager_load=True):
         if eager_load and runtime.status()["status"] == "configured":
             try:
                 await run_in_threadpool(runtime.load)
+            except ModelUnavailable as exc:
+                # These are deliberately operator-facing prerequisite messages,
+                # unlike arbitrary framework exceptions that may include paths.
+                runtime.failure = str(exc)
             except Exception as exc:
                 # Show an actionable class without URLs, checkpoint data or tokens.
                 runtime.failure = "Model initialization failed (" + type(exc).__name__ + "). Check the matching dependency/config/checkpoint versions on the worker."

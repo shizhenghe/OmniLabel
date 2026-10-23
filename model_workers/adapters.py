@@ -7,6 +7,7 @@ does not require fabricated ground-truth tensors used by its evaluation API.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 import importlib
 import importlib.util
 import json
@@ -27,6 +28,26 @@ def module_present(name):
         return importlib.util.find_spec(name) is not None
     except (ValueError, ImportError, ModuleNotFoundError):
         return False
+
+
+def resolve_sam2_precision(torch, device, requested="auto"):
+    """Turing uses FP16; native BF16 requires Ampere+ on the selected GPU.
+
+    Some torch versions report emulated BF16 as supported on older cards. The
+    capability check prevents treating that as native SAM2 BF16 support.
+    """
+    if requested not in ("auto", "float16", "bfloat16", "float32"):
+        raise ModelUnavailable("SAM2_PRECISION must be auto, float16, bfloat16 or float32")
+    if not str(device).startswith("cuda"):
+        if requested not in ("auto", "float32"):
+            raise ModelUnavailable("SAM2 float16/bfloat16 precision requires a CUDA device; use float32 on CPU")
+        return "float32"
+    with torch.cuda.device(device):
+        major, _ = torch.cuda.get_device_capability(device)
+        native_bf16 = major >= 8 and torch.cuda.is_bf16_supported()
+    if requested == "bfloat16" and not native_bf16:
+        raise ModelUnavailable("SAM2 bfloat16 requires native BF16 on Ampere or newer; use auto or float16 on RTX 2080/Turing")
+    return ("bfloat16" if native_bf16 else "float16") if requested == "auto" else requested
 
 
 class Adapter:
@@ -80,10 +101,25 @@ class SAM2Adapter(Adapter):
     tasks = ["image-segmentation"]
     dependencies = ["torch", "torchvision", "sam2"]
     checkpoint_variable = "SAM2_CHECKPOINT"
+    precision = None
+    points_per_batch = 16
+
+    def status(self):
+        value = super().status()
+        value["precision"] = self.precision or os.environ.get("SAM2_PRECISION", "auto")
+        return value
 
     def load(self):
         self.prerequisites()
+        import torch
         from sam2.build_sam import build_sam2
+        self.precision = resolve_sam2_precision(torch, self.device, os.environ.get("SAM2_PRECISION", "auto"))
+        try:
+            self.points_per_batch = int(os.environ.get("SAM2_POINTS_PER_BATCH", "16"))
+        except ValueError:
+            raise ModelUnavailable("SAM2_POINTS_PER_BATCH must be an integer from 1 to 128") from None
+        if not 1 <= self.points_per_batch <= 128:
+            raise ModelUnavailable("SAM2_POINTS_PER_BATCH must be an integer from 1 to 128")
         checkpoint = os.environ[self.checkpoint_variable]
         config = os.environ.get("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_t.yaml")
         self.model = build_sam2(config, checkpoint, device=self.device, apply_postprocessing=False)
@@ -113,7 +149,9 @@ class SAM2Adapter(Adapter):
             if box.shape != (4,) or not np.isfinite(box).all() or not (0 <= box[0] < box[2] <= camera["width"] and 0 <= box[1] < box[3] <= camera["height"]):
                 raise InvalidInput("SAM2 box prompt must be [x1,y1,x2,y2] inside the original image")
         masks = []
-        with torch.inference_mode():
+        autocast = nullcontext() if self.precision == "float32" else torch.autocast(
+            device_type="cuda", dtype=getattr(torch, self.precision))
+        with torch.inference_mode(), autocast:
             if prompt_points.size or box is not None:
                 predictor = SAM2ImagePredictor(self.model)
                 predictor.set_image(image_array)
@@ -124,7 +162,7 @@ class SAM2Adapter(Adapter):
                 masks = [(mask, float(score)) for mask, score in zip(predicted, scores) if float(score) >= threshold]
             else:
                 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-                generator = SAM2AutomaticMaskGenerator(self.model, points_per_side=16,
+                generator = SAM2AutomaticMaskGenerator(self.model, points_per_side=16, points_per_batch=self.points_per_batch,
                     pred_iou_thresh=max(threshold, 0.7), min_mask_region_area=0)
                 generated = sorted(generator.generate(image_array), key=lambda item: item["predicted_iou"], reverse=True)
                 maximum = options.get("max_masks", 32)
@@ -140,7 +178,7 @@ class SAM2Adapter(Adapter):
                 annotation_id = new_id("sam2")
                 annotations["image_polygons"].append({"id": annotation_id, "camera_id": camera_id, "label": label, "points": polygon})
                 confidence[annotation_id] = score
-        return {"annotations": annotations, "model_version": self.version,
+        return {"annotations": annotations, "model_version": self.version, "inference_precision": self.precision,
                 "confidence": confidence, "conversion": conversions,
                 "warnings": ["SAM2 predicts class-agnostic masks. The selected label is assigned by the annotator, not inferred from text.",
                              "Simple polygon conversion approximates raster boundaries; holes are reported and require manual review."]}

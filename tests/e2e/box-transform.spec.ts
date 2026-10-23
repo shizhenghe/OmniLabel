@@ -25,3 +25,15 @@ test('yaw normalization keeps shortest-equivalent rotation at the wrap boundary'
   expect(normalizeYaw(2 * Math.PI + 0.2)).toBeCloseTo(0.2);
   expect(normalizeYaw(-2 * Math.PI - 0.2)).toBeCloseTo(-0.2);
 });
+
+test('width resize at an arbitrary yaw preserves the opposite local side and the other dimensions', () => {
+  const original: Box = {...box, yaw: .63};
+  const result = resizeBoxFace(original, 1, -1, .8);
+  expect(result.size).toEqual([4, 2.8, 2]);
+  const localWidthAxis = [-Math.sin(original.yaw), Math.cos(original.yaw), 0];
+  for (let i = 0; i < 3; i++) {
+    const oldOpposite = original.center[i] + localWidthAxis[i] * original.size[1] / 2;
+    const newOpposite = result.center![i] + localWidthAxis[i] * result.size![1] / 2;
+    expect(newOpposite).toBeCloseTo(oldOpposite, 10);
+  }
+});
