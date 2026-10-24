@@ -144,7 +144,7 @@ def test_mixed_xyz_xyzi_normalized_and_npy_rejects_complex():
 def test_npy_forged_shape_rejected_before_allocating():
     contents = io.BytesIO()
     np.lib.format.write_array_header_1_0(contents, {"descr": "<f4", "fortran_order": False, "shape": (2**40, 4)})
-    with pytest.raises(ValueError, match="500000"):
+    with pytest.raises(ValueError, match="shorter than its declared shape"):
         decode_points(contents.getvalue(), "points.npy")
 
 

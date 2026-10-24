@@ -190,3 +190,46 @@ def test_propagation_vector_id_collision_with_other_annotation_type_is_safe_and_
     assert result["vectors"][0]["id"] != "shared"
     again = propagate_annotations(frame([], "a"), frame([], "b"), source, result)
     assert len(again["vectors"]) == 1
+
+
+def test_full_fusion_retains_every_measured_point_without_voxel_or_count_truncation():
+    source = [[.01, .01, .01, .2], [.011, .01, .01, .9], [.01, .01, .01, .2]]
+    result = fuse_map({"frames": [frame(source)]}, {"f0": annotations(point_labels={"1": "lane"})},
+                      1, fusion_mode="full")
+    assert result["points"] == source
+    assert result["point_count"] == result["input_point_count"] == 3
+    assert result["point_labels"] == {"1": "lane"}
+    assert result["effective_voxel_size"] == 0 and result["point_reduction"] == "all-measured-points"
+    assert not result["input_truncated"] and not result["output_truncated"]
+
+
+def test_surface_fusion_keeps_a_measured_surface_sample_instead_of_bright_outlier():
+    source = [[.001, .001, .001, .2], [.003, .001, .002, .3], [.048, .049, .049, 9]]
+    value = fuse_map({"frames": [frame(source)]}, {}, .5, fusion_mode="surface")
+    assert value["points"] == [source[1]]
+    assert value["point_reduction"] == "nearest-measured-surface-point"
+    bright = fuse_map({"frames": [frame(source)]}, {}, .5, fusion_mode="detail")
+    assert bright["points"] == [source[2]]
+
+
+def test_chunk_boundaries_preserve_full_point_indices_and_centroid_weights():
+    source = np.tile([.01, .01, .01, .2], (100001, 1))
+    source[-1, 3] = .8
+    value = {"frames": [frame([])]}
+    labels = {"f0": annotations(point_labels={"100000": "lane"})}
+    full = fuse_map(value, labels, fusion_mode="full", point_loader=lambda _: source, return_array=True)
+    assert len(full["points"]) == len(source) and full["point_labels"] == {"100000": "lane"}
+    np.testing.assert_array_equal(full["points"], source)
+    average = fuse_map(value, {}, point_loader=lambda _: source)
+    np.testing.assert_allclose(average["points"], [source.mean(axis=0)], atol=1e-10)
+
+
+def test_explicit_outlier_filter_reports_removed_samples_and_is_off_by_default():
+    rng = np.random.default_rng(81)
+    road = np.column_stack((rng.normal(0, .5, (500, 2)), np.zeros(500), np.full(500, .3)))
+    noisy = np.vstack((road, [[30, 40, 50, 1], [-30, -40, 60, 1]]))
+    original = fuse_map({"frames": [frame(noisy)]}, {}, fusion_mode="full")
+    filtered = fuse_map({"frames": [frame(noisy)]}, {}, fusion_mode="full", outlier_filter=True)
+    assert original["point_count"] == len(noisy) and original["excluded_outlier_points"] == 0
+    assert filtered["excluded_outlier_points"] == 2 and filtered["point_count"] == len(road)
+    np.testing.assert_array_equal(filtered["points"], road)

@@ -36,6 +36,9 @@ drive-001.zip
 - `.pcd`：仅支持 `DATA ascii`，必须有 x/y/z 字段，可选 intensity；不支持多 count 字段或压缩/二进制 PCD。
 
 同一帧使用 `points` 或 `points_path` 之一。点的顺序定义语义标注的索引，导入后不要在保留原标注的情况下重新排序。
+二进制点云导入后保存在独立的 NPY 文件中；清单使用服务器内部的 `pointcloud_file` 和
+完整 `point_count`，不会将全部扫描膨胀为清单 JSON，也不会按点数裁剪。
+逐帧读取使用内存映射；坐标、反射强度和原始点顺序保留。
 
 ## 最小可用 manifest 示例
 
@@ -103,7 +106,20 @@ ID 使用字母/数字开头，后续仅字母、数字、`_`、`-`、`.`，长�
 - **可迁移 ZIP**：`GET /api/clips/{id}/export.zip` 同时打包 `manifest.json`、点云及相对路径的图像资源，可以导入另一台 OmniLabel 实例。导入已存在的 clip ID 前应更改 manifest 中的 ID。
 - 输出 3D 框、矢量线/多边形、图像多边形和逐点 label。语义分割可单独导出 PNG，见下节。尚未宣称兼容 COCO、nuScenes、OpenLABEL 或特定 OCC 训练集；这些格式应增加显式转换器和测试。
 
-当前原型限制单文件上传 128 MiB、ZIP 解压内容 256 MiB、最多 5000 个 ZIP 条目；单帧 50 万点、整段 200 万点、2000 帧。每张图片不超过 24 MiB、4000 万像素；相机宽高各不超过 16384。更大数据应按 clip 切分，后续改为对象存储、索引及按帧/分块流式读取。
+源点云没有单帧或整段点数上限。上传与 ZIP 的字节/条目配额默认均为 0（不限制），
+部署方可通过 `OMNILABEL_MAX_UPLOAD_BYTES`、`OMNILABEL_MAX_EXPANDED_BYTES`、
+`OMNILABEL_MAX_ARCHIVE_MEMBERS` 显式设置；这些配额拒绝超额输入，不会静默丢点。
+上传文件通过磁盘暂存，ZIP 中的点文件作为独立 NPY 保存，JSON 与 ZIP 导出均保留完整点云。
+可迁移 ZIP 会包含实际点文件，不再依赖原服务器的内部文件路径。
+
+`GET /api/clips/{id}` 返回帧元数据及完整 `point_count`，帧 `points` 为空，避免一次传输整段扫描。
+`GET /api/clips/{id}/frames/{frame_id}/points` 默认返回该帧所有点；可选 `offset`、`count`
+进行连续分块读取，响应包含 `point_count`、`offset`、`returned_point_count`。
+分块只是传输方式，逐点标注索引始终使用原始点编号，不按块重新编号。
+SQ 打包脚本默认不按点数或文件字节拆分场景，只有显式帧数/字节分组参数会改变分包。
+
+当前清单仍最多包含 2000 帧。每张图片不超过 24 MiB、4000 万像素；相机宽高各不超过 16384。
+无点数配额不代表无限内存：重建输出、浏览器完整显示和模型推理仍受机器内存、显存及磁盘容量约束。
 
 ## 地图和 OCC 输出解释
 

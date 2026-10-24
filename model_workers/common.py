@@ -33,8 +33,8 @@ def as_numpy(value):
 
 def points_array(frame):
     points = np.asarray(frame.get("points", []), dtype=np.float32)
-    if points.ndim != 2 or points.shape[1] not in (3, 4) or not 1 <= len(points) <= 500000:
-        raise InvalidInput("A model frame requires 1–500000 original XYZ/XYZI points")
+    if points.ndim != 2 or points.shape[1] not in (3, 4) or not len(points):
+        raise InvalidInput("A model frame requires a nonempty original XYZ/XYZI point array")
     if not np.isfinite(points).all():
         raise InvalidInput("Point coordinates must be finite")
     if points.shape[1] == 3:

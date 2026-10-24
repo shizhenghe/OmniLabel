@@ -62,4 +62,18 @@ class ReconstructionRequest(Model):
     registration: Literal["poses", "icp"] = "poses"
     exclude_dynamic: bool = True
     preserve_detail: bool = True
-    detail_voxel_size: float = Field(default=0.05, ge=0.05, le=0.2)
+    detail_voxel_size: float = Field(default=0.05, ge=0.02, le=0.2)
+    fusion_mode: Literal["full", "detail", "surface", "centroid"] | None = None
+    outlier_filter: bool = False
+    outlier_neighbors: int = Field(default=16, ge=2, le=128)
+    outlier_std_ratio: float = Field(default=3.0, gt=0, le=10)
+    registration_voxel_size: float = Field(default=0.1, ge=0.02, le=1)
+    registration_sample_size: int = Field(default=15000, ge=0)
+    submap_frames: int = Field(default=5, ge=1, le=100)
+
+    @field_validator("registration_sample_size")
+    @classmethod
+    def registration_budget(cls, value):
+        if 0 < value < 30:
+            raise ValueError("registration_sample_size must be zero (all cells) or at least 30")
+        return value

@@ -6,13 +6,14 @@ import logging
 import time
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 import numpy as np
 
 from .models import Clip
 from .scene import (
     SCENE_PREVIEW_POINTS, frame_annotations, get_scene, get_scene_map, reconstruct_scene,
-    registered_poses, save_reconstruction, save_scene, source_fingerprint,
+    registered_poses, save_reconstruction, save_scene, source_fingerprint, scene_map_page, scene_map_file,
 )
 from .scene_models import ReconstructionRequest, SceneAnnotations
 from .storage import Store
@@ -47,6 +48,30 @@ def mount_scene_routes(app: FastAPI, store: Store, executor: ThreadPoolExecutor)
             raise HTTPException(404, "Frame not found")
         return frame_annotations(get_scene(store, clip), clip, frame, registered_poses(store, clip),
                                  store.annotations(clip.id, frame_id))
+
+    @app.get("/api/clips/{clip_id}/scene/registration")
+    def scene_registration(clip_id: str):
+        clip = clip_for(clip_id)
+        return {"coordinate_frame": "world", "source": "registered-or-source",
+                "world_from_lidar": {fid: value.tolist() for fid, value in registered_poses(store, clip).items()}}
+
+    @app.get("/api/clips/{clip_id}/scene/map/points")
+    def map_points(clip_id: str, offset: int = Query(default=0, ge=0),
+                   limit: int | None = Query(default=100000, ge=1)):
+        try:
+            return scene_map_page(store, clip_for(clip_id), offset, limit)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/clips/{clip_id}/scene/map.npy")
+    def download_map(clip_id: str):
+        try:
+            return FileResponse(scene_map_file(store, clip_for(clip_id)), media_type="application/octet-stream",
+                                filename=f"{clip_id}-scene-full.npy")
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/clips/{clip_id}/scene/map")
     def cached_map(clip_id: str):
@@ -83,8 +108,10 @@ def mount_scene_routes(app: FastAPI, store: Store, executor: ThreadPoolExecutor)
                 annotations,
                 request,
                 point_loader=lambda value: store.frame_point_array(source_frames[value["id"]]),
+                array_result=True,
             )
             result = save_reconstruction(store, clip, result, fingerprint, scene, poses)
+            result.pop("points", None)  # Cache is persisted; release the solver array before serializing the response.
             preview = get_scene_map(store, clip, max_points=SCENE_PREVIEW_POINTS)
             job.update(status="completed", result=preview, finished_at=time.time())
         except Exception as exc:

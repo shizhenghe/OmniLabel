@@ -4,7 +4,7 @@ test('discoverable lane drawing saves world vertices, edits coordinates and proj
   await page.goto('/');
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
   await page.locator('.task-button').filter({hasText: '车道线标注'}).click();
-  await expect(page.getByTestId('lane-guide')).toContainText('左键依次加点');
+  await expect(page.getByTestId('lane-guide')).toHaveCount(0);
   await page.getByLabel('加载道路标线示例', {exact: true}).click();
   await expect(page.getByLabel('选择clip')).toHaveValue('demo-ground-detail');
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
@@ -80,6 +80,9 @@ test('ground view filters roofs and real XYZI contrast survives detail reconstru
   await page.getByLabel('点云着色', {exact: true}).selectOption('semantic');
   await expect(viewport).toHaveAttribute('data-color-mode', 'semantic');
   await page.getByLabel('点云着色', {exact: true}).selectOption('intensity');
+  await page.getByLabel('场景融合方式', {exact: true}).selectOption('detail');
+  await page.getByLabel('重建整个场景', {exact: true}).click();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
   const map = await (await request.get('/api/clips/demo-ground-detail/scene/map')).json();
   expect(map.preserve_detail).toBe(true);
   expect(map.effective_voxel_size).toBe(.05);

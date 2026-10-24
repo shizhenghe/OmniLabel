@@ -14,11 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from PIL import Image, ImageDraw
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
+
+import numpy as np
 
 from .importer import MAX_EXPANDED, MAX_FILES, MAX_UPLOAD, parse_import
 from .models import Annotations, Clip, JobRequest, ProjectRequest
@@ -79,6 +82,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     mount_model_routes(app, model_connections)
     from .scene_routes import mount_scene_routes
     mount_scene_routes(app, store, executor)
+    from .calibration import mount_calibration_routes
+    mount_calibration_routes(app, store)
 
     @app.exception_handler(ConflictError)
     async def handle_conflict(request, exc):
@@ -106,20 +111,29 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
 
     @app.post("/api/clips/import", response_model=Clip, status_code=201)
     async def import_clip(file: UploadFile = File(...)):
-        payload = await file.read(MAX_UPLOAD + 1)
-        await file.close()
-        if len(payload) > MAX_UPLOAD:
-            raise HTTPException(413, "Upload exceeds 128 MiB")
         staging = None
         destination = None
+        point_destination = None
         published = False
         try:
-            clip, labels, staging, namespace, scene_bundle = parse_import(payload, file.filename or "", store.root / "assets", include_scene=True)
+            # UploadFile already spools large requests to disk. Parse its file
+            # directly rather than allocating a second archive-sized bytes.
+            clip, labels, staging, namespace, scene_bundle = await run_in_threadpool(
+                parse_import, file.file, file.filename or "", store.root / "assets", include_scene=True)
             with store.lock:
                 if (store.root / "clips" / f"{clip.id}.json").exists():
                     raise ConflictError("A clip with this ID already exists. Change clip.id before importing.")
-                destination = store.root / "assets" / namespace
-                staging.rename(destination)
+                if (staging / "_pointclouds").exists():
+                    target = store.root / "pointclouds" / namespace
+                    if target.exists():
+                        raise ConflictError("Import point namespace already exists")
+                    (staging / "_pointclouds").rename(target)
+                    point_destination = target
+                target = store.root / "assets" / namespace
+                if target.exists():
+                    raise ConflictError("Import asset namespace already exists")
+                staging.rename(target)
+                destination = target
                 staging = None
                 store.add_clip(clip, labels)
                 published = True
@@ -136,10 +150,13 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                 detail = "; ".join(f"{'.'.join(map(str, item['loc']))}: {item['msg']}" for item in exc.errors()[:8])
             raise HTTPException(422, detail[:1500]) from exc
         finally:
+            await file.close()
             if staging:
                 shutil.rmtree(staging, ignore_errors=True)
             if destination and not published:
                 shutil.rmtree(destination, ignore_errors=True)
+            if point_destination and not published:
+                shutil.rmtree(point_destination, ignore_errors=True)
 
     @app.get("/api/clips/{clip_id}")
     def read_clip(clip_id: str):
@@ -150,13 +167,30 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
         return value
 
     @app.get("/api/clips/{clip_id}/frames/{frame_id}/points")
-    def read_points(clip_id: str, frame_id: str):
+    def read_points(clip_id: str, frame_id: str, offset: int = Query(default=0, ge=0), count: int | None = Query(default=None, ge=0)):
         frame = get_frame(get_clip(clip_id), frame_id)
         try:
-            points = store.frame_points(frame)
+            points = store.frame_point_array(frame)
         except (OSError, ValueError) as exc:
             raise HTTPException(422, str(exc)) from exc
-        return {"points": points, "point_count": len(points)}
+        end = len(points) if count is None else min(offset + count, len(points))
+        selected = points[offset:end]
+
+        def stream():
+            yield b'{"points":'
+            yield from point_rows(selected)
+            yield (',"point_count":' + str(len(points)) + ',"offset":' + str(offset)
+                   + ',"returned_point_count":' + str(len(selected)) + '}').encode()
+        return StreamingResponse(stream(), media_type="application/json")
+
+    def point_rows(points):
+        """Serialize every source row with bounded temporary JSON working memory."""
+        yield b"["
+        for start in range(0, len(points), 10_000):
+            if start:
+                yield b","
+            yield json.dumps(points[start:start + 10_000].tolist(), allow_nan=False, separators=(",", ":"))[1:-1].encode()
+        yield b"]"
 
     @app.get("/api/clips/{clip_id}/frames/{frame_id}/annotations", response_model=Annotations)
     def read_annotations(clip_id: str, frame_id: str):
@@ -345,8 +379,31 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     def export_clip(clip_id: str):
         clip = get_clip(clip_id)
         from .scene import scene_export
-        return JSONResponse({"schema_version": "1.1", "clip": clip.model_dump(), "annotations": store.all_annotations(clip), **scene_export(store, clip)},
-                            headers={"Content-Disposition": f'attachment; filename="{clip.id}-annotations.json"'})
+        annotations, scene_metadata = store.all_annotations(clip), scene_export(store, clip)
+        try:
+            for frame in clip.frames:
+                store.frame_point_array(frame)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        def stream():
+            metadata = json.dumps(clip.model_dump(exclude={"frames"}), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            yield ('{"schema_version":"1.1","clip":' + metadata[:-1] + ',"frames":[').encode()
+            for index, frame in enumerate(clip.frames):
+                if index:
+                    yield b","
+                metadata = json.dumps(frame.model_dump(exclude={"points", "pointcloud_file"}), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+                yield (metadata[:-1] + ',"points":').encode()
+                yield from point_rows(store.frame_point_array(frame))
+                yield b"}"
+            yield b"]}"
+            for key, value in {"annotations": annotations, **scene_metadata}.items():
+                yield ("," + json.dumps(key) + ":").encode()
+                for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":")).iterencode(value):
+                    yield chunk.encode()
+            yield b"}"
+        return StreamingResponse(stream(), media_type="application/json", headers={
+            "Content-Disposition": f'attachment; filename="{clip.id}-annotations.json"'})
 
     @app.get("/api/clips/{clip_id}/export.zip")
     def export_archive(clip_id: str):
@@ -367,8 +424,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                     asset_files[source] = f"assets/image-{len(asset_files):06d}{source.suffix.lower()}"
                     expanded += source.stat().st_size
                 frame["images"][camera_id] = asset_files[source]
-        if len(asset_files) + 1 > MAX_FILES:
-            raise HTTPException(422, "Portable archive exceeds the 5000-member import limit; split this clip before export")
+        if MAX_FILES and len(asset_files) + len(clip.frames) + 1 > MAX_FILES:
+            raise HTTPException(422, "Portable archive exceeds the configured member limit")
         temporary = tempfile.NamedTemporaryFile(prefix=".export-", suffix=".zip", dir=store.root, delete=False)
         destination = Path(temporary.name)
         temporary.close()
@@ -376,6 +433,28 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as archive:
                 for source, name in asset_files.items():
                     archive.write(source, name)
+                # ZIPs carry complete point assets, including externally stored
+                # scans. A server-local pointcloud_file path is not portable.
+                for index, (frame, raw) in enumerate(zip(clip.frames, clip_data["frames"])):
+                    try:
+                        points = store.frame_point_array(frame)
+                    except (OSError, ValueError) as exc:
+                        raise HTTPException(422, str(exc)) from exc
+                    name = f"points/frame-{index:06d}.npy"
+                    if frame.pointcloud_file:
+                        source = store.pointcloud_path(frame)
+                        archive.write(source, name)
+                        expanded += source.stat().st_size
+                    else:
+                        with archive.open(name, "w", force_zip64=True) as point_file:
+                            np.save(point_file, points, allow_pickle=False)
+                        expanded += archive.getinfo(name).file_size
+                    raw.pop("points", None)
+                    raw.pop("pointcloud_file", None)
+                    raw["points_path"] = name
+                    raw["point_count"] = len(points)
+                    if MAX_EXPANDED and expanded > MAX_EXPANDED:
+                        raise HTTPException(422, "Portable archive exceeds the configured expanded-byte limit")
                 from .scene import scene_export
                 envelope = {"schema_version": "1.1", "clip": clip_data, "annotations": annotations, **scene_export(store, clip)}
                 encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -383,11 +462,11 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                     for chunk in encoder.iterencode(envelope):
                         encoded = chunk.encode("utf-8")
                         expanded += len(encoded)
-                        if expanded > MAX_EXPANDED:
-                            raise HTTPException(422, "Portable archive exceeds 256 MiB expanded; split this clip before export")
+                        if MAX_EXPANDED and expanded > MAX_EXPANDED:
+                            raise HTTPException(422, "Portable archive exceeds the configured expanded-byte limit")
                         manifest.write(encoded)
-            if destination.stat().st_size > MAX_UPLOAD:
-                raise HTTPException(422, "Portable archive exceeds 128 MiB compressed; split this clip before export")
+            if MAX_UPLOAD and destination.stat().st_size > MAX_UPLOAD:
+                raise HTTPException(422, "Portable archive exceeds the configured compressed-byte limit")
             return FileResponse(destination, media_type="application/zip", filename=f"{clip.id}-omnilabel.zip",
                                 background=BackgroundTask(destination.unlink, missing_ok=True))
         except Exception:

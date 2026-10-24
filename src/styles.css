@@ -89,7 +89,28 @@
 .inline-proposal .button {padding:6px; font-size:9px}
 .model-card .field-label input {font-size:9px; padding:7px 5px}
 .model-card .button {font-size:9px; min-height:28px; padding:6px}
+.inspector.calibration-active>.inspector-heading,.inspector.calibration-active>.inspector-body,.inspector.calibration-active>.inspector-bottom {display:none}
+.calibration-editor {min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:15px;color:#a3b9c9;font-size:11px;line-height:1.7}
+.calibration-heading {display:flex;align-items:flex-start;gap:8px;margin-bottom:18px}
+.calibration-heading>div {flex:1;min-width:0}
+.calibration-heading h2 {font-size:15px;color:#d5e7ef;margin-bottom:7px}
+.calibration-heading p {font-size:10px;color:#88a4b8}
+.calibration-heading>.icon-button {flex-shrink:0;font-size:20px}
+.calibration-controls fieldset {border:1px solid #344b60;border-radius:4px;padding:10px 8px;margin:12px 0}
+.calibration-controls legend {font-size:10px;color:#9fbed0;padding:0 4px}
+.calibration-axis {display:flex;align-items:center;gap:6px;margin:10px 0}
+.calibration-axis>span {width:28px;font-size:10px;color:#a8c8d7;flex-shrink:0}
+.calibration-axis input[type=range] {flex:1;min-width:25px;accent-color:#5dc3ad}
+.calibration-axis input[type=number] {width:66px;min-width:0;background:#0f1c29;border:1px solid #385266;border-radius:3px;color:#d7e6ed;padding:5px;font:10px monospace}
+.calibration-matrix {font-size:9px;color:#8fb2c7;margin:13px 0}
+.calibration-matrix pre {font:8px/1.8 monospace;color:#a8c5d4;overflow-x:auto;background:#0c1824;border:1px solid #30475a;border-radius:4px;padding:8px;margin-top:6px}
+.calibration-actions {display:flex;flex-wrap:wrap;gap:7px;margin:14px 0}
+.calibration-actions>.button {font-size:10px;min-height:30px;padding:6px 8px}
+.calibration-error {color:#efa5aa;font-size:10px;overflow-wrap:anywhere}
+.calibration-preview-tag {font-size:9px;padding:5px 8px;border:1px solid #78674c;border-radius:3px;background:#342f25;color:#d4c392;margin-bottom:8px;flex-shrink:0}
 .lane-guide {display:flex; align-items:center; gap:12px; padding:12px; margin-bottom:12px; background:#18332f; border:1px solid #3f7563; border-radius:5px; flex-shrink:0; color:#b0d9c5}
+.vector-actions {display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-shrink:0; flex-wrap:wrap}
+.vector-actions .button {min-height:30px; padding:6px 10px; font-size:10px}
 .box-edit-guide {display:flex; align-items:center; gap:10px; padding:10px 12px; margin-bottom:12px; background:#172c38; border:1px solid #385c70; border-radius:5px; flex-shrink:0}
 .box-edit-guide>svg {color:#89b9d2; flex-shrink:0}
 .box-edit-guide>div {flex:1; min-width:0}
