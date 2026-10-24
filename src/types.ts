@@ -16,6 +16,7 @@ export interface Frame {
   ego_to_world: number[][];
   lidar_to_ego: number[][];
   points: number[][];
+  point_count: number;
   images: Record<string, string>;
 }
 
@@ -125,6 +126,7 @@ export interface SceneMap {
   coordinate_frame: 'world';
   frame_count: number;
   point_count: number;
+  rendered_point_count?: number;
   trajectory: {frame_id: string; timestamp: number; position: Vec3}[];
   bounds: {min: Vec3; max: Vec3};
   method: string;

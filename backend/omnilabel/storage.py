@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
 import uuid
 from pathlib import Path
 
-from .models import Annotations, Clip
+import numpy as np
+from pydantic import ValidationError
+
+from .models import Annotations, Clip, Frame
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ConflictError(Exception):
@@ -60,12 +67,57 @@ class Store:
             raise KeyError("clip not found")
         return Clip.model_validate_json(path.read_text())
 
+    def frame_point_array(self, frame: Frame) -> np.ndarray:
+        if frame.pointcloud_file is None:
+            points = np.asarray(frame.points, dtype=float)
+            return points if points.size else np.empty((0, 4), dtype=float)
+        points_root = (self.root / "pointclouds").resolve()
+        source = (points_root / frame.pointcloud_file).resolve()
+        if not source.is_relative_to(points_root) or not source.is_file():
+            raise ValueError("referenced point cloud is missing or outside the pointcloud store")
+        try:
+            points = np.load(source, allow_pickle=False)
+        except (OSError, ValueError) as exc:
+            raise ValueError("referenced point cloud is not a valid NPY array") from exc
+        if (points.ndim != 2 or points.shape[1] not in (3, 4)
+                or len(points) != frame.point_count or not np.issubdtype(points.dtype, np.number)
+                or not np.isfinite(points).all()):
+            raise ValueError("referenced point cloud has invalid shape, count, type, or values")
+        if points.shape[1] == 3:
+            points = np.column_stack((points, np.zeros(len(points), dtype=points.dtype)))
+        return points.astype(float, copy=False)
+
+    def frame_points(self, frame: Frame) -> list[list[float]]:
+        return self.frame_point_array(frame).tolist()
+
+    def materialize_frame(self, frame: Frame) -> Frame:
+        if frame.pointcloud_file is None:
+            return frame
+        value = frame.model_dump()
+        value["points"] = self.frame_points(frame)
+        value["pointcloud_file"] = None
+        return Frame.model_validate(value)
+
     def summaries(self):
+        clip_paths = sorted((self.root / "clips").glob("*.json"), key=lambda path: path.stem)
+        files = {path.name: [path.stat().st_size, path.stat().st_mtime_ns] for path in clip_paths}
+        cache_path = self.root / "clip_summaries.json"
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("files") == files and isinstance(cached.get("summaries"), list):
+                return cached["summaries"]
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            pass
         summaries = []
-        for path in sorted((self.root / "clips").glob("*.json"), key=lambda path: path.stem):
-            clip = Clip.model_validate_json(path.read_text())
+        for path in clip_paths:
+            try:
+                clip = Clip.model_validate_json(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValidationError) as exc:
+                LOGGER.warning("Ignoring invalid clip manifest %s: %s", path, exc)
+                continue
             summaries.append({"id": clip.id, "name": clip.name, "description": clip.description,
                               "fps": clip.fps, "frame_count": len(clip.frames), "camera_count": len(clip.cameras)})
+        atomic_json(cache_path, {"files": files, "summaries": summaries})
         return summaries
 
     def add_clip(self, clip: Clip, annotations: dict[str, Annotations] | None = None):

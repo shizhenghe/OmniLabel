@@ -2,6 +2,8 @@ node_modules/
 dist/
 .venv/
 data/
+tests/sq_data/
+prelabel_ckpt/
 __pycache__/
 *.py[cod]
 .pytest_cache/

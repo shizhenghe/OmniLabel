@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 import numpy as np
@@ -59,7 +60,9 @@ class Frame(Model):
     timestamp: float
     ego_to_world: list[list[float]]
     lidar_to_ego: list[list[float]]
-    points: list[list[float]] = Field(max_length=500_000)
+    points: list[list[float]] = Field(default_factory=list, max_length=500_000)
+    pointcloud_file: str | None = Field(default=None, max_length=240)
+    point_count: int | None = Field(default=None, ge=0)
     images: dict[str, str] = Field(default_factory=dict)
 
     _transforms = field_validator("ego_to_world", "lidar_to_ego")(rigid_transform)
@@ -70,6 +73,22 @@ class Frame(Model):
         if any(len(p) not in (3, 4) for p in value):
             raise ValueError("each point must contain x,y,z or x,y,z,intensity")
         return [p if len(p) == 4 else [*p, 0.0] for p in value]
+
+    @model_validator(mode="after")
+    def validate_point_source(self):
+        if self.pointcloud_file is not None:
+            path = PurePosixPath(self.pointcloud_file)
+            if path.is_absolute() or ".." in path.parts or "\\" in self.pointcloud_file or path.suffix.lower() != ".npy":
+                raise ValueError("pointcloud_file must be a relative .npy path without traversal")
+            if self.points:
+                raise ValueError("a frame cannot contain both inline points and pointcloud_file")
+            if self.point_count is None:
+                raise ValueError("point_count is required with pointcloud_file")
+        elif self.point_count is None:
+            self.point_count = len(self.points)
+        elif self.point_count != len(self.points):
+            raise ValueError("point_count must equal the number of inline points")
+        return self
 
 
 class Clip(Model):
@@ -91,8 +110,9 @@ class Clip(Model):
             raise ValueError("frame images reference an unknown camera")
         if any(self.frames[i].timestamp >= self.frames[i + 1].timestamp for i in range(len(self.frames) - 1)):
             raise ValueError("frame timestamps must be strictly increasing")
-        if sum(len(f.points) for f in self.frames) > 2_000_000:
-            raise ValueError("interactive clip limit is 2 million points; split larger clips")
+        total_points = sum(f.point_count or 0 for f in self.frames)
+        if not any(f.pointcloud_file for f in self.frames) and total_points > 2_000_000:
+            raise ValueError("interactive inline clip limit is 2 million points; use external point-cloud storage")
         return self
 
 
@@ -154,7 +174,7 @@ class Annotations(Model):
 
     def validate_for_frame(self, frame: Frame, cameras: list[Camera]):
         camera_map = {c.id: c for c in cameras}
-        if any(int(index) >= len(frame.points) for index in self.point_labels):
+        if any(int(index) >= (frame.point_count or 0) for index in self.point_labels):
             raise ValueError("point label index is outside this frame")
         for polygon in self.image_polygons:
             camera = camera_map.get(polygon.camera_id)

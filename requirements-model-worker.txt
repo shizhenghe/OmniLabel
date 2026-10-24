@@ -1,0 +1,10 @@
+# Base HTTP and polygon-conversion dependencies for model_worker/.
+# Install PyTorch, SAM 3, and/or MMDetection3D separately using their official
+# CUDA/version instructions before installing this file.
+fastapi>=0.115,<1
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+pillow>=10,<13
+pydantic>=2.10,<3
+uvicorn>=0.30,<1
+

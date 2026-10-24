@@ -141,9 +141,22 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             if destination and not published:
                 shutil.rmtree(destination, ignore_errors=True)
 
-    @app.get("/api/clips/{clip_id}", response_model=Clip)
+    @app.get("/api/clips/{clip_id}")
     def read_clip(clip_id: str):
-        return get_clip(clip_id)
+        value = get_clip(clip_id).model_dump(exclude_none=True)
+        for frame in value["frames"]:
+            frame["points"] = []
+            frame.pop("pointcloud_file", None)
+        return value
+
+    @app.get("/api/clips/{clip_id}/frames/{frame_id}/points")
+    def read_points(clip_id: str, frame_id: str):
+        frame = get_frame(get_clip(clip_id), frame_id)
+        try:
+            points = store.frame_points(frame)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {"points": points, "point_count": len(points)}
 
     @app.get("/api/clips/{clip_id}/frames/{frame_id}/annotations", response_model=Annotations)
     def read_annotations(clip_id: str, frame_id: str):
@@ -164,7 +177,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     def project(clip_id: str, request: ProjectRequest):
         from .geometry import project_points
         clip = get_clip(clip_id)
-        frame = get_frame(clip, request.frame_id)
+        frame = store.materialize_frame(get_frame(clip, request.frame_id))
         camera = next((c for c in clip.cameras if c.id == request.camera_id), None)
         if camera is None:
             raise HTTPException(404, "Camera not found")
@@ -235,10 +248,17 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             clip_data = clip.model_dump()
             annotations = store.all_annotations(clip)
             source = get_frame(clip, request.frame_id or clip.frames[0].id)
+            source_with_points = store.materialize_frame(source)
             if request.kind == "map":
-                result = fuse_map(clip_data, annotations, request.voxel_size)
+                source_frames = {frame.id: frame for frame in clip.frames}
+                result = fuse_map(
+                    clip_data,
+                    annotations,
+                    request.voxel_size,
+                    point_loader=lambda value: store.frame_point_array(source_frames[value["id"]]),
+                )
             elif request.kind == "occupancy":
-                result = build_occupancy(source.model_dump(), annotations[source.id], request.voxel_size)
+                result = build_occupancy(source_with_points.model_dump(), annotations[source.id], request.voxel_size)
             elif request.kind == "prelabel":
                 from .inference import infer_proposal
                 current_annotations = annotations[source.id]
@@ -250,7 +270,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                         current_annotations = evaluate_scene(store, clip, source.id, scene)
                         scene_revision = scene.revision
                 endpoint, _ = model_connections.endpoint(request.model_id)
-                result = infer_proposal(clip_data, source.model_dump(), current_annotations,
+                result = infer_proposal(clip_data, source_with_points.model_dump(), current_annotations,
                                         request.model_id, request.prompt, assets_root=store.root / "assets",
                                         options=request.options.model_dump(exclude_none=True) if request.options else None,
                                         endpoint=endpoint, token=model_connections.token(request.model_id))
@@ -260,7 +280,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             else:
                 changes = {}
                 if request.kind == "ground-segmentation":
-                    changes[source.id] = segment_ground(source.model_dump(), annotations[source.id])
+                    changes[source.id] = segment_ground(source_with_points.model_dump(), annotations[source.id])
                 else:
                     targets = [get_frame(clip, request.target_frame_id)] if request.target_frame_id else [f for f in clip.frames if f.id != source.id]
                     for target in targets:

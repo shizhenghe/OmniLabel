@@ -113,7 +113,7 @@ export default function App() {
     if (!sceneMode || !frame) return annotations;
     return {...sceneInLidar(worldAnnotations, frame, sceneMap), image_polygons: annotations.image_polygons, point_labels: annotations.point_labels};
   }, [sceneMode, worldAnnotations, frame, sceneMap, annotations]);
-  const sceneFrame = useMemo<Frame | null>(() => sceneMap ? {id: 'scene-world', timestamp: 0, ego_to_world: IDENTITY, lidar_to_ego: IDENTITY, points: sceneMap.points, images: {}} : null, [sceneMap]);
+  const sceneFrame = useMemo<Frame | null>(() => sceneMap ? {id: 'scene-world', timestamp: 0, ego_to_world: IDENTITY, lidar_to_ego: IDENTITY, points: sceneMap.points, point_count: sceneMap.rendered_point_count ?? sceneMap.points.length, images: {}} : null, [sceneMap]);
   const renderedAnnotations = sceneMode ? {...worldAnnotations, point_labels: sceneMap?.point_labels ?? {}} : annotations;
   const selectedBox = renderedAnnotations.boxes.find(b => b.id === selectedId);
   const selectedVector = renderedAnnotations.vectors.find(v => v.id === selectedId);
@@ -160,9 +160,12 @@ export default function App() {
       }
       if (next.status === 'failed') throw new Error(next.error || '场景重建失败');
       if (generation !== clipGeneration.current) return;
-      const updated = await request<SceneAnnotations>(`/clips/${encodeURIComponent(id)}/scene/annotations`);
+      const [updated, rebuiltMap] = await Promise.all([
+        request<SceneAnnotations>(`/clips/${encodeURIComponent(id)}/scene/annotations`),
+        next.result?.points ? Promise.resolve(next.result as unknown as SceneMap) : request<SceneMap>(`/clips/${encodeURIComponent(id)}/scene/map`),
+      ]);
       if (generation !== clipGeneration.current) return;
-      setSceneMap(next.result as unknown as SceneMap);
+      setSceneMap(rebuiltMap);
       setPreserveDetail(detail); setDetailVoxelSize(detailSize); setVoxelSize(size);
       if (!sceneDirtyRef.current) setScene(updated);
       setReconstruction(next);
@@ -178,14 +181,16 @@ export default function App() {
     setPlaying(false); setLoading(true); setSceneMap(null); setReconstruction(null); setModelPromptMode(null);
     try {
       const next = await request<Clip>(`/clips/${encodeURIComponent(id)}`);
-      const [labels, sceneLabels, mapResponse] = await Promise.all([
+      const [labels, sceneLabels, framePoints, mapResponse] = await Promise.all([
         request<Annotations>(`/clips/${encodeURIComponent(id)}/frames/${next.frames[0].id}/annotations`),
         request<SceneAnnotations>(`/clips/${encodeURIComponent(id)}/scene/annotations`),
+        request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(id)}/frames/${next.frames[0].id}/points`),
         fetch(`/api/clips/${encodeURIComponent(id)}/scene/map`),
       ]);
       if (!mapResponse.ok && mapResponse.status !== 404) throw new Error(`读取场景地图失败 HTTP ${mapResponse.status}`);
       const map = mapResponse.ok ? await mapResponse.json() as SceneMap : null;
       if (generation !== clipGeneration.current) return;
+      next.frames[0] = {...next.frames[0], points: framePoints.points, point_count: framePoints.point_count};
       sceneDirtyRef.current = false; frameDirtyRef.current = false;
       setClip(next); setFrameIndex(0); setAnnotations(labels); setScene(sceneLabels); setSceneMap(map); setSceneMode(true);
       if (map) {setPreserveDetail(map.preserve_detail ?? false); setDetailVoxelSize(map.detail_voxel_size ?? 0.05); setVoxelSize(map.voxel_size);}
@@ -227,8 +232,18 @@ export default function App() {
     const clipId = clip.id;
     setLoading(true);
     try {
-      const next = await request<Annotations>(`/clips/${encodeURIComponent(clipId)}/frames/${clip.frames[index].id}/annotations`);
+      const frameId = clip.frames[index].id;
+      const [next, framePoints] = await Promise.all([
+        request<Annotations>(`/clips/${encodeURIComponent(clipId)}/frames/${frameId}/annotations`),
+        request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(clipId)}/frames/${frameId}/points`),
+      ]);
       if (generation !== frameGeneration.current || clipContext.current !== clipId) return;
+      setClip(current => current?.id === clipId ? {
+        ...current,
+        frames: current.frames.map((item, position) => position === index
+          ? {...item, points: framePoints.points, point_count: framePoints.point_count}
+          : {...item, points: []}),
+      } : current);
       setFrameIndex(index); setAnnotations(next); setFrameDirty(false); frameDirtyRef.current = false;
       if (!sceneMode) setSelectedId(null);
       setDraftVector([]); setDraftPolygon([]); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined); setProposal(null);
@@ -449,7 +464,7 @@ export default function App() {
     <header className="topbar"><div className="brand"><span className="brand-mark"><Icon name="cube" size={26}/></span><span>Omni<span className="brand-light">Label</span><small>4D SCENE ANNOTATION</small></span><span className="version">4D</span></div><div className="workspace-breadcrumb"><span>工作空间</span><Icon name="chevron" size={12}/><strong>整场景多任务标注</strong></div><div className="topbar-actions"><span className={`save-status ${dirty ? 'is-dirty' : ''}`}><span className="status-dot"/>{saving ? '正在保存…' : dirty ? '有未保存修改' : '已同步至工作区'}</span><button className="button ghost" onClick={() => setModal('help')}><Icon name="help" size={16}/>使用说明</button><button className="button primary" aria-label="保存标注" disabled={busy || !dirty || reconstructing} onClick={() => void save()}><Icon name="save" size={15}/>{saving ? '保存中' : '保存标注'}</button><span className="avatar">OL</span></div></header>
     <aside className="sidebar"><div className="nav-label">标注任务 <span>WORKSPACE</span></div><nav aria-label="标注任务">{tasks.map(t => <button key={t.id} className={`task-button ${task === t.id ? 'active' : ''}`} onClick={() => switchTask(t.id)}><Icon name={t.icon} size={19}/><span>{t.name}</span><small>{t.short}</small>{task === t.id && <i/>}</button>)}</nav><div className="sidebar-divider"/><div className="nav-label">自动化工具</div><button className="task-button model-link" onClick={() => void openModels()}><Icon name="model" size={19}/><span>模型预标注</span><span className="small-badge">3</span></button><div className="sidebar-bottom"><div className="sensor-orbit"><Icon name="cube" size={25}/><span/><span/><span/></div><strong>一个场景 · 连续时空</strong><p>统一地图 / 轨迹关键帧<br/>3D 标签与七路图像实时联动</p><div className="local-indicator"><span className="status-dot"/>世界场景 · 持久化标注</div></div></aside>
     <main className="main-workspace">
-      <section className="dataset-bar"><div className="dataset-select"><span className="dataset-icon"><Icon name="layers" size={20}/></span><div><label htmlFor="clip-select">当前场景 CLIP</label><select id="clip-select" aria-label="选择clip" value={clip?.id ?? ''} disabled={busy || jobBusy || reconstructing} onChange={e => {if (confirmDiscard()) void loadClip(e.target.value);}}>{!clip && <option value="">{loading ? '正在加载…' : '导入 clip 开始重建'}</option>}{clips.map(c => <option value={c.id} key={c.id}>{c.name}</option>)}</select></div><span className="demo-badge">{clip?.source === 'synthetic' || clip?.id === 'demo' ? '合成示例' : 'CLIP'}</span></div><div className="dataset-metrics"><span><strong>{clip?.frames.length ?? '—'}</strong> 帧</span><span><strong>{clip?.cameras.length ?? '—'}</strong> 相机</span><span><strong>{(sceneMode ? sceneMap?.point_count : frame?.points.length)?.toLocaleString() ?? '—'}</strong> {sceneMode ? '场景点' : '源点'}</span></div><div className="dataset-actions"><input ref={fileInput} type="file" accept=".json,.zip" hidden onChange={e => {void importFile(e.target.files?.[0]); e.target.value = '';}}/><button className="button ghost" aria-label="导入clip" disabled={busy || jobBusy || reconstructing} onClick={() => fileInput.current?.click()}><Icon name="upload" size={15}/>导入</button><button className="button subtle" aria-label="导出clip" disabled={!clip || busy || jobBusy || reconstructing} onClick={exportClip}><Icon name="download" size={15}/>导出场景</button></div></section>
+      <section className="dataset-bar"><div className="dataset-select"><span className="dataset-icon"><Icon name="layers" size={20}/></span><div><label htmlFor="clip-select">当前场景 CLIP</label><select id="clip-select" aria-label="选择clip" value={clip?.id ?? ''} disabled={busy || jobBusy || reconstructing} onChange={e => {if (confirmDiscard()) void loadClip(e.target.value);}}>{!clip && <option value="">{loading ? '正在加载…' : '导入 clip 开始重建'}</option>}{clips.map(c => <option value={c.id} key={c.id}>{c.name}</option>)}</select></div><span className="demo-badge">{clip?.source === 'synthetic' || clip?.id === 'demo' ? '合成示例' : 'CLIP'}</span></div><div className="dataset-metrics"><span><strong>{clip?.frames.length ?? '—'}</strong> 帧</span><span><strong>{clip?.cameras.length ?? '—'}</strong> 相机</span><span><strong>{(sceneMode ? sceneMap?.point_count : frame?.point_count)?.toLocaleString() ?? '—'}</strong> {sceneMode ? '场景点' : '源点'}</span></div><div className="dataset-actions"><input ref={fileInput} type="file" accept=".json,.zip" hidden onChange={e => {void importFile(e.target.files?.[0]); e.target.value = '';}}/><button className="button ghost" aria-label="导入clip" disabled={busy || jobBusy || reconstructing} onClick={() => fileInput.current?.click()}><Icon name="upload" size={15}/>导入</button><button className="button subtle" aria-label="导出clip" disabled={!clip || busy || jobBusy || reconstructing} onClick={exportClip}><Icon name="download" size={15}/>导出场景</button></div></section>
       <div className="workspace-grid scene-layout">
         <aside className="camera-rail" aria-label="左侧相机标注投影"><div className="camera-rail-heading"><h2><Icon name="image" size={16}/>相机标注投影 <span>{clip?.cameras.length ?? 0}</span></h2><div className="camera-overlay-toggles"><button className={`toggle-button ${annotationProjection ? 'on' : ''}`} aria-label="切换标注投影" onClick={() => setAnnotationProjection(!annotationProjection)}>标注结果<i className="toggle-switch"/></button><button className={`toggle-button ${rawProjection ? 'on' : ''}`} aria-label="切换点云投影" onClick={() => setRawProjection(!rawProjection)}>原始点云<i className="toggle-switch"/></button></div><p>框、车道线与矢量地图随当前时刻投影</p>{modelPromptMode && <div className="seed-banner">SAM2 {modelPromptMode === 'box' ? '拖动提示框' : negativePrompt ? '负提示点' : '正提示点'} · {activeCamera}<button onClick={() => setModelPromptMode(null)}>退出</button></div>}</div><div className="camera-grid camera-scroll" data-testid="camera-scroll">{cameraCards()}{!clip && <div className="camera-placeholder">导入场景后显示同步相机</div>}</div>{task === 'image' && <div className="image-draw-footer"><span>{draftPolygon.length} 个区域顶点</span><button className="button subtle" disabled={draftPolygon.length < 3} onClick={finishPolygon}>完成多边形</button><button className="button ghost" onClick={() => setDraftPolygon([])}>取消</button><button className="button ghost" aria-label="导出语义掩码" disabled={!clip || busy} onClick={() => clip && frame && void exportFile(`/clips/${clip.id}/frames/${frame.id}/masks/${activeCamera}.zip`, `${frame.id}-${activeCamera}-mask.zip`)}>导出掩码</button></div>}</aside>
         <section className="view-workspace"><div className="section-header"><div><span className="section-eyebrow">{taskInfo.short} / {sceneMode ? 'WORLD SCENE' : 'LIDAR FRAME'}</span><h1>{taskInfo.name}<span>{taskInfo.subtitle}</span></h1></div><span className="coordinate-tag"><span/>{sceneMode ? 'WORLD' : 'LiDAR'} · 米</span></div>
@@ -463,7 +478,7 @@ export default function App() {
             {selectedBox && task === 'detection' && <div className="transform-toolbar"><span>鼠标直接编辑</span>{(['translate', 'scale', 'rotate'] as const).map((mode, i) => <button key={mode} className={transformMode === mode ? 'active' : ''} aria-label={['平移标注框', '缩放标注框', '旋转标注框'][i]} disabled={editBlocked} onClick={() => {setTransformMode(mode); setTool('select');}}>{['平移', '拖动改尺寸', '旋转'][i]}</button>)}<small>{sceneMode ? currentIsKeyframe ? '当前关键帧' : '拖动即创建关键帧' : '当前帧'}</small></div>}
             <div className={`scene-canvas ${editBlocked ? 'scene-disabled' : ''}`}>
               <PointCloudView frame={sceneMode ? sceneFrame : frame} annotations={renderedAnnotations} selectedId={selectedId} onSelect={selectAnnotation} onCreateBox={createBox} onUpdateBox={updateBoxById} focusSelection={focusSelection} transformMode={transformMode} editable={!editBlocked && task === 'detection'} sceneMode={sceneMode} trajectory={sceneMode ? sceneMap?.trajectory : undefined} activeFrameId={frame?.id} onTransformStart={() => setPlaying(false)} onAddVectorPoint={point => {if (!editBlocked) setDraftVector(p => [...p, point]);}} onPaint={indices => {if (!sceneMode && indices.length) editFrame(a => ({...a, point_labels: {...a.point_labels, ...Object.fromEntries(indices.map(i => [String(i), classId]))}}));}} tool={editBlocked ? 'select' : tool} view={view} groundZ={groundZ} voxels={!sceneMode && task === 'occupancy' && occupancy?.frameId === frame?.id ? occupancy?.voxels : undefined} voxelSize={occupancy?.size ?? voxelSize} voxelDimensions={occupancy?.dimensions} showFree={showFree} showBoxes={showBoxes} showVectors={showVectors} colorMode={pointColorMode} groundOnly={groundOnly} groundBand={groundBand} drawOnGround={vectorTask} draftVector={draftVector} brushRadius={brushRadius}/>
-              <div className="scene-top-info"><span className="live-pill"><i/>{sceneMode ? 'WORLD SCENE' : `FRAME ${String(frameIndex + 1).padStart(4, '0')}`}</span><span>{(sceneMode ? sceneMap?.point_count : frame?.points.length)?.toLocaleString() ?? 0} POINTS</span></div>
+              <div className="scene-top-info"><span className="live-pill"><i/>{sceneMode ? 'WORLD SCENE' : `FRAME ${String(frameIndex + 1).padStart(4, '0')}`}</span><span>{sceneMode && sceneMap?.rendered_point_count != null && sceneMap.rendered_point_count !== sceneMap.point_count ? `${sceneMap.rendered_point_count.toLocaleString()} / ${sceneMap.point_count.toLocaleString()}` : (sceneMode ? sceneMap?.point_count : frame?.point_count)?.toLocaleString() ?? 0} POINTS</span></div>
               {(loading || (sceneMode && reconstructing && !sceneMap)) && <div className="loading-overlay"><span className="spinner"/>{reconstructing ? '正在将整个 clip 重建为场景地图…' : '正在加载多模态数据…'}</div>}
               {sceneMode && !sceneMap && !loading && !reconstructing && <div className="empty-scene"><Icon name="layers" size={38}/><h2>{clip ? '场景地图尚未生成' : '从一个 clip 开始'}</h2><p>{reconstruction?.error ?? '将整段点云配准、融合为可标注场景'}</p>{clip && <button className="button primary" onClick={() => void rebuildScene()}>重建整个场景</button>}</div>}
               {vectorTask && tool === 'vector' && <div className="drawing-bar"><span>{draftVector.length} 个{sceneMode ? '世界' : 'LiDAR'}顶点 · {closedDraft ? '面至少 3 点' : '线至少 2 点'}</span><button disabled={editBlocked || draftVector.length < (closedDraft ? 3 : 2)} onClick={finishVector}>完成绘制</button><button disabled={!draftVector.length} onClick={() => setDraftVector(p => p.slice(0, -1))}>撤回一点</button><button onClick={() => {setDraftVector([]); setTool('select');}}>取消</button><small>Enter 完成 · Backspace 撤回 · Esc 取消</small></div>}
