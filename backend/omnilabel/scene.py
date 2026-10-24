@@ -18,16 +18,17 @@ from uuid import uuid4
 
 import numpy as np
 
-from .geometry import DYNAMIC_LABELS, _inside_box, _matrix, _points, _transform, _voxel_indices, fuse_map
+from .geometry import DYNAMIC_LABELS, _inside_box, _matrix, _points, _static_chunks, _transform, _voxel_indices, fuse_map
 from .models import Annotations, Clip, Frame
 from .scene_models import ReconstructionRequest, SceneAnnotations
+from .registration import register_multiscale, spatial_sample
 from .storage import ConflictError, Store, atomic_json, safe_id
 
-MAX_ICP_POINTS = 3000
-MAX_ICP_ITERATIONS = 35
+MAX_ICP_POINTS = 15000  # Solver sample budget only; source/fused map is never truncated.
+MAX_ICP_ITERATIONS = 45
 MAX_ICP_PAIR_DISTANCE = 3.0
-FUSION_VERSION = 2
-SCENE_PREVIEW_POINTS = 500_000
+FUSION_VERSION = 3
+SCENE_PREVIEW_POINTS = None  # No implicit map preview truncation.
 
 
 def _scene_path(store: Store, clip_id: str) -> Path:
@@ -64,6 +65,17 @@ def _clip_fingerprint(store: Store, clip: Clip) -> str:
     if path.exists():
         stat = path.stat()
         token = [clip.id, stat.st_size, stat.st_mtime_ns]
+        point_root = (store.root / "pointclouds").resolve()
+        for frame in clip.frames:
+            if frame.pointcloud_file:
+                source = (point_root / frame.pointcloud_file).resolve()
+                if not source.is_relative_to(point_root):
+                    raise ValueError("Referenced point cloud is outside the pointcloud store")
+                if source.is_file():
+                    info = source.stat()
+                    token.append([frame.pointcloud_file, info.st_size, info.st_mtime_ns])
+                else:
+                    token.append([frame.pointcloud_file, None])
     else:
         token = clip.model_dump()
     return sha256(json.dumps(token, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -225,15 +237,29 @@ def _fusion_annotations(frame: Frame, annotations: dict, exclude_dynamic: bool, 
         return value
     value["boxes"] = [box for box in value.get("boxes", []) if box.get("track_id") not in static_ids]
     if static_boxes:
-        cloud = _points(frame.model_dump(), point_loader)
-        if len(cloud) * len(static_boxes) > 50_000_000:
-            raise ValueError("Too many static target/point comparisons for reconstruction")
-        protected = np.zeros(len(cloud), dtype=bool)
-        for box in static_boxes:
-            protected |= _inside_box(cloud, box)
-        for index, label in list(value.get("point_labels", {}).items()):
-            if label.lower() in DYNAMIC_LABELS and protected[int(index)]:
-                value["point_labels"][index] = f"scene-static:{label}"
+        # Test only the annotated candidate rows, in batches. Loading/converting
+        # the whole scan to protect a handful of static labels wastes RAM.
+        raw = point_loader(frame.model_dump()) if point_loader is not None else frame.points
+        candidates = (index for index, label in value.get("point_labels", {}).items()
+                      if label.lower() in DYNAMIC_LABELS)
+        pending = []
+
+        def protect(indices):
+            points = np.asarray([raw[int(index)][:3] for index in indices], dtype=float)
+            protected = np.zeros(len(points), dtype=bool)
+            for box in static_boxes:
+                protected |= _inside_box(points, box)
+            for index, keep in zip(indices, protected):
+                if keep:
+                    value["point_labels"][index] = f"scene-static:{value['point_labels'][index]}"
+
+        for index in candidates:
+            pending.append(index)
+            if len(pending) == 100_000:
+                protect(pending)
+                pending = []
+        if pending:
+            protect(pending)
     return value
 
 
@@ -242,8 +268,6 @@ def _static_scan(frame: Frame, annotations: dict, exclude_dynamic: bool, point_l
     if not exclude_dynamic:
         return cloud
     keep = np.ones(len(cloud), dtype=bool)
-    if len(cloud) * len(annotations.get("boxes", [])) > 50_000_000:
-        raise ValueError("Too many target/point comparisons for scene reconstruction")
     for box in annotations.get("boxes", []):
         if box["label"].lower() in DYNAMIC_LABELS:
             keep &= ~_inside_box(cloud, box)
@@ -253,15 +277,24 @@ def _static_scan(frame: Frame, annotations: dict, exclude_dynamic: bool, point_l
     return cloud[keep]
 
 
-def _registration_sample(points: np.ndarray, voxel_size: float) -> np.ndarray:
-    if not len(points):
-        return np.empty((0, 3))
-    xyz = points[:, :3]
-    _, indices = np.unique(_voxel_indices(xyz, max(voxel_size, 0.2)), axis=0, return_index=True)
-    xyz = xyz[np.sort(indices)]
-    if len(xyz) > MAX_ICP_POINTS:
-        xyz = xyz[np.linspace(0, len(xyz) - 1, MAX_ICP_POINTS, dtype=int)]
-    return xyz
+def _registration_sample(points: np.ndarray, voxel_size: float, max_points: int = 15000) -> np.ndarray:
+    return spatial_sample(points, voxel_size, max_points)
+
+
+def _registration_scan(frame: Frame, annotations: dict, request: ReconstructionRequest, point_loader=None) -> np.ndarray:
+    # Keep registration in the sensor coordinate frame while streaming all
+    # packets. A bounded spatial reservoir avoids materialising a huge scan.
+    raw = frame.model_dump()
+    raw["ego_to_world"] = np.eye(4).tolist()
+    raw["lidar_to_ego"] = np.eye(4).tolist()
+    candidate = np.empty((0, 3))
+    voxel = request.registration_voxel_size * .5
+    for static, _, _, _, _ in _static_chunks({"frames": [raw]}, {frame.id: annotations}, point_loader):
+        if not len(static):
+            continue
+        sample = spatial_sample(static[:, :3], voxel, request.registration_sample_size)
+        candidate = spatial_sample(np.concatenate((candidate, sample)), voxel, request.registration_sample_size)
+    return candidate
 
 
 def _spatial_support(points: np.ndarray) -> bool:
@@ -272,73 +305,14 @@ def _spatial_support(points: np.ndarray) -> bool:
     return len(singular) >= 2 and singular[1] > max(1e-5, singular[0] * 1e-4)
 
 
-def _nearest(source: np.ndarray, target: np.ndarray):
-    try:
-        from scipy.spatial import cKDTree
-        tree = cKDTree(target)
-        return lambda query: tree.query(query, k=1, workers=1)
-    except ImportError:
-        # Bounded NumPy fallback keeps the route functional in minimal installs.
-        def query(values):
-            distances, indices = [], []
-            for start in range(0, len(values), 128):
-                chunk = values[start:start + 128]
-                squared = ((chunk[:, None, :] - target[None, :, :]) ** 2).sum(axis=2)
-                index = np.argmin(squared, axis=1)
-                distances.extend(np.sqrt(squared[np.arange(len(chunk)), index]))
-                indices.extend(index)
-            return np.asarray(distances), np.asarray(indices)
-        return query
-
-
 def register_icp(source: np.ndarray, target: np.ndarray, initial: np.ndarray,
                  max_distance: float = MAX_ICP_PAIR_DISTANCE) -> tuple[np.ndarray, dict]:
-    """Trimmed, point-to-point SVD ICP with explicit overlap/degeneracy checks."""
-    if not _spatial_support(source) or not _spatial_support(target):
-        raise ValueError("ICP needs at least 30 non-collinear static points in both scans")
-    query = _nearest(source, target)
-    matrix = np.array(initial, dtype=float, copy=True)
-    iterations = 0
-    converged = False
-    for iteration in range(MAX_ICP_ITERATIONS):
-        transformed = _transform(source, matrix)
-        distances, indices = query(transformed)
-        valid = np.flatnonzero(distances <= max_distance)
-        if len(valid) < 30:
-            raise ValueError("ICP scan overlap is insufficient (fewer than 30 nearby correspondences)")
-        # Trim long correspondences instead of fitting dynamic/outlier geometry.
-        order = valid[np.argsort(distances[valid])]
-        keep = order[:max(30, int(len(order) * 0.85))]
-        a, b = transformed[keep], target[indices[keep]]
-        if not _spatial_support(a) or not _spatial_support(b):
-            raise ValueError("ICP correspondence geometry is degenerate")
-        center_a, center_b = a.mean(axis=0), b.mean(axis=0)
-        u, _, vt = np.linalg.svd((a - center_a).T @ (b - center_b))
-        rotation = vt.T @ u.T
-        if np.linalg.det(rotation) < 0:
-            vt[-1] *= -1
-            rotation = vt.T @ u.T
-        translation = center_b - rotation @ center_a
-        delta = np.eye(4)
-        delta[:3, :3], delta[:3, 3] = rotation, translation
-        matrix = delta @ matrix
-        iterations = iteration + 1
-        angle = float(np.arccos(np.clip((np.trace(rotation) - 1) / 2, -1, 1)))
-        if np.linalg.norm(translation) < 1e-4 and angle < 1e-4:
-            converged = True
-            break
-    distances, _ = query(_transform(source, matrix))
-    inliers = distances <= max_distance
-    fitness = float(inliers.mean())
-    rmse = float(np.sqrt(np.mean(distances[inliers] ** 2))) if inliers.any() else float("inf")
-    if fitness < 0.25 or not np.isfinite(rmse) or rmse > max_distance * 0.5:
-        raise ValueError(f"ICP quality rejected: overlap={fitness:.3f}, inlier RMSE={rmse:.3f}m. Supply better poses or split the clip.")
-    return matrix, {"fitness": fitness, "rmse": rmse, "iterations": iterations, "converged": converged,
-                    "correspondence_distance": max_distance, "source_points": len(source), "target_points": len(target)}
+    """Compatibility entry point backed by the robust multiscale solver."""
+    return register_multiscale(source, target, initial, max_distance=max_distance)
 
 
 def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: ReconstructionRequest,
-                      point_loader=None) -> dict:
+                      point_loader=None, *, array_result: bool = False) -> dict:
     """Build one world-space map, retaining an explicit scan trajectory."""
     poses = source_poses(clip)
     fusion_annotations = {frame.id: _fusion_annotations(frame, annotations.get(frame.id, {}), request.exclude_dynamic,
@@ -346,26 +320,38 @@ def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: Reconst
                           for frame in clip.frames}
     reports = []
     if request.registration == "icp":
-        previous_frame, previous_scan = None, None
+        history = []
+        previous_frame = None
         original_poses = source_poses(clip)
         for frame in clip.frames:
-            scan = _registration_sample(_static_scan(frame, fusion_annotations.get(frame.id, {}), request.exclude_dynamic,
-                                                     point_loader), request.voxel_size)
+            # Sampling is only for the registration solver. Final fusion reads
+            # every original point again, independently of this solver budget.
+            scan = _registration_scan(frame, fusion_annotations.get(frame.id, {}), request, point_loader)
             if previous_frame is None:
                 if not _spatial_support(scan):
                     raise ValueError("ICP reference scan needs at least 30 non-collinear static points")
             else:
                 initial = poses[previous_frame.id] @ np.linalg.inv(original_poses[previous_frame.id]) @ original_poses[frame.id]
-                target = _transform(previous_scan, poses[previous_frame.id])
-                poses[frame.id], report = register_icp(scan, target, initial)
-                reports.append({"frame_id": frame.id, "reference_frame_id": previous_frame.id, **report})
-            previous_frame, previous_scan = frame, scan
+                # Register to several already-aligned scans. This retains useful
+                # static surfaces when adjacent packets have partial occlusion.
+                target = np.concatenate([entry[1] for entry in history[-request.submap_frames:]])
+                poses[frame.id], report = register_multiscale(
+                    scan, target, initial, base_voxel=request.registration_voxel_size,
+                    max_points=request.registration_sample_size)
+                reports.append({"frame_id": frame.id, "reference_frame_id": previous_frame.id,
+                                "reference_frame_ids": [entry[0] for entry in history[-request.submap_frames:]], **report})
+            history.append((frame.id, _transform(scan, poses[frame.id])))
+            if len(history) > request.submap_frames:
+                history.pop(0)
+            previous_frame = frame
     corrected = clip.model_dump()
     for frame in corrected["frames"]:
         frame["ego_to_world"] = (poses[frame["id"]] @ np.linalg.inv(np.asarray(frame["lidar_to_ego"], dtype=float))).tolist()
     result = fuse_map(corrected, fusion_annotations, request.voxel_size,
                       preserve_detail=request.preserve_detail, detail_voxel_size=request.detail_voxel_size,
-                      point_loader=point_loader)
+                      point_loader=point_loader, fusion_mode=request.fusion_mode,
+                      outlier_filter=request.outlier_filter, outlier_neighbors=request.outlier_neighbors,
+                      outlier_std_ratio=request.outlier_std_ratio, return_array=array_result)
     result["point_labels"] = {index: label.removeprefix("scene-static:") for index, label in result.get("point_labels", {}).items()}
     points = np.asarray(result["points"], dtype=float)
     if not len(points):
@@ -375,8 +361,8 @@ def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: Reconst
         world_from_lidar={fid: matrix.tolist() for fid, matrix in poses.items()},
         bounds={"min": points[:, :3].min(axis=0).tolist(), "max": points[:, :3].max(axis=0).tolist()},
         registration={"mode": request.registration, "frames": reports, "loop_closure": False,
-                      "note": "Uses supplied poses" if request.registration == "poses" else "Local sequential point-to-point ICP; no loop closure or global SLAM accuracy guarantee"},
-        method="pose-aligned whole-clip static reconstruction" if request.registration == "poses" else "sequential ICP whole-clip static reconstruction",
+                      "note": "Uses supplied poses" if request.registration == "poses" else "Multiscale trimmed/Huber scan-to-local-submap ICP; no loop closure or global SLAM accuracy guarantee"},
+        method="pose-aligned whole-clip static reconstruction" if request.registration == "poses" else "multiscale local-submap ICP whole-clip static reconstruction",
         exclude_dynamic=request.exclude_dynamic,
         fusion_version=FUSION_VERSION,
     )
@@ -398,7 +384,7 @@ def rebase_scene(scene: SceneAnnotations, old_poses: dict[str, np.ndarray], new_
     return SceneAnnotations.model_validate(raw)
 
 
-def _stored_map_points(store: Store, value: dict) -> np.ndarray:
+def _stored_map_points(store: Store, value: dict, *, check_values: bool = True) -> np.ndarray:
     relative = value.get("pointcloud_file")
     if not isinstance(relative, str):
         return np.asarray(value.get("points", []), dtype=float)
@@ -411,8 +397,12 @@ def _stored_map_points(store: Store, value: dict) -> np.ndarray:
     except (OSError, ValueError) as exc:
         raise ValueError("Scene map point cloud is not a valid NPY array") from exc
     if (points.ndim != 2 or points.shape[1] != 4 or len(points) != value.get("point_count")
-            or not np.issubdtype(points.dtype, np.number) or not np.isfinite(points).all()):
-        raise ValueError("Scene map point cloud has invalid shape, count, type, or values")
+            or not np.issubdtype(points.dtype, np.number)):
+        raise ValueError("Scene map point cloud has invalid shape, count, or type")
+    if check_values:
+        for start in range(0, len(points), 100_000):
+            if not np.isfinite(points[start:start + 100_000]).all():
+                raise ValueError("Scene map point cloud has nonfinite values")
     return points
 
 
@@ -432,19 +422,51 @@ def get_scene_map(store: Store, clip: Clip, *, max_points: int | None = None,
             value.pop("pointcloud_file", None)
             return value
         points = _stored_map_points(store, value)
-        if max_points is not None and len(points) > max_points:
-            indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
-        else:
-            indices = np.arange(len(points))
-        value["points"] = np.asarray(points[indices], dtype=float).tolist()
+        if max_points is not None and max_points <= 0:
+            raise ValueError("An explicit preview max_points must be positive")
+        indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64) if max_points is not None and len(points) > max_points else None
+        selected = points if indices is None else points[indices]
+        value["points"] = np.asarray(selected, dtype=float).tolist()
         labels = value.get("point_labels", {})
-        if len(indices) != len(points) and labels:
+        if indices is not None and labels:
             value["point_labels"] = {
                 str(output): labels[str(source)] for output, source in enumerate(indices) if str(source) in labels
             }
-        value["rendered_point_count"] = len(indices)
+        value["rendered_point_count"] = len(selected)
+        value["preview_truncated"] = indices is not None
         value.pop("pointcloud_file", None)
         return value
+
+
+def scene_map_page(store: Store, clip: Clip, offset: int = 0, limit: int | None = None) -> dict:
+    """Contiguous transport pages, with global indices; no points are sampled."""
+    if offset < 0 or (limit is not None and limit <= 0):
+        raise ValueError("Map point offset must be nonnegative and limit positive")
+    with store.lock:
+        metadata = get_scene_map(store, clip, include_points=False)
+        stored = json.loads(_map_path(store, clip.id).read_text())
+        points = _stored_map_points(store, stored, check_values=False)
+        end = len(points) if limit is None else min(len(points), offset + limit)
+        selected = points[offset:end]
+        if not np.isfinite(selected).all():
+            raise ValueError("Scene map point page contains nonfinite values")
+        labels = stored.get("point_labels", {})
+        return {"points": np.asarray(selected).tolist(), "point_offset": offset,
+                "point_count": len(points), "returned_point_count": len(selected),
+                "point_labels": {str(index): labels[str(index)] for index in range(offset, end) if str(index) in labels},
+                "next_offset": end if end < len(points) else None, "coordinate_frame": "world",
+                "source_fingerprint": metadata["source_fingerprint"], "sampling": False}
+
+
+def scene_map_file(store: Store, clip: Clip) -> Path:
+    with store.lock:
+        get_scene_map(store, clip, include_points=False)
+        value = json.loads(_map_path(store, clip.id).read_text())
+        _stored_map_points(store, value, check_values=False)
+        relative = value.get("pointcloud_file")
+        if not isinstance(relative, str):
+            raise KeyError("Reconstruct this scene to enable full-resolution NPY export")
+        return store.root / "scene_pointclouds" / relative
 
 
 def save_reconstruction(store: Store, clip: Clip, result: dict, fingerprint: str,
@@ -516,7 +538,9 @@ def scene_export(store: Store, clip: Clip) -> dict:
         value["scene_map"] = {key: deepcopy(cached[key]) for key in (
             "coordinate_frame", "frame_count", "point_count", "trajectory", "bounds", "method", "voxel_size", "registration", "exclude_dynamic",
             "fusion_version", "preserve_detail", "detail_voxel_size", "effective_voxel_size", "point_reduction",
-            "intensity_available", "intensity_has_contrast", "intensity_range") if key in cached}
+            "intensity_available", "intensity_has_contrast", "intensity_range", "fusion_mode",
+            "input_point_count", "excluded_dynamic_points", "excluded_outlier_points", "outlier_filter",
+            "input_truncated", "output_truncated") if key in cached}
     except KeyError:
         pass
     return value

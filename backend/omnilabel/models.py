@@ -60,7 +60,9 @@ class Frame(Model):
     timestamp: float
     ego_to_world: list[list[float]]
     lidar_to_ego: list[list[float]]
-    points: list[list[float]] = Field(default_factory=list, max_length=500_000)
+    # Point count is determined by the source data, not an interactive quota.
+    # Large binary scans use pointcloud_file so the manifest stays compact.
+    points: list[list[float]] = Field(default_factory=list)
     pointcloud_file: str | None = Field(default=None, max_length=240)
     point_count: int | None = Field(default=None, ge=0)
     images: dict[str, str] = Field(default_factory=dict)
@@ -110,9 +112,6 @@ class Clip(Model):
             raise ValueError("frame images reference an unknown camera")
         if any(self.frames[i].timestamp >= self.frames[i + 1].timestamp for i in range(len(self.frames) - 1)):
             raise ValueError("frame timestamps must be strictly increasing")
-        total_points = sum(f.point_count or 0 for f in self.frames)
-        if not any(f.pointcloud_file for f in self.frames) and total_points > 2_000_000:
-            raise ValueError("interactive inline clip limit is 2 million points; use external point-cloud storage")
         return self
 
 

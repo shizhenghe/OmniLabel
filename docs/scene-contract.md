@@ -14,7 +14,7 @@ interface SceneMap { points:number[][]; point_labels:Record<string,string>;
   trajectory:{frame_id:string;timestamp:number;position:Vec3}[];
   bounds:{min:Vec3;max:Vec3}; method:string; voxel_size:number;
   preserve_detail:boolean; detail_voxel_size:number; effective_voxel_size:number;
-  point_reduction:'brightest-measured-point'|'centroid-mean'; fusion_version:number;
+  point_reduction:'brightest-measured-point'|'nearest-measured-surface-point'|'centroid-mean'|'all-measured-points'; fusion_version:number;
   intensity_available:boolean; intensity_has_contrast:boolean; intensity_range:[number,number]|null;
   registration?:Record<string,unknown>; [key:string]:unknown }
 ```
@@ -26,11 +26,16 @@ interface SceneMap { points:number[][]; point_labels:Record<string,string>;
   active LiDAR coordinates (keyframe interpolation, persistent world vectors).
 - `POST /api/clips/{id}/scene/reconstruct` JSON
   `{voxel_size:number,registration:'poses'|'icp',exclude_dynamic:boolean,
-    preserve_detail?:boolean,detail_voxel_size?:number}`:
+    preserve_detail?:boolean,detail_voxel_size?:number,
+    fusion_mode?:'full'|'detail'|'surface'|'centroid',outlier_filter?:boolean,
+    registration_voxel_size?:number,registration_sample_size?:number,submap_frames?:number}`:
   returns persisted job `{id,kind:'reconstruct',status,...}`, polls existing jobs API.
-  Pose mode fuses input poses; ICP mode registers scans, reports fit/degeneracy
-  and never silently claims SLAM. Successful result is SceneMap and is cached.
-- Detail preservation defaults to true with 0.05m detail voxels (range 0.05–0.2m).
+  Pose mode fuses input poses; ICP mode uses multiscale trimmed/Huber scan-to-local-submap registration,
+  reports per-stage fit/degeneracy and never claims global SLAM. Successful result is SceneMap and is cached.
+- `fusion_mode:'full'` preserves every static measurement without voxel downsampling.
+  `surface` preserves the actual measured point nearest each voxel centroid; `detail` uses its brightest measurement;
+  `centroid` averages points. Optional statistical outlier filtering is off by default and records removed counts.
+- Legacy detail preservation defaults to true with 0.05m detail voxels (range 0.02–0.2m).
   Effective voxel resolution is `min(voxel_size,detail_voxel_size)`. The brightest
   observed sample per cell retains its paired XYZ/intensity/semantic label. Disabling
   it restores centroids and mean intensity; legacy `fuse_map` callers still default
@@ -38,7 +43,12 @@ interface SceneMap { points:number[][]; point_labels:Record<string,string>;
 - `intensity_available` indicates a nonzero signal after filtering, not provenance of
   the original file: normalized XYZ rows are zero-filled, and native all-zero intensity
   is likewise treated as unusable. `intensity_has_contrast` reports actual variation.
-- `GET /api/clips/{id}/scene/map`: latest reconstructed SceneMap, 404 if absent.
+- `GET /api/clips/{id}/scene/registration`: registered-or-source `world_from_lidar` transforms,
+  available even when annotation changes stale the map. Use this for world-coordinate fallback rendering.
+- `GET /api/clips/{id}/scene/map`: latest complete reconstructed SceneMap, with no implicit point limit, 404 if absent.
+- `GET /api/clips/{id}/scene/map/points?offset=0&limit=100000`: contiguous transport page, original map indices,
+  `point_count`, `next_offset`, and `sampling:false`. Page size controls transport only.
+- `GET /api/clips/{id}/scene/map.npy`: full-resolution XYZI map download, independently of any preview.
   Old fusion-version caches also return 404 to request refresh; saved registered
   transforms and scene annotations are retained independently.
 - Exports should include `scene_annotations` and optional `scene_map` metadata;

@@ -9,6 +9,7 @@ interface Props {
   box: Box;
   mode: BoxTransformMode;
   camera: THREE.Camera;
+  renderOrigin?: Vec3;
   canvas: HTMLCanvasElement;
   controls: OrbitControls;
   onUpdate: (id: string, patch: Partial<Box>) => void;
@@ -41,6 +42,61 @@ interface Drag {
 const AXES = ['x', 'y', 'z'];
 const DIMENSIONS = ['长', '宽', '高'];
 const COLORS = ['#ff8080', '#7de2aa', '#78adff'];
+
+interface GripLayoutPoint { id: string; action: BoxTransformMode; x: number; y: number; visible: boolean }
+
+/** Keep projected controls reachable without changing their measured 3D faces. */
+export function placeViewportGrips<T extends GripLayoutPoint>(grips: T[], viewportWidth: number,
+  viewportHeight: number, projectedCenter: {x: number; y: number}): T[] {
+  const width = Number.isFinite(viewportWidth) ? Math.max(0, viewportWidth) : 0;
+  const height = Number.isFinite(viewportHeight) ? Math.max(0, viewportHeight) : 0;
+  const center = {x: Number.isFinite(projectedCenter.x) ? projectedCenter.x : width / 2,
+    y: Number.isFinite(projectedCenter.y) ? projectedCenter.y : height / 2};
+  const dimensions = (grip: GripLayoutPoint) => grip.action === 'scale' ? [34, 26] : [25, 25];
+  const clamp = (value: number, extent: number, halfSize: number) => {
+    if (extent <= 2 * (halfSize + 4)) return extent / 2;
+    return Math.max(halfSize + 4, Math.min(extent - halfSize - 4, value));
+  };
+  const result = grips.map(grip => ({...grip}));
+  const placed: T[] = [];
+  // The center grip has priority so face labels never cover the move target.
+  const order = [...result.filter(grip => grip.id === 'translate-xy'), ...result.filter(grip => grip.id !== 'translate-xy')];
+  for (const grip of order) {
+    if (!grip.visible) continue;
+    const size = dimensions(grip);
+    const desired = {x: Number.isFinite(grip.x) ? grip.x : width / 2,
+      y: Number.isFinite(grip.y) ? grip.y : height / 2};
+    const dx = desired.x - center.x, dy = desired.y - center.y;
+    const length = Math.hypot(dx, dy);
+    const tangent = length > 1e-6 ? {x: -dy / length, y: dx / length} : {x: 1, y: 0};
+    const candidates = [0, 42, -42, 84, -84, 126, -126].map(offset => ({
+      x: desired.x + tangent.x * offset, y: desired.y + tangent.y * offset}));
+    // A tangent may run along an edge. Nearby in-bounds alternatives still
+    // separate those grips instead of pushing them outside the clipped overlay.
+    for (const radius of [42, 84, 126]) for (let direction = 0; direction < 8; direction++) {
+      const angle = direction * Math.PI / 4;
+      candidates.push({x: desired.x + Math.cos(angle) * radius, y: desired.y + Math.sin(angle) * radius});
+    }
+    let best = {x: width / 2, y: height / 2}, bestOverlap = Infinity, bestDistance = Infinity;
+    for (const candidate of candidates) {
+      const point = {x: clamp(candidate.x, width, size[0] / 2), y: clamp(candidate.y, height, size[1] / 2)};
+      let overlap = 0;
+      for (const other of placed) {
+        const otherSize = dimensions(other);
+        const across = Math.max(0, (size[0] + otherSize[0]) / 2 + 5 - Math.abs(point.x - other.x));
+        const down = Math.max(0, (size[1] + otherSize[1]) / 2 + 5 - Math.abs(point.y - other.y));
+        overlap += across * down;
+      }
+      const distance = (point.x - desired.x) ** 2 + (point.y - desired.y) ** 2;
+      if (overlap < bestOverlap || (overlap === bestOverlap && distance < bestDistance)) {
+        best = point; bestOverlap = overlap; bestDistance = distance;
+      }
+    }
+    grip.x = best.x; grip.y = best.y;
+    placed.push(grip);
+  }
+  return result;
+}
 
 export function normalizeYaw(value: number) {
   return Math.atan2(Math.sin(value), Math.cos(value));
@@ -93,6 +149,7 @@ function pointerRay(event: {clientX: number; clientY: number}, props: Props) {
   const ray = new THREE.Raycaster();
   ray.setFromCamera(new THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
     -(event.clientY - rect.top) / rect.height * 2 + 1), props.camera);
+  ray.ray.origin.add(new THREE.Vector3(...(props.renderOrigin ?? [0, 0, 0])));
   return ray.ray;
 }
 
@@ -125,9 +182,10 @@ export function BoxTransformGizmo(props: Props) {
       const p = latest.current;
       const rect = p.canvas.getBoundingClientRect();
       const centerWorld = new THREE.Vector3(...p.box.center);
-      const center = centerWorld.clone().project(p.camera);
+      const offset = new THREE.Vector3(...(p.renderOrigin ?? [0, 0, 0]));
+      const center = centerWorld.clone().sub(offset).project(p.camera);
       const handles = makeHandles(p.box, p.mode).map(handle => {
-        const pixel = handle.world.clone().project(p.camera);
+        const pixel = handle.world.clone().sub(offset).project(p.camera);
         let x = (pixel.x + 1) * rect.width / 2;
         let y = (1 - pixel.y) * rect.height / 2;
         const length = handle.world.distanceTo(centerWorld);
@@ -145,38 +203,13 @@ export function BoxTransformGizmo(props: Props) {
         return { ...handle, x, y,
           visible: pixel.z > -1 && pixel.z < 1 && (length < 0.001 || screenLength > 1e-4) };
       });
-      // Narrow boxes can project a face to a fraction of one pixel at world-map
-      // zoom. Keep that grip and separate overlapping labels in screen space;
-      // the measured face positions and world-space drag planes stay unchanged.
-      const centerGrip = handles.find(handle => handle.id === 'translate-xy');
-      const placed: ScreenHandle[] = centerGrip?.visible ? [centerGrip] : [];
-      const dimensions = (handle: ScreenHandle) => handle.action === 'scale' ? [34, 26] : [25, 25];
-      handles.filter(handle => handle.visible && handle.id !== 'translate-xy').forEach(handle => {
-        const dx = handle.x - (center.x + 1) * rect.width / 2;
-        const dy = handle.y - (1 - center.y) * rect.height / 2;
-        const length = Math.max(Math.hypot(dx, dy), 1e-4);
-        const tangent = {x: -dy / length, y: dx / length};
-        const size = dimensions(handle);
-        const offsets = [0, 42, -42, 84, -84, 126, -126];
-        const desired = {x: handle.x, y: handle.y};
-        for (const offset of offsets) {
-          const x = desired.x + tangent.x * offset, y = desired.y + tangent.y * offset;
-          if (placed.some(other => {
-            const otherSize = dimensions(other);
-            return Math.abs(x - other.x) < (size[0] + otherSize[0]) / 2 + 5 &&
-              Math.abs(y - other.y) < (size[1] + otherSize[1]) / 2 + 5;
-          })) continue;
-          handle.x = x; handle.y = y;
-          break;
-        }
-        placed.push(handle);
-      });
-      const next = { center: {x: (center.x + 1) * rect.width / 2, y: (1 - center.y) * rect.height / 2},
-        handles, width: rect.width, height: rect.height };
+      const projectedCenter = {x: (center.x + 1) * rect.width / 2, y: (1 - center.y) * rect.height / 2};
+      const visibleHandles = placeViewportGrips(handles, rect.width, rect.height, projectedCenter);
+      const next = {center: projectedCenter, handles: visibleHandles, width: rect.width, height: rect.height};
       // Orbit renders every frame; only ask React to update when screen positions
       // or box/mode values change. Rounded pixels prevent subpixel jitter churn.
       const key = JSON.stringify([p.box.id, p.box.center, p.box.size, p.box.yaw, p.mode, next.center.x.toFixed(1), next.center.y.toFixed(1),
-        rect.width, rect.height, ...handles.map(h => [h.id, h.x.toFixed(1), h.y.toFixed(1), h.visible])]);
+        rect.width, rect.height, ...visibleHandles.map(h => [h.id, h.x.toFixed(1), h.y.toFixed(1), h.visible])]);
       if (key !== previous) { previous = key; setLayout(next); }
       animation = requestAnimationFrame(render);
     };

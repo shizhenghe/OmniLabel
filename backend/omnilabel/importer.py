@@ -1,9 +1,10 @@
-"""Bounded portable clip import. ZIP members are never extracted blindly."""
+"""Lossless portable clip import. ZIP members are never extracted blindly."""
 from __future__ import annotations
 
 import base64
 import io
 import json
+import os
 import shutil
 import stat
 import tempfile
@@ -16,10 +17,12 @@ from PIL import Image
 
 from .models import Annotations, Clip
 
-MAX_UPLOAD = 128 * 1024 * 1024
-MAX_EXPANDED = 256 * 1024 * 1024
-MAX_FILES = 5000
-MAX_POINTS = 500_000
+# Optional deployment quotas are bytes/members, never source-point quotas.
+# Zero means unrestricted. UploadFile and ZIP assets stream through disk so a
+# large archive need not be copied into one giant request bytes object.
+MAX_UPLOAD = int(os.environ.get("OMNILABEL_MAX_UPLOAD_BYTES", "0"))
+MAX_EXPANDED = int(os.environ.get("OMNILABEL_MAX_EXPANDED_BYTES", "0"))
+MAX_FILES = int(os.environ.get("OMNILABEL_MAX_ARCHIVE_MEMBERS", "0"))
 
 
 def read_member(archive: zipfile.ZipFile, entry: zipfile.ZipInfo) -> bytes:
@@ -36,7 +39,16 @@ def member_path(name: str) -> str:
     return str(value)
 
 
-def decode_points(data: bytes, name: str):
+def checked_point_array(points: np.ndarray) -> np.ndarray:
+    if points.ndim != 2 or points.shape[1] not in (3, 4) or points.dtype.kind not in "fiu":
+        raise ValueError("point file must contain a real numeric Nx3 or Nx4 array")
+    for start in range(0, len(points), 100_000):
+        if not np.isfinite(points[start:start + 100_000]).all():
+            raise ValueError("point file must contain finite values")
+    return points
+
+
+def decode_point_array(data: bytes, name: str) -> np.ndarray:
     extension = Path(name).suffix.lower()
     if extension == ".bin":
         if len(data) % 16:
@@ -51,8 +63,8 @@ def decode_points(data: bytes, name: str):
             shape, fortran, dtype = np.lib.format.read_array_header_2_0(stream)
         else:
             raise ValueError("NPY format versions 1 and 2 are supported")
-        if len(shape) != 2 or shape[1] not in (3, 4) or not 0 <= shape[0] <= MAX_POINTS or dtype.kind not in "fiu":
-            raise ValueError("NPY must contain a real numeric Nx3 or Nx4 array with at most 500000 points")
+        if len(shape) != 2 or shape[1] not in (3, 4) or shape[0] < 0 or dtype.kind not in "fiu":
+            raise ValueError("NPY must contain a real numeric Nx3 or Nx4 array")
         expected_size = int(shape[0]) * int(shape[1]) * dtype.itemsize
         if expected_size > len(data) - stream.tell():
             raise ValueError("NPY data is shorter than its declared shape")
@@ -79,9 +91,55 @@ def decode_points(data: bytes, name: str):
         points = raw[:, selected]
     else:
         raise ValueError("point files must be .bin, .npy or ASCII .pcd")
-    if points.ndim != 2 or points.shape[1] not in (3, 4) or len(points) > MAX_POINTS or not np.issubdtype(points.dtype, np.number) or not np.isfinite(points).all():
-        raise ValueError("point file must be finite Nx3 or Nx4 with at most 500000 points")
-    return points.astype(float).tolist()
+    return checked_point_array(points)
+
+
+def decode_points(data: bytes, name: str):
+    """Compatibility helper for callers needing JSON rows; no count truncation."""
+    return decode_point_array(data, name).astype(float).tolist()
+
+
+def point_array_from_file(path: Path, name: str) -> np.ndarray:
+    """Validate a complete binary scan without loading another complete copy."""
+    extension = Path(name).suffix.lower()
+    try:
+        if extension == ".bin":
+            size = path.stat().st_size
+            if size % 16:
+                raise ValueError(".bin points must contain little-endian float32 XYZI records")
+            points = np.memmap(path, mode="r", dtype="<f4", shape=(size // 16, 4)) if size else np.empty((0, 4), dtype="<f4")
+        elif extension == ".npy":
+            points = np.load(path, mmap_mode="r", allow_pickle=False)
+        else:
+            return decode_point_array(path.read_bytes(), name)
+        return checked_point_array(points)
+    except (OSError, EOFError) as exc:
+        raise ValueError("point file data is missing or shorter than its declared shape") from exc
+
+
+def stage_point_asset(archive, entry, name, staging: Path, namespace: str, frame: dict):
+    point_stage = staging / "_pointclouds"
+    point_stage.mkdir(exist_ok=True)
+    source = point_stage / (uuid.uuid4().hex + ".source")
+    try:
+        try:
+            with archive.open(entry) as incoming, source.open("wb") as outgoing:
+                shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError) as exc:
+            raise ValueError("ZIP member failed integrity or compression validation") from exc
+        points = point_array_from_file(source, name)
+        if frame.get("point_count") is not None and frame["point_count"] != len(points):
+            raise ValueError("point_count does not match the point asset")
+        target = uuid.uuid4().hex + ".npy"
+        if Path(name).suffix.lower() == ".npy":
+            shutil.copyfile(source, point_stage / target)
+        else:
+            np.save(point_stage / target, points, allow_pickle=False)
+        frame["points"] = []
+        frame["pointcloud_file"] = f"{namespace}/{target}"
+        frame["point_count"] = len(points)
+    finally:
+        source.unlink(missing_ok=True)
 
 
 def validate_image(data: bytes, expected_size: tuple[int, int] | None = None) -> str:
@@ -102,23 +160,28 @@ def validate_image(data: bytes, expected_size: tuple[int, int] | None = None) ->
         raise ValueError("invalid image asset") from exc
 
 
-def parse_import(payload: bytes, filename: str, assets_root: Path, *, include_scene: bool = False):
+def parse_import(payload, filename: str, assets_root: Path, *, include_scene: bool = False):
     """Return validated clip, labels, staged asset directory, final asset namespace.
 
     Caller publishes the directory and clip transactionally; on failure it cleans
     the staging path. The namespace is random, so imported files cannot overwrite
     files belonging to an existing clip.
     """
-    if len(payload) > MAX_UPLOAD:
-        raise ValueError("upload exceeds 128 MiB")
+    incoming = io.BytesIO(payload) if isinstance(payload, bytes) else payload
+    incoming.seek(0, io.SEEK_END)
+    payload_size = incoming.tell()
+    incoming.seek(0)
+    if MAX_UPLOAD and payload_size > MAX_UPLOAD:
+        raise ValueError("upload exceeds configured byte limit")
     archive = None
     names = {}
     if Path(filename).suffix.lower() == ".zip":
         try:
-            archive = zipfile.ZipFile(io.BytesIO(payload))
+            archive = zipfile.ZipFile(incoming)
             entries = archive.infolist()
-            if len(entries) > MAX_FILES or sum(e.file_size for e in entries) > MAX_EXPANDED:
-                raise ValueError("ZIP exceeds 5000 files or 256 MiB expanded")
+            if ((MAX_FILES and len(entries) > MAX_FILES)
+                    or (MAX_EXPANDED and sum(e.file_size for e in entries) > MAX_EXPANDED)):
+                raise ValueError("ZIP exceeds configured member or expanded-byte limit")
             for entry in entries:
                 name = member_path(entry.filename)
                 if stat.S_ISLNK(entry.external_attr >> 16):
@@ -135,7 +198,7 @@ def parse_import(payload: bytes, filename: str, assets_root: Path, *, include_sc
         except (zipfile.BadZipFile, RuntimeError) as exc:
             raise ValueError("invalid ZIP archive") from exc
     elif Path(filename).suffix.lower() == ".json":
-        raw = json.loads(payload)
+        raw = json.load(incoming)
     else:
         raise ValueError("upload a .json manifest or a .zip clip archive")
 
@@ -160,10 +223,12 @@ def parse_import(payload: bytes, filename: str, assets_root: Path, *, include_sc
             if not isinstance(frame, dict):
                 raise ValueError("frames must be objects")
             if "points_path" in frame:
+                if frame.get("points") or frame.get("pointcloud_file"):
+                    raise ValueError("a frame cannot contain both points_path and another point source")
                 path = member_path(frame.pop("points_path"))
                 if archive is None or path not in names:
                     raise ValueError(f"missing point asset: {path}")
-                frame["points"] = decode_points(read_member(archive, names[path]), path)
+                stage_point_asset(archive, names[path], path, staging, namespace, frame)
             images = frame.get("images", {})
             if not isinstance(images, dict):
                 raise ValueError("frame images must be an object")
@@ -195,6 +260,16 @@ def parse_import(payload: bytes, filename: str, assets_root: Path, *, include_sc
                 (staging / target).write_bytes(image_bytes)
                 images[camera_id] = f"/api/assets/{namespace}/{target}"
         clip = Clip.model_validate(clip_raw)
+        # JSON manifests may reference scans already present in this single-user
+        # store, but may never create dangling or escaping source references.
+        point_root = (assets_root.parent / "pointclouds").resolve()
+        for frame in clip.frames:
+            if frame.pointcloud_file and not frame.pointcloud_file.startswith(namespace + "/"):
+                source = (point_root / frame.pointcloud_file).resolve()
+                if not source.is_relative_to(point_root) or not source.is_file():
+                    raise ValueError("referenced point asset is missing; use points_path in a portable ZIP")
+                if len(point_array_from_file(source, source.name)) != frame.point_count:
+                    raise ValueError("point_count does not match the referenced point asset")
         frame_map = {frame.id: frame for frame in clip.frames}
         if set(annotations_raw) - set(frame_map):
             raise ValueError("annotations reference an unknown frame")

@@ -4,6 +4,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { BoxTransformGizmo, type BoxTransformMode } from './BoxTransformGizmo';
 import type { Annotations, Box, Frame, Vec3, Voxel } from '../types';
 import { groundDrawingPoint, intensityBrightness, intensityRange, visiblePointIndices, type PointColorMode } from '../geometry/pointDisplay';
+import {renderOriginForPoints, toRenderPoint} from '../geometry/renderCoordinates';
 
 export interface PointCloudViewProps {
   frame: Frame | null;
@@ -22,6 +23,8 @@ export interface PointCloudViewProps {
   sceneMode?: boolean;
   trajectory?: {frame_id: string; timestamp: number; position: Vec3}[];
   activeFrameId?: string;
+  /** Stable raw source identity prevents refitting the camera on every live calibration step. */
+  autoFitReference?: number[][];
   /** Increment to frame the currently selected box once; dragging never refits. */
   focusSelection?: number;
   tool?: 'select' | 'box' | 'vector' | 'brush';
@@ -104,9 +107,9 @@ function makeLabel(text: string, color: string): THREE.Sprite {
   return sprite;
 }
 
-function boxMesh(box: Box, selected: boolean) {
+function boxMesh(box: Box, selected: boolean, origin: Vec3) {
   const group = new THREE.Group();
-  group.position.fromArray(box.center);
+  group.position.fromArray(toRenderPoint(box.center, origin));
   group.rotation.z = box.yaw;
   const color = selected ? '#ffffff' : labelColor(box.label);
   const geometry = new THREE.BoxGeometry(...box.size);
@@ -147,6 +150,8 @@ export function PointCloudView(props: PointCloudViewProps) {
   const [cursor, setCursor] = useState('');
   const [ready, setReady] = useState(false);
   const pointerStart = useRef<[number, number] | null>(null);
+  const origin = useMemo(() => renderOriginForPoints(props.frame?.points ?? []), [props.autoFitReference ?? props.frame?.points]);
+  const previousOrigin = useRef<Vec3>([0, 0, 0]);
   const colorMode = props.colorMode ?? (props.semantic ? 'semantic' : 'height');
   const visibleIndices = useMemo(() => visiblePointIndices(props.frame?.points ?? [], props.groundOnly, props.groundZ ?? -1.7, props.groundBand),
     [props.frame?.points, props.groundOnly, props.groundZ, props.groundBand]);
@@ -225,6 +230,14 @@ export function PointCloudView(props: PointCloudViewProps) {
   useEffect(() => {
     const rt = runtime.current;
     if (!rt) return;
+    const delta = new THREE.Vector3(...previousOrigin.current).sub(new THREE.Vector3(...origin));
+    rt.camera.position.add(delta); rt.controls.target.add(delta);
+    previousOrigin.current = origin;
+  }, [ready, origin]);
+
+  useEffect(() => {
+    const rt = runtime.current;
+    if (!rt) return;
     disposeObject(rt.pointsGroup);
     rt.pointsGroup.clear();
     rt.cloud = null;
@@ -236,7 +249,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     const range = colorMode === 'intensity' ? intensityRange(points, visibleIndices) : null;
     visibleIndices.forEach((sourceIndex, displayIndex) => {
       const p = points[sourceIndex];
-      positions.set(p.slice(0, 3), displayIndex * 3);
+    positions.set(toRenderPoint(p, origin), displayIndex * 3);
       const label = props.annotations.point_labels[String(sourceIndex)];
       if (colorMode === 'semantic' && label) color.set(labelColor(label));
       else if (colorMode === 'semantic') color.set('#748a9e');
@@ -258,17 +271,18 @@ export function PointCloudView(props: PointCloudViewProps) {
     cloud.userData.sourceIndices = visibleIndices;
     rt.pointsGroup.add(cloud);
     rt.cloud = cloud;
-  }, [ready, props.frame?.points, props.annotations.point_labels, colorMode, visibleIndices]);
+  }, [ready, props.frame?.points, props.annotations.point_labels, colorMode, visibleIndices, origin]);
 
   const fittedScene = useRef<number[][] | null>(null);
   useEffect(() => {
     const rt = runtime.current;
     const points = props.frame?.points;
     if (!props.sceneMode) { fittedScene.current = null; return; }
-    if (!rt || !points?.length || fittedScene.current === points) return;
-    fittedScene.current = points;
+    const fitReference = props.autoFitReference ?? points;
+    if (!rt || !points?.length || fittedScene.current === fitReference) return;
+    fittedScene.current = fitReference ?? points;
     const bounds = new THREE.Box3();
-    points.forEach(point => bounds.expandByPoint(new THREE.Vector3(point[0], point[1], point[2])));
+    points.forEach(point => bounds.expandByPoint(new THREE.Vector3(...toRenderPoint(point, origin))));
     const center = bounds.getCenter(new THREE.Vector3());
     const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 12);
     rt.controls.target.copy(center);
@@ -278,7 +292,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.camera.far = Math.max(radius * 40, 4000);
     rt.camera.updateProjectionMatrix();
     rt.controls.update();
-  }, [ready, props.sceneMode, props.frame?.points, props.view]);
+  }, [ready, props.sceneMode, props.frame?.points, props.autoFitReference, props.view, origin]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -286,7 +300,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     disposeObject(rt.trajectoryGroup);
     rt.trajectoryGroup.clear();
     if (!props.sceneMode || !props.trajectory?.length) return;
-    const positions = props.trajectory.map(frame => new THREE.Vector3(...frame.position));
+    const positions = props.trajectory.map(frame => new THREE.Vector3(...toRenderPoint(frame.position, origin)));
     const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(positions),
       new THREE.LineBasicMaterial({color: '#7fa8ef', transparent: true, opacity: 0.75, depthTest: false}));
     rt.trajectoryGroup.add(line);
@@ -296,26 +310,26 @@ export function PointCloudView(props: PointCloudViewProps) {
     const active = props.trajectory.find(frame => frame.frame_id === (props.activeFrameId ?? props.frame?.id));
     if (active) {
       const marker = new THREE.Mesh(new THREE.SphereGeometry(0.42, 12, 8), new THREE.MeshBasicMaterial({color: '#fff1a0', depthTest: false}));
-      marker.position.fromArray(active.position);
+      marker.position.fromArray(toRenderPoint(active.position, origin));
       rt.trajectoryGroup.add(marker);
       const label = makeLabel(`当前时刻 ${active.frame_id}`, '#fff1a0');
-      label.position.fromArray(active.position).add(new THREE.Vector3(0, 0, 1.6));
+      label.position.fromArray(toRenderPoint(active.position, origin)).add(new THREE.Vector3(0, 0, 1.6));
       rt.trajectoryGroup.add(label);
     }
-  }, [ready, props.sceneMode, props.trajectory, props.activeFrameId, props.frame?.id]);
+  }, [ready, props.sceneMode, props.trajectory, props.activeFrameId, props.frame?.id, origin]);
 
   useEffect(() => {
     const rt = runtime.current;
     if (!rt) return;
     disposeObject(rt.annotationsGroup);
     rt.annotationsGroup.clear();
-    if (props.showBoxes !== false) props.annotations.boxes.forEach((box) => rt.annotationsGroup.add(boxMesh(box, props.selectedId === box.id)));
+    if (props.showBoxes !== false) props.annotations.boxes.forEach((box) => rt.annotationsGroup.add(boxMesh(box, props.selectedId === box.id, origin)));
     if (props.showVectors !== false) {
       const vectors = [...props.annotations.vectors];
       if (props.draftVector?.length) vectors.push({ id: '__draft__', label: 'lane', points: props.draftVector, closed: false });
       vectors.forEach((vector) => {
         if (!vector.points.length) return;
-        const coordinates = vector.points.map((p) => new THREE.Vector3(...p));
+        const coordinates = vector.points.map((p) => new THREE.Vector3(...toRenderPoint(p, origin)));
         if (vector.closed && coordinates.length > 2) coordinates.push(coordinates[0].clone());
         const color = vector.id === props.selectedId ? '#ffffff' : labelColor(vector.label);
         const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(coordinates), new THREE.LineBasicMaterial({ color, depthTest: false }));
@@ -326,7 +340,7 @@ export function PointCloudView(props: PointCloudViewProps) {
         rt.annotationsGroup.add(dots);
       });
     }
-  }, [ready, props.annotations.boxes, props.annotations.vectors, props.selectedId, props.draftVector, props.showBoxes, props.showVectors]);
+  }, [ready, props.annotations.boxes, props.annotations.vectors, props.selectedId, props.draftVector, props.showBoxes, props.showVectors, origin]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -334,7 +348,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     disposeObject(rt.overlaysGroup);
     rt.overlaysGroup.clear();
     if (props.overlayPoints?.length) {
-      const coordinates = props.overlayPoints.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+      const coordinates = props.overlayPoints.map((p) => new THREE.Vector3(...toRenderPoint(p, origin)));
       const geometry = new THREE.BufferGeometry().setFromPoints(coordinates);
       if (props.semantic && props.overlayPointLabels) {
         const colors = new Float32Array(coordinates.length * 3);
@@ -350,7 +364,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     const voxels = props.voxels?.filter((voxel) => voxel.state === 'occupied');
     const freeVoxels = props.showFree ? props.voxels?.filter((voxel) => voxel.state === 'free') : undefined;
     if (freeVoxels?.length) {
-      const geometry = new THREE.BufferGeometry().setFromPoints(freeVoxels.map((voxel) => new THREE.Vector3(...voxel.center)));
+      const geometry = new THREE.BufferGeometry().setFromPoints(freeVoxels.map((voxel) => new THREE.Vector3(...toRenderPoint(voxel.center, origin))));
       const freeSpace = new THREE.Points(geometry, new THREE.PointsMaterial({
         color: '#6e9cb5', size: (props.voxelSize ?? 0.5) * 0.2,
         transparent: true, opacity: 0.26, depthWrite: false, sizeAttenuation: true,
@@ -366,7 +380,7 @@ export function PointCloudView(props: PointCloudViewProps) {
       const transform = new THREE.Matrix4();
       const color = new THREE.Color();
       voxels.forEach((voxel, index) => {
-        transform.makeTranslation(...voxel.center);
+        transform.makeTranslation(...toRenderPoint(voxel.center, origin));
         mesh.setMatrixAt(index, transform);
         color.set(labelColor(voxel.label));
         mesh.setColorAt(index, color);
@@ -375,11 +389,11 @@ export function PointCloudView(props: PointCloudViewProps) {
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       rt.overlaysGroup.add(mesh);
     }
-  }, [ready, props.overlayPoints, props.overlayPointLabels, props.semantic, props.voxels, props.voxelSize, props.showFree, props.voxelDimensions]);
+  }, [ready, props.overlayPoints, props.overlayPointLabels, props.semantic, props.voxels, props.voxelSize, props.showFree, props.voxelDimensions, origin]);
 
   useEffect(() => {
-    if (runtime.current) runtime.current.grid.position.z = (props.groundZ ?? -1.7) - 0.05;
-  }, [ready, props.groundZ]);
+    if (runtime.current) runtime.current.grid.position.z = (props.groundZ ?? -1.7) - origin[2] - 0.05;
+  }, [ready, props.groundZ, origin]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -406,7 +420,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     const damping = rt.controls.enableDamping;
     rt.controls.enableDamping = false;
     rt.controls.update();
-    const center = new THREE.Vector3(...box.center);
+    const center = new THREE.Vector3(...toRenderPoint(box.center, origin));
     const distance = Math.max(Math.max(...box.size) * 3, 8);
     const direction = rt.camera.position.clone().sub(rt.controls.target).normalize();
     if (direction.lengthSq() < 1e-6) direction.set(-1, -1, 1).normalize();
@@ -444,10 +458,11 @@ export function PointCloudView(props: PointCloudViewProps) {
       return;
     }
     const cloudHit = rt.cloud ? raycaster.intersectObject(rt.cloud)[0] : undefined;
-    const ground = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -(current.groundZ ?? -1.7)), new THREE.Vector3());
-    let point = cloudHit?.point ?? ground;
-    if (current.tool === 'vector' && current.drawOnGround && ground) {
-      point = new THREE.Vector3(...groundDrawingPoint(current.frame?.points ?? [], [ground.x, ground.y, ground.z], current.groundBand));
+    const ground = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -((current.groundZ ?? -1.7) - origin[2])), new THREE.Vector3());
+    const worldGround = ground?.clone().add(new THREE.Vector3(...origin));
+    let point = cloudHit?.point.clone().add(new THREE.Vector3(...origin)) ?? worldGround;
+    if (current.tool === 'vector' && current.drawOnGround && worldGround) {
+      point = new THREE.Vector3(...groundDrawingPoint(current.frame?.points ?? [], [worldGround.x, worldGround.y, worldGround.z], current.groundBand));
     }
     if (!point) return;
     const coordinates: Vec3 = [point.x, point.y, point.z];
@@ -473,6 +488,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     data-cloud-point-count={props.frame?.points.length ?? 0}
     data-visible-point-count={visibleIndices.length}
     data-color-mode={colorMode}
+    data-render-origin={origin.join(',')}
     data-active-frame-id={props.activeFrameId ?? props.frame?.id ?? ''}
     style={{ position: 'relative', width: '100%', height: '100%', minHeight: 240, overflow: 'hidden', cursor: props.tool && props.tool !== 'select' ? 'crosshair' : 'grab' }}
     onPointerDown={(event) => { pointerStart.current = [event.clientX, event.clientY]; }}
@@ -480,7 +496,8 @@ export function PointCloudView(props: PointCloudViewProps) {
     onPointerMove={(event) => {
       if (!runtime.current || event.buttons) return;
       const ray = rayAt(event.clientX, event.clientY);
-      const point = ray?.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -(latest.current.groundZ ?? -1.7)), new THREE.Vector3());
+      const point = ray?.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -((latest.current.groundZ ?? -1.7) - origin[2])), new THREE.Vector3());
+      if (point) point.add(new THREE.Vector3(...origin));
       if (point) setCursor(`X ${point.x.toFixed(1)} · Y ${point.y.toFixed(1)} m`);
     }}
     onPointerLeave={() => setCursor('')}
@@ -489,7 +506,7 @@ export function PointCloudView(props: PointCloudViewProps) {
       (props.tool === 'select' || !props.tool) && props.onUpdateBox && props.annotations.boxes.find(box => box.id === props.selectedId) &&
       <BoxTransformGizmo key={`${props.selectedId}/${props.activeFrameId ?? props.frame?.id ?? ''}`}
         box={props.annotations.boxes.find(box => box.id === props.selectedId)!}
-        mode={props.transformMode ?? 'translate'} camera={runtime.current.camera} canvas={runtime.current.renderer.domElement}
+        renderOrigin={origin} mode={props.transformMode ?? 'scale'} camera={runtime.current.camera} canvas={runtime.current.renderer.domElement}
         controls={runtime.current.controls} onUpdate={props.onUpdateBox} onStart={props.onTransformStart} onEnd={props.onTransformEnd}/>}
     {error && <div role="alert" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: '#f3c2b2', background: '#0b131f', textAlign: 'center' }}>{error}</div>}
     <div style={{ position: 'absolute', right: 14, bottom: 12, pointerEvents: 'none', color: '#8294a9', font: '10px ui-monospace, monospace', display: 'flex', gap: 16 }}>

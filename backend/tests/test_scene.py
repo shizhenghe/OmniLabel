@@ -312,3 +312,46 @@ def test_reconstruction_route_retains_previously_registered_pose_coordinates(tmp
         assert job["status"] == "completed", job
         assert job["result"]["world_from_lidar"]["f1"][0][3] == 3.25
         assert registered_poses(app.state.store, clip)["f1"][0, 3] == 3.25
+
+
+def test_multiscale_submap_registration_preserves_full_resolution_across_partial_scans():
+    rng = np.random.default_rng(77)
+    world = rng.uniform([-8, -5, -2], [8, 5, 3], (2500, 3))
+    parts = [world[world[:, 0] < 3], world[world[:, 0] > -3], world]
+    translations = [np.array([0, 0, 0]), np.array([.35, -.15, .04]), np.array([.7, -.3, .08])]
+    data = clip_data()
+    for index, frame in enumerate(data["frames"]):
+        frame["ego_to_world"] = np.eye(4).tolist()
+        frame["points"] = (parts[index] - translations[index]).tolist()
+    result = reconstruct_scene(Clip.model_validate(data), {}, ReconstructionRequest(registration="icp", fusion_mode="full"))
+    np.testing.assert_allclose(np.array(result["world_from_lidar"]["f2"])[:3, 3], translations[-1], atol=.01)
+    assert result["point_count"] == result["input_point_count"] == sum(len(part) for part in parts)
+    report = result["registration"]["frames"][-1]
+    assert report["reference_frame_ids"] == ["f0", "f1"]
+    assert len(report["stages"]) == 3 and report["fitness"] > .98 and report["rmse"] < .03
+
+
+def test_full_map_page_binary_export_and_registered_pose_fallback_endpoint(tmp_path):
+    app = create_app(tmp_path, seed_demo=False)
+    with TestClient(app) as client:
+        assert client.post("/api/clips/import", files={"file": ("clip.json", json.dumps(clip_data()))}).status_code == 201
+        clip = app.state.store.clip("scene-test")
+        scene = get_scene(app.state.store, clip)
+        result = reconstruct_scene(clip, {}, ReconstructionRequest(fusion_mode="full"))
+        save_reconstruction(app.state.store, clip, result, source_fingerprint(app.state.store, clip), scene, source_poses(clip))
+        full = client.get("/api/clips/scene-test/scene/map").json()
+        assert full["rendered_point_count"] == full["point_count"] == 6
+        assert not full["preview_truncated"]
+        first = client.get("/api/clips/scene-test/scene/map/points?offset=0&limit=4").json()
+        second = client.get("/api/clips/scene-test/scene/map/points?offset=4&limit=4").json()
+        assert first["points"] + second["points"] == full["points"]
+        assert first["next_offset"] == 4 and second["next_offset"] is None
+        assert not first["sampling"]
+        import io
+        exported = client.get("/api/clips/scene-test/scene/map.npy")
+        np.testing.assert_array_equal(np.load(io.BytesIO(exported.content)), full["points"])
+        # Label edits stale the map but do not invalidate the coordinate system.
+        save_scene(app.state.store, clip, scene)
+        assert client.get("/api/clips/scene-test/scene/map").status_code == 404
+        transform = client.get("/api/clips/scene-test/scene/registration").json()["world_from_lidar"]
+        assert transform["f2"][0][3] == 4

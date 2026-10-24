@@ -45,7 +45,8 @@ class Store:
     def __init__(self, root: Path):
         self.root = root.resolve()
         self.lock = threading.RLock()
-        for folder in ("clips", "annotations", "jobs", "assets"):
+        self._point_validations = {}
+        for folder in ("clips", "annotations", "jobs", "assets", "pointclouds"):
             (self.root / folder).mkdir(parents=True, exist_ok=True)
 
     def recover_interrupted_jobs(self):
@@ -67,25 +68,39 @@ class Store:
             raise KeyError("clip not found")
         return Clip.model_validate_json(path.read_text())
 
-    def frame_point_array(self, frame: Frame) -> np.ndarray:
+    def pointcloud_path(self, frame: Frame) -> Path:
         if frame.pointcloud_file is None:
-            points = np.asarray(frame.points, dtype=float)
-            return points if points.size else np.empty((0, 4), dtype=float)
+            raise ValueError("this frame stores its points inline")
         points_root = (self.root / "pointclouds").resolve()
         source = (points_root / frame.pointcloud_file).resolve()
         if not source.is_relative_to(points_root) or not source.is_file():
             raise ValueError("referenced point cloud is missing or outside the pointcloud store")
+        return source
+
+    def frame_point_array(self, frame: Frame) -> np.ndarray:
+        if frame.pointcloud_file is None:
+            points = np.asarray(frame.points, dtype=float)
+            return points if points.size else np.empty((0, 4), dtype=float)
+        source = self.pointcloud_path(frame)
         try:
-            points = np.load(source, allow_pickle=False)
+            points = np.load(source, allow_pickle=False, mmap_mode="r")
         except (OSError, ValueError) as exc:
             raise ValueError("referenced point cloud is not a valid NPY array") from exc
         if (points.ndim != 2 or points.shape[1] not in (3, 4)
-                or len(points) != frame.point_count or not np.issubdtype(points.dtype, np.number)
-                or not np.isfinite(points).all()):
+                or len(points) != frame.point_count or points.dtype.kind not in "fiu"):
             raise ValueError("referenced point cloud has invalid shape, count, type, or values")
+        stat = source.stat()
+        key = (str(source), stat.st_size, stat.st_mtime_ns, frame.point_count)
+        if key not in self._point_validations:
+            # Validate all records in bounded working memory. This does not
+            # subsample or limit the scan, including labels at its last index.
+            for start in range(0, len(points), 100_000):
+                if not np.isfinite(points[start:start + 100_000]).all():
+                    raise ValueError("referenced point cloud contains non-finite values")
+            self._point_validations[key] = True
         if points.shape[1] == 3:
             points = np.column_stack((points, np.zeros(len(points), dtype=points.dtype)))
-        return points.astype(float, copy=False)
+        return points
 
     def frame_points(self, frame: Frame) -> list[list[float]]:
         return self.frame_point_array(frame).tolist()

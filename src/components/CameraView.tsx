@@ -224,6 +224,8 @@ export function CameraView(props: CameraViewProps) {
     data-projected-box-count={visibleResults.boxes.length}
     data-projected-vector-count={visibleResults.vectors.length}
     data-projected-polygon-count={visibleResults.imagePolygons.length}
+    data-projected-point-count={props.showProjection ? props.projections?.length ?? 0 : 0}
+    data-raw-projection-signature={props.showProjection && props.projections?.length ? `${props.projections.length}:${props.projections[0].index}:${props.projections[0].u.toFixed(4)},${props.projections[0].v.toFixed(4)}` : ''}
     data-projection-signature={signature}
     data-model-point-count={props.modelPoints?.length ?? 0}
     data-model-box={props.modelBox?.join(',') ?? ''}

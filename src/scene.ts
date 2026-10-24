@@ -7,7 +7,7 @@ export function multiply(a: number[][], b: number[][]) {
   return a.map(row => b[0].map((_, column) => row.reduce((sum, value, k) => sum + value * b[k][column], 0)));
 }
 
-export function worldFromLidar(frame: Frame, map?: SceneMap | null) {
+export function worldFromLidar(frame: Frame, map?: Pick<SceneMap, 'world_from_lidar'> | null) {
   return map?.world_from_lidar?.[frame.id] ?? multiply(frame.ego_to_world, frame.lidar_to_ego);
 }
 
@@ -52,7 +52,7 @@ export function evaluateScene(scene: SceneAnnotations | null, frame: Frame | nul
     vectors: scene.vectors, image_polygons: [], point_labels: {}, revision: scene.revision};
 }
 
-export function sceneInLidar(scene: Annotations, frame: Frame, map?: SceneMap | null): Annotations {
+export function sceneInLidar(scene: Annotations, frame: Frame, map?: Pick<SceneMap, 'world_from_lidar'> | null): Annotations {
   const inverse = inverseRigid(worldFromLidar(frame, map));
   return {...scene, boxes: scene.boxes.map(b => transformBox(b, inverse)),
     vectors: scene.vectors.map(v => ({...v, points: v.points.map(p => transformPoint(p, inverse))}))};

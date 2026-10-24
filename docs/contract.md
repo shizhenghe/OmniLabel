@@ -31,7 +31,10 @@ API base `/api`:
 
 - `GET /health` → `{status:"ok"}`.
 - `GET /clips` → summary array `{id,name,description,fps,frame_count,camera_count}`.
-- `GET /clips/{id}` → Clip.
+- `GET /clips/{id}` → Clip metadata; each frame has `points:[]` and full `point_count`.
+- `GET /clips/{id}/frames/{frame_id}/points` → all source rows by default:
+  `{points,point_count,offset,returned_point_count}`. Optional `offset`/`count`
+  request contiguous ranges without reindexing point labels. No implicit point quota or preview sampling.
 - `POST /clips/import` multipart `file` (.json or .zip). Returns Clip. ZIP has
   `manifest.json`, relative image paths, and optional `.bin` float32 XYZI,
   `.npy` Nx3/4 or ASCII `.pcd` point paths in `frame.points_path`.
@@ -46,8 +49,10 @@ API base `/api`:
   occupancy `{voxels:[{index:[i,j,k],center:Vec3,state:"occupied"|"free",label:string}],
   voxel_size,coordinate_frame:"lidar"}`; propagation/ground segmentation
   `{updated_frames:number}`. Jobs use saved annotations.
-- `GET /clips/{id}/export` → JSON `{schema_version:"1.0",clip,annotations}`.
-- `GET /clips/{id}/export.zip` → portable ZIP with manifest, annotations and local images.
+- `GET /clips/{id}/export` → streamed JSON `{schema_version:"1.1",clip,annotations,...}`
+  with full inline point data even when the store uses external NPY files.
+- `GET /clips/{id}/export.zip` → portable ZIP with manifest, annotations,
+  complete NPY point assets and local images. Manifests use `points_path`, not server-local filenames.
 - `GET /clips/{id}/frames/{frame_id}/masks/{camera_id}.zip` → `mask.png`
   (16-bit class IDs) and `labels.json` from a single saved annotation snapshot.
   Separate `.png` and `.json` routes are also available.

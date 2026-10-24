@@ -21,8 +21,6 @@ CHANNELS = {
     "CAM_RIGHT_WIDE": ("right_wide", "Right wide"),
 }
 LIDAR_CHANNEL = "LIDAR_TOP"
-MAX_CLIP_POINTS = 2_000_000
-MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 
 
 def load_json(path: Path):
@@ -206,23 +204,22 @@ def build_dataset(source: Path):
     return cameras, records, fps
 
 
-def chunks(records: list[dict], max_frames: int, max_asset_bytes: int):
+def chunks(records: list[dict], max_frames: int, max_asset_bytes: int = 0):
     current = []
     point_count = 0
     asset_bytes = 0
     for record in records:
         would_exceed = current and (
             len(current) >= max_frames
-            or point_count + record["points"] > MAX_CLIP_POINTS
-            or asset_bytes + record["asset_size"] > max_asset_bytes
+            or (max_asset_bytes > 0 and asset_bytes + record["asset_size"] > max_asset_bytes)
         )
         if would_exceed:
             yield current
             current = []
             point_count = 0
             asset_bytes = 0
-        if record["points"] > MAX_CLIP_POINTS or record["asset_size"] > max_asset_bytes:
-            raise ValueError(f"single frame {record['frame']['id']} exceeds a clip limit")
+        if max_asset_bytes > 0 and record["asset_size"] > max_asset_bytes:
+            raise ValueError(f"single frame {record['frame']['id']} exceeds the requested asset-byte limit")
         current.append(record)
         point_count += record["points"]
         asset_bytes += record["asset_size"]
@@ -230,7 +227,7 @@ def chunks(records: list[dict], max_frames: int, max_asset_bytes: int):
         yield current
 
 
-def write_archives(source: Path, output: Path, max_frames: int, force: bool) -> list[Path]:
+def write_archives(source: Path, output: Path, max_frames: int, force: bool, max_asset_bytes: int = 0) -> list[Path]:
     cameras, records, fps = build_dataset(source)
     if output.exists():
         if not output.is_dir():
@@ -246,8 +243,9 @@ def write_archives(source: Path, output: Path, max_frames: int, force: bool) -> 
     else:
         output.mkdir(parents=True)
 
-    # Keep raw contents below 100 MiB as well as the backend's compressed 128 MiB limit.
-    groups = list(chunks(records, max_frames=max_frames, max_asset_bytes=100 * 1024 * 1024))
+    # Partition only when the operator explicitly requests it. All LiDAR
+    # records are preserved; point count never changes scene membership.
+    groups = list(chunks(records, max_frames=max_frames, max_asset_bytes=max_asset_bytes))
     results = []
     for part, group in enumerate(groups, start=1):
         clip_id = f"sq-data-part-{part:02d}"
@@ -271,8 +269,6 @@ def write_archives(source: Path, output: Path, max_frames: int, force: bool) -> 
                 archive.writestr(record["point_archive_path"], record["point_payload"])
                 for archive_path, source_path in record["images"].items():
                     archive.write(source_path, archive_path)
-        if destination.stat().st_size > MAX_ARCHIVE_BYTES:
-            raise ValueError(f"{destination} exceeds the platform's 128 MiB upload limit")
         results.append(destination)
         print(
             f"wrote {destination} "
@@ -286,12 +282,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path("tests/sq_data"))
     parser.add_argument("--output", type=Path, default=Path("tests/sq_data/omnilabel_packages"))
-    parser.add_argument("--max-frames", type=int, default=7)
+    parser.add_argument("--max-frames", type=int, default=2000)
+    parser.add_argument("--max-asset-bytes", type=int, default=0, help="Optional archive source-byte budget; 0 keeps all points without a byte quota")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.max_frames <= 2000:
         parser.error("--max-frames must be between 1 and 2000")
-    write_archives(args.source.resolve(), args.output.resolve(), args.max_frames, args.force)
+    if args.max_asset_bytes < 0:
+        parser.error("--max-asset-bytes must be nonnegative")
+    write_archives(args.source.resolve(), args.output.resolve(), args.max_frames, args.force, args.max_asset_bytes)
 
 
 if __name__ == "__main__":

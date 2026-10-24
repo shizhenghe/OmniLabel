@@ -133,6 +133,7 @@ export interface SceneMap {
   voxel_size: number;
   scene_revision?: number;
   preserve_detail?: boolean;
+  fusion_mode?: 'full' | 'detail' | 'surface' | 'centroid';
   detail_voxel_size?: number;
   effective_voxel_size?: number;
   intensity_available?: boolean;

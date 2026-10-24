@@ -9,12 +9,13 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from hashlib import sha256
 from math import atan2
+import tempfile
 from uuid import uuid4
 
 import numpy as np
 
 
-MAX_POINTS = 500_000
+MAX_POINTS = None  # Backward-compatible name; no source point-count ceiling.
 MAX_OCCUPIED_VOXELS = 150_000
 MAX_FREE_VOXELS = 150_000
 MAX_RAYS = 12_000
@@ -28,8 +29,6 @@ DYNAMIC_LABELS = {
 
 def _points(frame: dict, point_loader=None) -> np.ndarray:
     raw = point_loader(frame) if point_loader is not None else frame.get("points", [])
-    if point_loader is None and len(raw) > MAX_POINTS:
-        raise ValueError(f"A frame may contain at most {MAX_POINTS} points")
     # The interchange accepts both XYZ and XYZI rows in one frame.
     if isinstance(raw, np.ndarray):
         points = np.asarray(raw, dtype=np.float64)
@@ -152,86 +151,196 @@ def project_points(
     return {"points": projected, "width": width, "height": height, "occlusion_filtering": False}
 
 
+def _point_chunks(frame: dict, point_loader=None, chunk_size: int = 100_000):
+    """Read all source points, with bounded temporary arrays and stable indices.
+
+    A memmapped external scan stays on disk until its current chunk is needed.
+    Chunk size controls working memory, never how many input points are accepted.
+    """
+    raw = point_loader(frame) if point_loader is not None else frame.get("points", [])
+    for start in range(0, len(raw), chunk_size):
+        values = raw[start:start + chunk_size]
+        if isinstance(values, np.ndarray):
+            points = np.asarray(values, dtype=np.float64)
+        else:
+            points = np.asarray([p if len(p) == 4 else [*p, 0] for p in values], dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] not in (3, 4) or not np.isfinite(points).all():
+            raise ValueError("Points must be finite numeric Nx3 or Nx4 arrays")
+        if points.shape[1] == 3:
+            points = np.column_stack((points, np.zeros(len(points))))
+        yield start, points
+
+
+def _statistical_inliers(points: np.ndarray, neighbors: int, std_ratio: float) -> np.ndarray:
+    from scipy.spatial import cKDTree
+    xyz = np.asarray(points[:, :3] if isinstance(points, np.ndarray) else [p[:3] for p in points], dtype=np.float64)
+    if not np.isfinite(xyz).all():
+        raise ValueError("Points must be finite")
+    if len(xyz) <= neighbors:
+        return np.ones(len(xyz), dtype=bool)
+    tree = cKDTree(xyz)
+    distances = np.empty(len(xyz))
+    for start in range(0, len(xyz), 25_000):
+        values, _ = tree.query(xyz[start:start + 25_000], k=neighbors + 1, workers=1)
+        distances[start:start + len(values)] = values[:, 1:].mean(axis=1)
+    threshold = float(distances.mean() + std_ratio * distances.std())
+    return distances <= threshold
+
+
+def _static_chunks(clip: dict, annotations_by_frame: dict, point_loader=None, *,
+                   outlier_filter=False, outlier_neighbors=16, outlier_std_ratio=3.0):
+    for frame in clip["frames"]:
+        annotations = annotations_by_frame.get(frame["id"], {})
+        labels = annotations.get("point_labels", {})
+        raw = point_loader(frame) if point_loader is not None else frame.get("points", [])
+        inliers = _statistical_inliers(raw, outlier_neighbors, outlier_std_ratio) if outlier_filter and len(raw) else None
+        dynamic_indices = np.asarray([int(index) for index, label in labels.items()
+                                      if str(index).isdigit() and label.lower() in DYNAMIC_LABELS], dtype=np.int64)
+        transform = _world_from_lidar(frame)
+        for start, points in _point_chunks(frame, lambda _: raw):
+            remove = np.zeros(len(points), dtype=bool)
+            for box in annotations.get("boxes", []):
+                if box["label"].lower() in DYNAMIC_LABELS:
+                    remove |= _inside_box(points, box)
+            selected_dynamic = dynamic_indices[(dynamic_indices >= start) & (dynamic_indices < start + len(points))]
+            remove[selected_dynamic - start] = True
+            removed_dynamic = int(remove.sum())
+            removed_outlier = 0
+            if inliers is not None:
+                rejected = ~inliers[start:start + len(points)]
+                removed_outlier = int((rejected & ~remove).sum())
+                remove |= rejected
+            original_indices = np.flatnonzero(~remove) + start
+            static = points[~remove].copy()
+            static[:, :3] = _transform(static[:, :3], transform)
+            if not np.isfinite(static).all():
+                raise ValueError("Transformed point coordinates must remain finite")
+            point_labels = [labels.get(str(index), "unknown") for index in original_indices]
+            yield static, point_labels, len(points), removed_dynamic, removed_outlier
+
+
 def fuse_map(clip: dict, annotations_by_frame: dict, voxel_size: float = 0.15, *,
              preserve_detail: bool = False, detail_voxel_size: float = 0.05,
-             point_loader=None) -> dict:
-    """Fuse pose-aligned, dynamic-filtered scans into world-space voxel centroids.
+             point_loader=None, fusion_mode: str | None = None,
+             return_array: bool = False, outlier_filter: bool = False,
+             outlier_neighbors: int = 16, outlier_std_ratio: float = 3.0) -> dict:
+    """Fuse every scan in chunks; no input/output point-count ceiling is used.
 
-    This uses supplied calibrated ego poses; it does not estimate SLAM poses.
-    Dynamic exclusion requires saved boxes or point semantic labels. The optional
-    detail profile uses smaller voxels and retains the brightest *measured* XYZI
-    sample, so narrow painted markings are not replaced by an averaged intensity.
-    It cannot recover reflectance or markings absent from the supplied scans.
+    full keeps every measured static point. detail retains the brightest measured
+    sample in each fine voxel, surface picks the measured sample nearest its voxel
+    centroid, and centroid averages measurements. Surface does not invent a bright
+    centroid or move a measured intensity onto a different surface point.
     """
     size = _voxel_size(voxel_size)
-    detail_size = _voxel_size(detail_voxel_size)
-    effective_size = min(size, detail_size) if preserve_detail else size
-    clouds = []
-    cloud_classes = []
-    input_count = excluded_count = 0
-    for frame in clip["frames"]:
-        points = _points(frame, point_loader)
-        annotations = annotations_by_frame.get(frame["id"], {})
-        if len(points) * len(annotations.get("boxes", [])) > MAX_BOX_COMPARISONS:
-            raise ValueError("Too many box/point comparisons; split the clip or reduce annotations")
-        remove = np.zeros(len(points), dtype=bool)
-        for box in annotations.get("boxes", []):
-            if box["label"].lower() in DYNAMIC_LABELS:
-                remove |= _inside_box(points, box)
-        for index, label in annotations.get("point_labels", {}).items():
-            if str(index).isdigit() and int(index) < len(points) and label.lower() in DYNAMIC_LABELS:
-                remove[int(index)] = True
-        input_count += len(points)
-        excluded_count += int(remove.sum())
-        static = points[~remove].copy()
-        static[:, :3] = _transform(static[:, :3], _world_from_lidar(frame))
-        clouds.append(static)
-        point_labels = annotations.get("point_labels", {})
-        cloud_classes.extend(point_labels.get(str(index), "unknown") for index in np.flatnonzero(~remove))
-    merged = np.concatenate(clouds) if clouds else np.empty((0, 4))
+    detail_size = float(detail_voxel_size)
+    if not np.isfinite(detail_size) or not 0.02 <= detail_size <= 5:
+        raise ValueError("detail_voxel_size must be between 0.02 and 5 metres")
+    mode = fusion_mode or ("detail" if preserve_detail else "centroid")
+    if mode not in ("full", "detail", "surface", "centroid"):
+        raise ValueError("fusion_mode must be full, detail, surface or centroid")
+    effective_size = 0.0 if mode == "full" else min(size, detail_size) if mode in ("detail", "surface") else size
+    if outlier_neighbors < 2 or not np.isfinite(outlier_std_ratio) or outlier_std_ratio <= 0:
+        raise ValueError("Outlier neighbor count must be at least 2 and standard-deviation ratio positive")
+    filtering = dict(outlier_filter=outlier_filter, outlier_neighbors=outlier_neighbors,
+                     outlier_std_ratio=outlier_std_ratio)
+    cells = {}
     semantic_labels = {}
-    if len(merged):
-        indices = _voxel_indices(merged[:, :3], effective_size)
-        _, inverse = np.unique(indices, axis=0, return_inverse=True)
-        counts = np.bincount(inverse)
-        if preserve_detail:
-            # Stable tie breaking retains an observed position and its paired
-            # intensity/semantic label, rather than inventing a bright centroid.
-            order = np.lexsort((np.arange(len(merged)), -merged[:, 3], inverse))
-            first = np.r_[True, np.diff(inverse[order]) != 0]
-            selected = order[first]
-            downsampled = merged[selected]
-            semantic_labels = {str(index): cloud_classes[source] for index, source in enumerate(selected)
-                               if cloud_classes[source] not in ("unknown", "unlabeled")}
+    input_count = excluded_count = output_count = outlier_count = 0
+    minimum, maximum = float("inf"), -float("inf")
+    # Spooling full-resolution output avoids retaining a copy of every frame and
+    # then concatenating the whole clip. Only the final result occupies RAM.
+    with tempfile.TemporaryFile() as spool:
+        for static, labels, count, excluded, outliers in _static_chunks(clip, annotations_by_frame, point_loader, **filtering):
+            input_count += count
+            excluded_count += excluded
+            outlier_count += outliers
+            if not len(static):
+                continue
+            minimum = min(minimum, float(static[:, 3].min()))
+            maximum = max(maximum, float(static[:, 3].max()))
+            if mode == "full":
+                static.tofile(spool)
+                semantic_labels.update({str(output_count + i): label for i, label in enumerate(labels)
+                                        if label not in ("unknown", "unlabeled")})
+                output_count += len(static)
+                continue
+            keys, inverse, counts = np.unique(_voxel_indices(static[:, :3], effective_size), axis=0,
+                                               return_inverse=True, return_counts=True)
+            if mode == "detail":
+                order = np.lexsort((np.arange(len(static)), -static[:, 3], inverse))
+                selected = order[np.r_[True, np.diff(inverse[order]) != 0]]
+                for key, index in zip(keys, selected):
+                    cell = tuple(int(v) for v in key)
+                    previous = cells.get(cell)
+                    if previous is None or static[index, 3] > previous[0][3]:
+                        cells[cell] = (static[index].copy(), labels[index])
+            else:
+                sums = np.column_stack([np.bincount(inverse, weights=static[:, axis]) for axis in range(4)])
+                for key, summed, count in zip(keys, sums, counts):
+                    cell = tuple(int(v) for v in key)
+                    previous = cells.get(cell)
+                    if previous is None:
+                        cells[cell] = [summed.copy(), int(count), Counter()]
+                    else:
+                        previous[0] += summed
+                        previous[1] += int(count)
+                for key, label in zip(_voxel_indices(static[:, :3], effective_size), labels):
+                    if label not in ("unknown", "unlabeled"):
+                        cells[tuple(int(v) for v in key)][2][label] += 1
+        if mode == "full":
+            spool.seek(0)
+            downsampled = np.fromfile(spool, dtype=np.float64, count=output_count * 4).reshape((-1, 4))
         else:
-            downsampled = np.column_stack([
-                np.bincount(inverse, weights=merged[:, axis]) / counts for axis in range(4)
-            ])
-            semantic_votes = defaultdict(Counter)
-            for output_index, label in zip(inverse, cloud_classes):
-                if label not in ("unknown", "unlabeled"):
-                    semantic_votes[int(output_index)][label] += 1
-            semantic_labels = {
-                str(index): sorted(votes, key=lambda label: (-votes[label], label))[0]
-                for index, votes in semantic_votes.items()
-            }
-    else:
-        downsampled = merged
+            ordered = sorted(cells)
+            downsampled = np.empty((len(ordered), 4), dtype=np.float64)
+            if mode == "detail":
+                for index, key in enumerate(ordered):
+                    point, label = cells[key]
+                    downsampled[index] = point
+                    if label not in ("unknown", "unlabeled"):
+                        semantic_labels[str(index)] = label
+            else:
+                for index, key in enumerate(ordered):
+                    summed, count, votes = cells[key]
+                    downsampled[index] = summed / count
+                    if votes:
+                        semantic_labels[str(index)] = sorted(votes, key=lambda label: (-votes[label], label))[0]
+                if mode == "surface":
+                    # A second streamed pass selects an actual sample nearest
+                    # each final centroid. No high-reflectance outlier preference.
+                    positions = {key: index for index, key in enumerate(ordered)}
+                    distances = np.full(len(ordered), np.inf)
+                    centroids = downsampled[:, :3].copy()
+                    for static, labels, _, _, _ in _static_chunks(clip, annotations_by_frame, point_loader, **filtering):
+                        if not len(static):
+                            continue
+                        keys = _voxel_indices(static[:, :3], effective_size)
+                        for point, key, label in zip(static, keys, labels):
+                            index = positions[tuple(int(v) for v in key)]
+                            distance = float(np.sum((point[:3] - centroids[index]) ** 2))
+                            if distance < distances[index]:
+                                distances[index] = distance
+                                downsampled[index] = point
+                                if label not in ("unknown", "unlabeled"):
+                                    semantic_labels[str(index)] = label
+                                else:
+                                    semantic_labels.pop(str(index), None)
+    reductions = {"full": "all-measured-points", "detail": "brightest-measured-point",
+                  "surface": "nearest-measured-surface-point", "centroid": "centroid-mean"}
+    has_points = bool(len(downsampled))
     return {
-        "points": downsampled.tolist(), "frame_count": len(clip["frames"]),
+        "points": downsampled if return_array else downsampled.tolist(), "frame_count": len(clip["frames"]),
         "point_count": len(downsampled), "input_point_count": input_count,
-        "excluded_dynamic_points": excluded_count, "voxel_size": size,
-        "preserve_detail": preserve_detail, "detail_voxel_size": detail_size,
-        "effective_voxel_size": effective_size,
-        "point_reduction": "brightest-measured-point" if preserve_detail else "centroid-mean",
-        # Frame normalisation pads XYZ-only input with zero; the schema alone
-        # therefore cannot establish measured reflectance provenance. Zero-only
-        # scans are treated as having no usable signal, including native zeros.
-        "intensity_available": bool(len(merged) and np.any(merged[:, 3] != 0)),
-        "intensity_has_contrast": bool(len(merged) and np.ptp(merged[:, 3]) > 1e-8),
-        "intensity_range": [float(merged[:, 3].min()), float(merged[:, 3].max())] if len(merged) else None,
-        "point_labels": semantic_labels,
-        "coordinate_frame": "world", "method": "pose-aligned static voxel fusion",
+        "excluded_dynamic_points": excluded_count, "excluded_outlier_points": outlier_count,
+        "outlier_filter": outlier_filter, "voxel_size": size,
+        "fusion_mode": mode, "preserve_detail": mode in ("detail", "surface"), "detail_voxel_size": detail_size,
+        "effective_voxel_size": effective_size, "point_reduction": reductions[mode],
+        "intensity_available": bool(has_points and (minimum != 0 or maximum != 0)),
+        "intensity_has_contrast": bool(has_points and maximum - minimum > 1e-8),
+        "intensity_range": [minimum, maximum] if has_points else None,
+        "point_labels": semantic_labels, "coordinate_frame": "world",
+        "input_truncated": False, "output_truncated": False,
+        "method": "pose-aligned streamed static fusion",
     }
 
 

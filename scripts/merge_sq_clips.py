@@ -18,6 +18,11 @@ MERGED_ID = "sq-data-all"
 
 
 def main() -> None:
+    import sys
+    sys.path.insert(0, str(ROOT / "backend"))
+    from omnilabel.models import Clip, Frame
+    from omnilabel.storage import Store
+    source_store = Store(DATA)
     clip_root = DATA / "clips"
     source_paths = sorted(
         clip_root.glob("sq-data-part-*.json"),
@@ -60,9 +65,8 @@ def main() -> None:
                 timestamp = float(frame["timestamp"])
                 if previous_timestamp is not None and timestamp <= previous_timestamp:
                     raise ValueError(f"Non-increasing timestamp at {source_path.name}:{frame['id']}")
-                points = np.asarray(frame.pop("points"), dtype="<f8")
-                if points.ndim != 2 or points.shape[1] != 4 or len(points) > 500_000 or not np.isfinite(points).all():
-                    raise ValueError(f"Invalid source point cloud at {source_path.name}:{frame['id']}")
+                points = source_store.frame_point_array(Frame.model_validate(frame))
+                frame.pop("points", None)
                 relative_path = f"{frame['id']}.npy"
                 np.save(point_stage / relative_path, points, allow_pickle=False)
                 frame["pointcloud_file"] = f"{MERGED_ID}/{relative_path}"
@@ -76,22 +80,18 @@ def main() -> None:
                     shutil.copy2(source_labels, annotation_stage / source_labels.name)
                     annotations_found += 1
 
-        if len(merged_frames) > 2000 or total_points > 20_000_000:
-            raise ValueError("Merged clip exceeds the configured frame or point limit")
+        if len(merged_frames) > 2000:
+            raise ValueError("Merged clip exceeds the supported frame count")
         manifest = {
             "id": MERGED_ID,
             "name": f"SQ test data · merged ({len(merged_frames)} frames)",
-            "description": "Merged locally from SQ part clips; source point clouds are stored losslessly as per-frame float64 NPY files.",
+            "description": "Merged locally from SQ part clips; complete source point clouds are stored losslessly as per-frame NPY files.",
             "fps": float(reference["fps"]),
             "cameras": reference["cameras"],
             "frames": merged_frames,
             "source": "imported-merged",
         }
         # Validate the manifest through the application schema before publishing.
-        import sys
-        sys.path.insert(0, str(ROOT / "backend"))
-        from omnilabel.models import Clip
-
         validated = Clip.model_validate(manifest)
         final_points.parent.mkdir(parents=True, exist_ok=True)
         point_stage.rename(final_points)

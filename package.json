@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
+    "postbuild": "python3 scripts/frontend_build.py stamp",
     "preview": "vite preview --host 0.0.0.0",
     "test:e2e": "playwright test"
   },
