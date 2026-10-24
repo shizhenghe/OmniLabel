@@ -176,11 +176,39 @@ def test_map_cache_invalidates_after_labels_change_but_registered_poses_survive(
     old_poses = registered_poses(store, clip)
     result = reconstruct_scene(clip, {}, ReconstructionRequest())
     save_reconstruction(store, clip, result, source_fingerprint(store, clip), scene, old_poses)
-    assert get_scene_map(store, clip)["point_count"] == 2
+    loaded = get_scene_map(store, clip)
+    assert loaded["point_count"] == loaded["rendered_point_count"] == 2
+    stored = json.loads((tmp_path / "scene_maps" / f"{clip.id}.json").read_text())
+    assert "points" not in stored and stored["pointcloud_file"].endswith(".npy")
+    preview = get_scene_map(store, clip, max_points=1)
+    assert preview["point_count"] == 2 and preview["rendered_point_count"] == len(preview["points"]) == 1
     store.save_annotations(clip.id, "f0", Annotations(point_labels={"0": "road"}))
     with pytest.raises(KeyError, match="changed"):
         get_scene_map(store, clip)
     assert registered_poses(store, clip)["f2"][0, 3] == 4
+
+
+def test_reconstruction_reads_lazy_frame_arrays(tmp_path):
+    data = clip_data()
+    point_root = tmp_path / "pointclouds" / "scene-test"
+    point_root.mkdir(parents=True)
+    for frame in data["frames"]:
+        points = np.asarray(frame.pop("points"), dtype=float)
+        path = point_root / f"{frame['id']}.npy"
+        np.save(path, points, allow_pickle=False)
+        frame["pointcloud_file"] = f"scene-test/{path.name}"
+        frame["point_count"] = len(points)
+    clip = Clip.model_validate(data)
+    store = Store(tmp_path)
+    frames = {frame.id: frame for frame in clip.frames}
+    result = reconstruct_scene(
+        clip,
+        {},
+        ReconstructionRequest(),
+        point_loader=lambda value: store.frame_point_array(frames[value["id"]]),
+    )
+    assert result["input_point_count"] == 6
+    assert result["point_count"] == 2
 
 
 def test_old_fusion_cache_requires_refresh_without_losing_registration_or_labels(tmp_path):
