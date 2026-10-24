@@ -15,7 +15,6 @@ import numpy as np
 
 
 MAX_POINTS = 500_000
-MAX_MAP_POINTS = 2_000_000
 MAX_OCCUPIED_VOXELS = 150_000
 MAX_FREE_VOXELS = 150_000
 MAX_RAYS = 12_000
@@ -27,12 +26,15 @@ DYNAMIC_LABELS = {
 }
 
 
-def _points(frame: dict) -> np.ndarray:
-    raw = frame.get("points", [])
-    if len(raw) > MAX_POINTS:
+def _points(frame: dict, point_loader=None) -> np.ndarray:
+    raw = point_loader(frame) if point_loader is not None else frame.get("points", [])
+    if point_loader is None and len(raw) > MAX_POINTS:
         raise ValueError(f"A frame may contain at most {MAX_POINTS} points")
     # The interchange accepts both XYZ and XYZI rows in one frame.
-    points = np.asarray([p if len(p) == 4 else [*p, 0] for p in raw], dtype=np.float64)
+    if isinstance(raw, np.ndarray):
+        points = np.asarray(raw, dtype=np.float64)
+    else:
+        points = np.asarray([p if len(p) == 4 else [*p, 0] for p in raw], dtype=np.float64)
     if not points.size:
         return np.empty((0, 4), dtype=np.float64)
     if points.ndim != 2 or points.shape[1] not in (3, 4):
@@ -151,7 +153,8 @@ def project_points(
 
 
 def fuse_map(clip: dict, annotations_by_frame: dict, voxel_size: float = 0.15, *,
-             preserve_detail: bool = False, detail_voxel_size: float = 0.05) -> dict:
+             preserve_detail: bool = False, detail_voxel_size: float = 0.05,
+             point_loader=None) -> dict:
     """Fuse pose-aligned, dynamic-filtered scans into world-space voxel centroids.
 
     This uses supplied calibrated ego poses; it does not estimate SLAM poses.
@@ -163,13 +166,11 @@ def fuse_map(clip: dict, annotations_by_frame: dict, voxel_size: float = 0.15, *
     size = _voxel_size(voxel_size)
     detail_size = _voxel_size(detail_voxel_size)
     effective_size = min(size, detail_size) if preserve_detail else size
-    if sum(len(frame.get("points", [])) for frame in clip["frames"]) > MAX_MAP_POINTS:
-        raise ValueError(f"Map fusion accepts at most {MAX_MAP_POINTS} input points per job")
     clouds = []
     cloud_classes = []
     input_count = excluded_count = 0
     for frame in clip["frames"]:
-        points = _points(frame)
+        points = _points(frame, point_loader)
         annotations = annotations_by_frame.get(frame["id"], {})
         if len(points) * len(annotations.get("boxes", [])) > MAX_BOX_COMPARISONS:
             raise ValueError("Too many box/point comparisons; split the clip or reduce annotations")

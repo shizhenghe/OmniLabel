@@ -11,7 +11,7 @@ import numpy as np
 
 from .models import Clip
 from .scene import (
-    frame_annotations, get_scene, get_scene_map, reconstruct_scene,
+    SCENE_PREVIEW_POINTS, frame_annotations, get_scene, get_scene_map, reconstruct_scene,
     registered_poses, save_reconstruction, save_scene, source_fingerprint,
 )
 from .scene_models import ReconstructionRequest, SceneAnnotations
@@ -51,7 +51,7 @@ def mount_scene_routes(app: FastAPI, store: Store, executor: ThreadPoolExecutor)
     @app.get("/api/clips/{clip_id}/scene/map")
     def cached_map(clip_id: str):
         try:
-            return get_scene_map(store, clip_for(clip_id))
+            return get_scene_map(store, clip_for(clip_id), max_points=SCENE_PREVIEW_POINTS)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -77,9 +77,16 @@ def mount_scene_routes(app: FastAPI, store: Store, executor: ThreadPoolExecutor)
             reconstruction_clip = clip.model_copy(deep=True)
             for frame in reconstruction_clip.frames:
                 frame.ego_to_world = (poses[frame.id] @ np.linalg.inv(np.asarray(frame.lidar_to_ego, dtype=float))).tolist()
-            result = reconstruct_scene(reconstruction_clip, annotations, request)
+            source_frames = {frame.id: frame for frame in clip.frames}
+            result = reconstruct_scene(
+                reconstruction_clip,
+                annotations,
+                request,
+                point_loader=lambda value: store.frame_point_array(source_frames[value["id"]]),
+            )
             result = save_reconstruction(store, clip, result, fingerprint, scene, poses)
-            job.update(status="completed", result=result, finished_at=time.time())
+            preview = get_scene_map(store, clip, max_points=SCENE_PREVIEW_POINTS)
+            job.update(status="completed", result=preview, finished_at=time.time())
         except Exception as exc:
             LOGGER.exception("Scene reconstruction %s failed", job["id"])
             job.update(status="failed", error=str(exc)[:1500], finished_at=time.time())

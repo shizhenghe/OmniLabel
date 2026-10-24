@@ -12,7 +12,9 @@ from copy import deepcopy
 from hashlib import sha256
 import json
 from math import atan2, cos, pi, sin
+import os
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
@@ -25,6 +27,7 @@ MAX_ICP_POINTS = 3000
 MAX_ICP_ITERATIONS = 35
 MAX_ICP_PAIR_DISTANCE = 3.0
 FUSION_VERSION = 2
+SCENE_PREVIEW_POINTS = 500_000
 
 
 def _scene_path(store: Store, clip_id: str) -> Path:
@@ -210,7 +213,7 @@ def evaluate_scene(store: Store, clip: Clip, frame_id: str, scene: SceneAnnotati
                              store.annotations(clip.id, frame_id)).model_dump()
 
 
-def _fusion_annotations(frame: Frame, annotations: dict, exclude_dynamic: bool) -> dict:
+def _fusion_annotations(frame: Frame, annotations: dict, exclude_dynamic: bool, point_loader=None) -> dict:
     """Keep explicitly static vehicles; semantic class alone is not motion."""
     value = deepcopy(annotations)
     static_ids = set(value.pop("_static_track_ids", []))
@@ -222,7 +225,7 @@ def _fusion_annotations(frame: Frame, annotations: dict, exclude_dynamic: bool) 
         return value
     value["boxes"] = [box for box in value.get("boxes", []) if box.get("track_id") not in static_ids]
     if static_boxes:
-        cloud = _points(frame.model_dump())
+        cloud = _points(frame.model_dump(), point_loader)
         if len(cloud) * len(static_boxes) > 50_000_000:
             raise ValueError("Too many static target/point comparisons for reconstruction")
         protected = np.zeros(len(cloud), dtype=bool)
@@ -234,8 +237,8 @@ def _fusion_annotations(frame: Frame, annotations: dict, exclude_dynamic: bool) 
     return value
 
 
-def _static_scan(frame: Frame, annotations: dict, exclude_dynamic: bool) -> np.ndarray:
-    cloud = _points(frame.model_dump())
+def _static_scan(frame: Frame, annotations: dict, exclude_dynamic: bool, point_loader=None) -> np.ndarray:
+    cloud = _points(frame.model_dump(), point_loader)
     if not exclude_dynamic:
         return cloud
     keep = np.ones(len(cloud), dtype=bool)
@@ -334,17 +337,20 @@ def register_icp(source: np.ndarray, target: np.ndarray, initial: np.ndarray,
                     "correspondence_distance": max_distance, "source_points": len(source), "target_points": len(target)}
 
 
-def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: ReconstructionRequest) -> dict:
+def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: ReconstructionRequest,
+                      point_loader=None) -> dict:
     """Build one world-space map, retaining an explicit scan trajectory."""
     poses = source_poses(clip)
-    fusion_annotations = {frame.id: _fusion_annotations(frame, annotations.get(frame.id, {}), request.exclude_dynamic)
+    fusion_annotations = {frame.id: _fusion_annotations(frame, annotations.get(frame.id, {}), request.exclude_dynamic,
+                                                        point_loader)
                           for frame in clip.frames}
     reports = []
     if request.registration == "icp":
         previous_frame, previous_scan = None, None
         original_poses = source_poses(clip)
         for frame in clip.frames:
-            scan = _registration_sample(_static_scan(frame, fusion_annotations.get(frame.id, {}), request.exclude_dynamic), request.voxel_size)
+            scan = _registration_sample(_static_scan(frame, fusion_annotations.get(frame.id, {}), request.exclude_dynamic,
+                                                     point_loader), request.voxel_size)
             if previous_frame is None:
                 if not _spatial_support(scan):
                     raise ValueError("ICP reference scan needs at least 30 non-collinear static points")
@@ -358,7 +364,8 @@ def reconstruct_scene(clip: Clip, annotations: dict[str, dict], request: Reconst
     for frame in corrected["frames"]:
         frame["ego_to_world"] = (poses[frame["id"]] @ np.linalg.inv(np.asarray(frame["lidar_to_ego"], dtype=float))).tolist()
     result = fuse_map(corrected, fusion_annotations, request.voxel_size,
-                      preserve_detail=request.preserve_detail, detail_voxel_size=request.detail_voxel_size)
+                      preserve_detail=request.preserve_detail, detail_voxel_size=request.detail_voxel_size,
+                      point_loader=point_loader)
     result["point_labels"] = {index: label.removeprefix("scene-static:") for index, label in result.get("point_labels", {}).items()}
     points = np.asarray(result["points"], dtype=float)
     if not len(points):
@@ -391,7 +398,26 @@ def rebase_scene(scene: SceneAnnotations, old_poses: dict[str, np.ndarray], new_
     return SceneAnnotations.model_validate(raw)
 
 
-def get_scene_map(store: Store, clip: Clip) -> dict:
+def _stored_map_points(store: Store, value: dict) -> np.ndarray:
+    relative = value.get("pointcloud_file")
+    if not isinstance(relative, str):
+        return np.asarray(value.get("points", []), dtype=float)
+    root = (store.root / "scene_pointclouds").resolve()
+    source = (root / relative).resolve()
+    if not source.is_relative_to(root) or source.suffix.lower() != ".npy" or not source.is_file():
+        raise ValueError("Scene map point cloud is missing or outside the pointcloud store")
+    try:
+        points = np.load(source, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError("Scene map point cloud is not a valid NPY array") from exc
+    if (points.ndim != 2 or points.shape[1] != 4 or len(points) != value.get("point_count")
+            or not np.issubdtype(points.dtype, np.number) or not np.isfinite(points).all()):
+        raise ValueError("Scene map point cloud has invalid shape, count, type, or values")
+    return points
+
+
+def get_scene_map(store: Store, clip: Clip, *, max_points: int | None = None,
+                  include_points: bool = True) -> dict:
     path = _map_path(store, clip.id)
     with store.lock:
         if not path.exists():
@@ -401,6 +427,23 @@ def get_scene_map(store: Store, clip: Clip) -> dict:
             raise KeyError("Scene fusion profile changed; reconstruct the scene map to retain measured surface detail")
         if value.get("source_fingerprint") != source_fingerprint(store, clip):
             raise KeyError("Scene source annotations changed; reconstruct the scene map to refresh dynamic filtering")
+        if not include_points:
+            value.pop("points", None)
+            value.pop("pointcloud_file", None)
+            return value
+        points = _stored_map_points(store, value)
+        if max_points is not None and len(points) > max_points:
+            indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+        else:
+            indices = np.arange(len(points))
+        value["points"] = np.asarray(points[indices], dtype=float).tolist()
+        labels = value.get("point_labels", {})
+        if len(indices) != len(points) and labels:
+            value["point_labels"] = {
+                str(output): labels[str(source)] for output, source in enumerate(indices) if str(source) in labels
+            }
+        value["rendered_point_count"] = len(indices)
+        value.pop("pointcloud_file", None)
         return value
 
 
@@ -416,7 +459,39 @@ def save_reconstruction(store: Store, clip: Clip, result: dict, fingerprint: str
         atomic_json(_poses_path(store, clip.id), {"clip_fingerprint": _clip_fingerprint(store, clip),
                                                  "world_from_lidar": result["world_from_lidar"]})
         result.update(scene_revision=rebased.revision, source_fingerprint=source_fingerprint(store, clip))
-        atomic_json(_map_path(store, clip.id), result)
+        points = np.asarray(result.get("points", []), dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 4 or len(points) != result.get("point_count"):
+            raise ValueError("Reconstructed scene points do not match point_count")
+        points_root = store.root / "scene_pointclouds" / safe_id(clip.id)
+        points_root.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid4().hex}.npy"
+        destination = points_root / filename
+        temporary = points_root / f".{filename}.tmp"
+        previous_file = None
+        map_path = _map_path(store, clip.id)
+        if map_path.exists() and map_path.stat().st_size < 16 * 1024 * 1024:
+            try:
+                previous_file = json.loads(map_path.read_text()).get("pointcloud_file")
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                pass
+        try:
+            with temporary.open("wb") as stream:
+                np.save(stream, points, allow_pickle=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            stored = {key: value for key, value in result.items() if key != "points"}
+            stored["pointcloud_file"] = f"{safe_id(clip.id)}/{filename}"
+            atomic_json(map_path, stored)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            destination.unlink(missing_ok=True)
+            raise
+        if previous_file and previous_file != stored["pointcloud_file"]:
+            previous_path = (store.root / "scene_pointclouds" / previous_file).resolve()
+            root = (store.root / "scene_pointclouds").resolve()
+            if previous_path.is_relative_to(root):
+                previous_path.unlink(missing_ok=True)
         return result
 
 
@@ -437,7 +512,7 @@ def scene_export(store: Store, clip: Clip) -> dict:
     # contract and is required for exact cross-server ICP round trips.
     value["scene_registration"] = {"world_from_lidar": {fid: matrix.tolist() for fid, matrix in registered_poses(store, clip).items()}}
     try:
-        cached = get_scene_map(store, clip)
+        cached = get_scene_map(store, clip, include_points=False)
         value["scene_map"] = {key: deepcopy(cached[key]) for key in (
             "coordinate_frame", "frame_count", "point_count", "trajectory", "bounds", "method", "voxel_size", "registration", "exclude_dynamic",
             "fusion_version", "preserve_detail", "detail_voxel_size", "effective_voxel_size", "point_reduction",

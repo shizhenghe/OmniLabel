@@ -92,6 +92,21 @@ def test_detail_fusion_xyz_only_never_invents_intensity_or_extra_points():
     assert all(point[:3] in source and point[3] == 0 for point in result["points"])
 
 
+def test_map_fusion_loads_external_frames_without_a_point_limit(monkeypatch):
+    source = np.asarray([[0, 0, 0, .1], [.1, 0, 0, .2], [1, 0, 0, .3]], dtype=float)
+    monkeypatch.setattr(geometry, "MAX_POINTS", 2)
+    lazy_frame = frame([])
+    lazy_frame["point_count"] = len(source)
+    result = fuse_map(
+        {"frames": [lazy_frame]},
+        {},
+        .05,
+        point_loader=lambda _: source,
+    )
+    assert result["input_point_count"] == len(source)
+    assert result["point_count"] == len(source)
+
+
 def test_occupancy_negative_coordinates_free_rays_and_occupied_precedence():
     cloud = frame([[2.1, 0.1, 0.1], [1.1, 0.1, 0.1], [-2.1, 0.1, 0.1]])
     result = build_occupancy(cloud, annotations(point_labels={"0": "car"}), 1)
