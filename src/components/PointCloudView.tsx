@@ -22,6 +22,8 @@ export interface PointCloudViewProps {
   sceneMode?: boolean;
   trajectory?: {frame_id: string; timestamp: number; position: Vec3}[];
   activeFrameId?: string;
+  /** Increment to frame the currently selected box once; dragging never refits. */
+  focusSelection?: number;
   tool?: 'select' | 'box' | 'vector' | 'brush';
   view?: 'perspective' | 'top';
   overlayPoints?: number[][];
@@ -394,6 +396,28 @@ export function PointCloudView(props: PointCloudViewProps) {
     }
     rt.controls.update();
   }, [ready, props.view, props.sceneMode]);
+
+  useEffect(() => {
+    const rt = runtime.current;
+    const current = latest.current;
+    if (!rt || !current.focusSelection) return;
+    const box = current.annotations.boxes.find(item => item.id === current.selectedId);
+    if (!box) return;
+    const damping = rt.controls.enableDamping;
+    rt.controls.enableDamping = false;
+    rt.controls.update();
+    const center = new THREE.Vector3(...box.center);
+    const distance = Math.max(Math.max(...box.size) * 3, 8);
+    const direction = rt.camera.position.clone().sub(rt.controls.target).normalize();
+    if (direction.lengthSq() < 1e-6) direction.set(-1, -1, 1).normalize();
+    rt.controls.target.copy(center);
+    if (current.view === 'top') rt.camera.position.copy(center).add(new THREE.Vector3(-.001, 0, distance));
+    else rt.camera.position.copy(center).addScaledVector(direction, distance);
+    rt.controls.update();
+    rt.controls.enableDamping = damping;
+    // This effect intentionally observes only the explicit focus request. Box
+    // changes during pointer drags must not move the camera under the cursor.
+  }, [ready, props.focusSelection]);
 
   const rayAt = (clientX: number, clientY: number) => {
     const rt = runtime.current;

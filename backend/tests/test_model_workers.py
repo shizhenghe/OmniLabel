@@ -1,6 +1,8 @@
 """Real output conversion/protocol tests; no GPU inference is claimed here."""
 import base64
 import io
+from contextlib import contextmanager, nullcontext
+import sys
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -10,9 +12,38 @@ import pytest
 
 from model_workers.app import create_app
 from model_workers.adapters import (SAM2Adapter, OpenOccupancyAdapter,
-                                    normalize_detection, occupancy_from_logits)
+                                    normalize_detection, occupancy_from_logits, resolve_sam2_precision)
 from model_workers.common import (InvalidInput, image_from_payload,
-                                  mask_to_polygons, points_array, validate_options)
+                                  mask_to_polygons, ModelUnavailable, points_array, validate_options)
+
+
+def test_sam2_turing_uses_fp16_even_if_torch_can_emulate_bf16():
+    torch = SimpleNamespace(cuda=SimpleNamespace(device=lambda value: nullcontext(),
+        get_device_capability=lambda value: (7, 5), is_bf16_supported=lambda: True))
+    assert resolve_sam2_precision(torch, "cuda:0") == "float16"
+    assert resolve_sam2_precision(torch, "cuda:0", "float32") == "float32"
+    with pytest.raises(ModelUnavailable, match="Turing"):
+        resolve_sam2_precision(torch, "cuda:0", "bfloat16")
+
+
+def test_sam2_native_bf16_requires_capability_and_actual_support_on_selected_device():
+    selected = []
+    torch = SimpleNamespace(cuda=SimpleNamespace(device=lambda value: nullcontext(),
+        get_device_capability=lambda value: selected.append(value) or (8, 6), is_bf16_supported=lambda: True))
+    assert resolve_sam2_precision(torch, "cuda:3") == "bfloat16"
+    assert selected == ["cuda:3"]
+    torch.cuda.is_bf16_supported = lambda: False
+    assert resolve_sam2_precision(torch, "cuda:3") == "float16"
+
+
+def test_sam2_cpu_keeps_float32_and_rejects_invalid_precision():
+    # CPU preflight must not probe CUDA devices or require a GPU runtime.
+    torch = SimpleNamespace()
+    assert resolve_sam2_precision(torch, "cpu") == "float32"
+    with pytest.raises(ModelUnavailable, match="CUDA"):
+        resolve_sam2_precision(torch, "cpu", "float16")
+    with pytest.raises(ModelUnavailable, match="SAM2_PRECISION"):
+        resolve_sam2_precision(torch, "cpu", "invalid")
 
 
 def payload():
@@ -22,6 +53,70 @@ def payload():
         {"id": "front", "width": 20, "height": 10}]}, "frame": {"id": "f0", "points": [[1, 2, 3, .5]],
         "images": {"front": "data:image/png;base64," + base64.b64encode(image.getvalue()).decode()}},
         "annotations": {"boxes": [], "vectors": [], "image_polygons": [], "point_labels": {}, "revision": 2}, "options": {}}
+
+
+@pytest.mark.parametrize("prompted", [True, False])
+def test_sam2_adapter_encodes_and_predicts_under_fp16_and_forwards_automatic_batch(monkeypatch, prompted):
+    """Exercise official API call wiring with explicit fakes, without GPU claims."""
+    state = {"inference": False, "autocast": False, "called": False}
+
+    @contextmanager
+    def inference_mode():
+        state["inference"] = True
+        yield
+        state["inference"] = False
+
+    @contextmanager
+    def autocast(*, device_type, dtype):
+        assert device_type == "cuda" and dtype == "fake-float16"
+        assert state["inference"]
+        state["autocast"] = True
+        yield
+        state["autocast"] = False
+
+    torch = SimpleNamespace(inference_mode=inference_mode, autocast=autocast, float16="fake-float16")
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    mask = np.zeros((10, 20), dtype=bool)
+    mask[1:9, 2:18] = True
+
+    class PromptPredictor:
+        def __init__(self, model):
+            assert model is adapter.model
+
+        def set_image(self, image):
+            assert image.shape == (10, 20, 3) and state["autocast"] and state["inference"]
+
+        def predict(self, **options):
+            assert state["autocast"] and state["inference"]
+            np.testing.assert_array_equal(options["point_coords"], [[10, 5]])
+            np.testing.assert_array_equal(options["point_labels"], [1])
+            assert options["multimask_output"] is False
+            state["called"] = True
+            return np.asarray([mask]), np.array([.95]), None
+
+    class AutomaticGenerator:
+        def __init__(self, model, **options):
+            assert model is adapter.model
+            assert options["points_per_batch"] == 4
+
+        def generate(self, image):
+            assert image.shape == (10, 20, 3) and state["autocast"] and state["inference"]
+            state["called"] = True
+            return [{"segmentation": mask, "predicted_iou": .95}]
+
+    monkeypatch.setitem(sys.modules, "sam2.sam2_image_predictor", SimpleNamespace(SAM2ImagePredictor=PromptPredictor))
+    monkeypatch.setitem(sys.modules, "sam2.automatic_mask_generator", SimpleNamespace(SAM2AutomaticMaskGenerator=AutomaticGenerator))
+    adapter = SAM2Adapter()
+    adapter.model, adapter.precision, adapter.points_per_batch = object(), "float16", 4
+    request = payload()
+    request["options"] = {"camera_id": "front", "label": "road"}
+    if prompted:
+        request["options"].update(points=[[10, 5]], point_labels=[1])
+    result = adapter.predict(request)
+    assert state == {"inference": False, "autocast": False, "called": True}
+    assert result["inference_precision"] == "float16"
+    assert len(result["annotations"]["image_polygons"]) == 1
+    assert result["annotations"]["image_polygons"][0]["label"] == "road"
 
 
 def test_embedded_image_validation_and_original_dimensions():
@@ -119,6 +214,23 @@ def test_worker_with_missing_dependencies_reports_unavailable_and_never_returns_
         record = client.get("/models").json()["models"][0]
         assert not record["available"] and record["status"] == "missing_dependencies"
         assert client.post("/predict", json=payload()).status_code == 503
+
+
+def test_worker_reports_actionable_precision_prerequisite_without_claiming_ready(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "trusted-test-fixture.pt"
+    checkpoint.write_bytes(b"fixture, not a real checkpoint")
+    monkeypatch.setenv("SAM2_CHECKPOINT", str(checkpoint))
+    monkeypatch.setattr("model_workers.adapters.module_present", lambda name: True)
+    adapter = SAM2Adapter()
+
+    def fail_load():
+        raise ModelUnavailable("SAM2 bfloat16 requires native BF16; use auto or float16 on RTX 2080/Turing")
+
+    monkeypatch.setattr(adapter, "load", fail_load)
+    with TestClient(create_app("sam2", adapter)) as client:
+        record = client.get("/models").json()["models"][0]
+        assert not record["available"] and record["status"] == "error"
+        assert "RTX 2080/Turing" in record["reason"]
 
 
 def test_worker_protocol_dispatch_auth_and_response(monkeypatch):

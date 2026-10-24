@@ -39,6 +39,10 @@ MMDetection3D / SAM2 的依赖安装到同一个环境。主平台环境不安�
 
 ### SAM2
 
+本地 GPU 服务器可直接使用 [逐步部署说明](sam2-local.md) 和
+`bash model_workers/sam2-local.sh install` / `serve`。说明包含独立环境、权重下载、
+就绪检查，以及云端平台访问内网 GPU 的 HTTPS / SSH 隧道连接方式。
+
 [官方安装说明](https://github.com/facebookresearch/sam2/blob/main/INSTALL.md)要求
 Python 3.10+、PyTorch 2.5.1+ 和匹配的 torchvision。安装脚本固定官方源码提交
 `2b90b9f5ceec907a1c18123530e92e794ad901a4`，可用 `SAM2_SOURCE_REF` 指定经核验版本。
@@ -53,6 +57,9 @@ bash model_workers/serve.sh
 ```
 
 SAM2 调用 `build_sam2`、`SAM2ImagePredictor`；没有点/框提示时使用自动 mask generator。
+`SAM2_PRECISION=auto` 默认按实际 GPU 选择混合精度：Turing/RTX 2080 为 FP16，
+原生支持 BF16 的 Ampere+ 为 BF16，CPU 为 FP32；可指定 `float16` / `float32`。
+自动掩码生成的 `SAM2_POINTS_PER_BATCH` 默认 16，可在小显存卡上降低后重启。
 在左侧相机添加正点、负点或拖动提示框。`label` 是人工赋予的类别；SAM2 不根据文本类别做检测。
 输出的原图 mask 转换为多边形，转换会报告孔洞和简化误差，需要检查复杂边界。
 
