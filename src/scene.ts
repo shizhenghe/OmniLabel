@@ -27,8 +27,8 @@ export function transformBox(box: Box, matrix: number[][]): Box {
     yaw: Math.atan2(matrix[1][0] * x + matrix[1][1] * y, matrix[0][0] * x + matrix[0][1] * y)};
 }
 
-export function evaluateTrack(track: SceneTrack, frame: Frame, clip: Clip): Box | null {
-  const timestamps = new Map(clip.frames.map(f => [f.id, f.timestamp]));
+export function evaluateTrack(track: SceneTrack, frame: Frame, clip: Clip,
+  timestamps = new Map(clip.frames.map(f => [f.id, f.timestamp]))): Box | null {
   const keys = track.keyframes.filter(k => timestamps.has(k.frame_id)).slice().sort((a, b) => timestamps.get(a.frame_id)! - timestamps.get(b.frame_id)!);
   if (!keys.length) return null;
   let state = keys[0];
@@ -48,7 +48,8 @@ export function evaluateTrack(track: SceneTrack, frame: Frame, clip: Clip): Box 
 
 export function evaluateScene(scene: SceneAnnotations | null, frame: Frame | null, clip: Clip | null): Annotations {
   if (!scene || !frame || !clip) return EMPTY_ANNOTATIONS;
-  return {boxes: scene.tracks.map(t => evaluateTrack(t, frame, clip)).filter((b): b is Box => b !== null),
+  const timestamps = new Map(clip.frames.map(f => [f.id, f.timestamp]));
+  return {boxes: scene.tracks.map(t => evaluateTrack(t, frame, clip, timestamps)).filter((b): b is Box => b !== null),
     vectors: scene.vectors, image_polygons: [], point_labels: {}, revision: scene.revision};
 }
 
