@@ -63,7 +63,7 @@ const COLORS: Record<string, string> = {
   lane: '#f7d16a', lane_line: '#f7d16a', lane_marking: '#f7d16a', lane_solid: '#f7d16a', lane_dashed: '#f7d16a',
   road_boundary: '#37ddbf', stop_line: '#f476aa',
   curb: '#ef8d85', crosswalk: '#aa96ff', direction_arrow: '#aa96ff', drivable_area: '#65acff',
-  unknown: '#98a8b8', unlabeled: '#98a8b8', free: '#446f8d',
+  unknown: '#ff3b5c', unlabeled: '#98a8b8', free: '#446f8d',
 };
 
 export function labelColor(label: string): string {

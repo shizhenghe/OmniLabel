@@ -18,6 +18,7 @@ export interface Frame {
   points: number[][];
   point_count: number;
   images: Record<string, string>;
+  annotation_camera_from_lidar?: Record<string, number[][]>;
 }
 
 export interface Clip {

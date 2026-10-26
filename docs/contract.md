@@ -11,7 +11,8 @@ type Camera = {id: string; name: string; width: number; height: number;
   intrinsics: number[][]; camera_from_ego: number[][];
   distortion?: number[]}; // Brown-Conrady k1,k2,p1,p2,k3
 type Frame = {id: string; timestamp: number; ego_to_world: number[][];
-  lidar_to_ego: number[][]; points: number[][]; images: Record<string,string>};
+  lidar_to_ego: number[][]; points: number[][]; images: Record<string,string>;
+  annotation_camera_from_lidar?: Record<string,number[][]>};
 type Clip = {id: string; name: string; description: string; fps: number;
   cameras: Camera[]; frames: Frame[]; source?: string};
 type Box = {id: string; track_id: string; label: string; center: Vec3;
@@ -26,6 +27,8 @@ type Annotations = {boxes: Box[]; vectors: Vector[];
 Frame points are LiDAR coordinates, `[x,y,z,intensity]`; boxes, vectors and point
 indices refer to this same per-frame LiDAR space. Each camera extrinsic maps ego
 to optical camera coordinates; projection is K * camera_from_ego * lidar_to_ego.
+When supplied, `annotation_camera_from_lidar[camera_id]` replaces those two
+extrinsics for annotation overlays only; raw point-cloud projection is unchanged.
 
 API base `/api`:
 
