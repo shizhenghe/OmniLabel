@@ -25,6 +25,8 @@ export interface PointCloudViewProps {
   activeFrameId?: string;
   /** Stable raw source identity prevents refitting the camera on every live calibration step. */
   autoFitReference?: number[][];
+  /** Review can follow ego translation while preserving the chosen view direction and zoom. */
+  followPosition?: Vec3;
   /** Increment to frame the currently selected box once; dragging never refits. */
   focusSelection?: number;
   tool?: 'select' | 'box' | 'vector' | 'brush';
@@ -153,6 +155,7 @@ export function PointCloudView(props: PointCloudViewProps) {
   const origin = useMemo(() => renderOriginForPoints(props.frame?.points ?? []), [props.autoFitReference ?? props.frame?.points]);
   const previousOrigin = useRef<Vec3>([0, 0, 0]);
   const colorMode = props.colorMode ?? (props.semantic ? 'semantic' : 'height');
+  const pointLabelCount = useMemo(() => Object.keys(props.annotations.point_labels).length, [props.annotations.point_labels]);
   const visibleIndices = useMemo(() => visiblePointIndices(props.frame?.points ?? [], props.groundOnly, props.groundZ ?? -1.7, props.groundBand),
     [props.frame?.points, props.groundOnly, props.groundZ, props.groundBand]);
 
@@ -293,6 +296,19 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.camera.updateProjectionMatrix();
     rt.controls.update();
   }, [ready, props.sceneMode, props.frame?.points, props.autoFitReference, props.view, origin]);
+
+  const followState = useRef<{reference: number[][] | undefined; position: THREE.Vector3} | null>(null);
+  useEffect(() => {
+    const rt = runtime.current;
+    if (!rt || !props.followPosition) {followState.current = null; return;}
+    const position = new THREE.Vector3(...props.followPosition);
+    const previous = followState.current;
+    if (previous && previous.reference === props.autoFitReference) {
+      const delta = position.clone().sub(previous.position);
+      rt.camera.position.add(delta); rt.controls.target.add(delta);
+    }
+    followState.current = {reference: props.autoFitReference, position};
+  }, [ready, props.followPosition?.[0], props.followPosition?.[1], props.followPosition?.[2], props.autoFitReference]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -490,6 +506,9 @@ export function PointCloudView(props: PointCloudViewProps) {
     data-color-mode={colorMode}
     data-render-origin={origin.join(',')}
     data-active-frame-id={props.activeFrameId ?? props.frame?.id ?? ''}
+    data-annotation-box-count={props.showBoxes === false ? 0 : props.annotations.boxes.length}
+    data-annotation-vector-count={props.showVectors === false ? 0 : props.annotations.vectors.length}
+    data-point-label-count={pointLabelCount}
     style={{ position: 'relative', width: '100%', height: '100%', minHeight: 240, overflow: 'hidden', cursor: props.tool && props.tool !== 'select' ? 'crosshair' : 'grab' }}
     onPointerDown={(event) => { pointerStart.current = [event.clientX, event.clientY]; }}
     onClick={onClick}

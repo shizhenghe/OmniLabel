@@ -8,6 +8,8 @@ export { projectLidarPoint } from '../geometry/cameraProjection';
 export interface CameraViewProps {
   camera: Camera;
   frame: Frame | null;
+  /** A decoded image supplied with a complete review frame; null means unavailable. */
+  preparedImage?: HTMLImageElement | null;
   annotations: Annotations;
   projections?: ProjectionPoint[];
   selected?: boolean;
@@ -35,12 +37,16 @@ export function CameraView(props: CameraViewProps) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const loadedSource = useRef<string | undefined>(undefined);
   const fit = useRef({ x: 0, y: 0, width: 0, height: 0 });
-  const [imageState, setImageState] = useState<'loading' | 'ready' | 'missing' | 'error'>('loading');
+  const [internalImageState, setImageState] = useState<'loading' | 'ready' | 'missing' | 'error'>('loading');
   const [size, setSize] = useState({ width: 0, height: 0 });
   const modelDrag = useRef<{ start: Pixel; pointerId: number } | null>(null);
   const [draftModelBox, setDraftModelBox] = useState<number[] | null>(null);
   const source = props.frame?.images[props.camera.id];
+  const displayImage = props.preparedImage !== undefined ? props.preparedImage : loadedSource.current === source ? imageRef.current : null;
+  const imageState = props.preparedImage !== undefined ? props.preparedImage ? 'ready' : source ? 'error' : 'missing'
+    : source && loadedSource.current !== source ? 'loading' : internalImageState;
   const results = useMemo(() => props.frame ? projectAnnotationResults(props.annotations, props.camera, props.frame)
     : { boxes: [], vectors: [], imagePolygons: [] }, [props.annotations, props.camera, props.frame]);
   const visibleResults = useMemo(() => ({
@@ -64,7 +70,9 @@ export function CameraView(props: CameraViewProps) {
   }, []);
 
   useEffect(() => {
+    if (props.preparedImage !== undefined) return;
     imageRef.current = null;
+    loadedSource.current = source;
     if (!source) { setImageState('missing'); return; }
     let cancelled = false;
     setImageState('loading');
@@ -77,7 +85,7 @@ export function CameraView(props: CameraViewProps) {
     image.onerror = () => { if (!cancelled) setImageState('error'); };
     image.src = source;
     return () => { cancelled = true; image.onload = null; image.onerror = null; };
-  }, [source]);
+  }, [source, props.preparedImage]);
 
   useEffect(() => {
     if (!canvas.current || !size.width || !size.height) return;
@@ -103,8 +111,8 @@ export function CameraView(props: CameraViewProps) {
     ctx.rect(0, 0, displayWidth, displayHeight);
     ctx.clip();
     const xy = (point: number[]) => [point[0] * scale, point[1] * scale];
-    if (imageState === 'ready' && imageRef.current) {
-      ctx.drawImage(imageRef.current, 0, 0, displayWidth, displayHeight);
+    if (imageState === 'ready' && displayImage) {
+      ctx.drawImage(displayImage, 0, 0, displayWidth, displayHeight);
     } else {
       ctx.fillStyle = '#121d2a';
       ctx.fillRect(0, 0, displayWidth, displayHeight);
@@ -204,7 +212,7 @@ export function CameraView(props: CameraViewProps) {
       ctx.stroke();
     });
     ctx.restore();
-  }, [props, imageState, size, visibleResults, draftModelBox]);
+  }, [props, imageState, displayImage, size, visibleResults, draftModelBox]);
 
   const originalPixel = (clientX: number, clientY: number, clamp = false): Pixel | null => {
     if (!host.current) return null;
@@ -221,6 +229,8 @@ export function CameraView(props: CameraViewProps) {
     className={props.className}
     data-testid={`camera-${props.camera.id}`}
     data-image-state={imageState}
+    data-active-frame-id={props.frame?.id ?? ''}
+    data-rendered-image-frame-id={imageState === 'ready' && displayImage ? props.frame?.id ?? '' : ''}
     data-projected-box-count={visibleResults.boxes.length}
     data-projected-vector-count={visibleResults.vectors.length}
     data-projected-polygon-count={visibleResults.imagePolygons.length}
