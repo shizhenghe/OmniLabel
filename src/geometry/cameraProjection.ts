@@ -12,6 +12,8 @@ export function transformPoint(matrix: number[][], point: number[]): Vec3 {
 }
 
 export function lidarToCamera(point: number[], camera: Camera, frame: Frame): Vec3 {
+  const annotationTransform = frame.annotation_camera_from_lidar?.[camera.id];
+  if (annotationTransform) return transformPoint(annotationTransform, point);
   return transformPoint(camera.camera_from_ego, transformPoint(frame.lidar_to_ego, point));
 }
 

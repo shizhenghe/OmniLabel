@@ -2,7 +2,7 @@ node_modules/
 dist/
 .venv/
 data/
-tests/sq_data/
+tests/
 prelabel_ckpt/
 __pycache__/
 *.py[cod]

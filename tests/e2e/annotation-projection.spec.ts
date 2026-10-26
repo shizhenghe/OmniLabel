@@ -15,6 +15,18 @@ test('lane labels project calibrated vertices into pixels without raw cloud data
   expect(projectVector(lane, camera, translated).segments).toEqual([[[320, 180], [360, 180]]]);
 });
 
+test('per-frame annotation correction overrides the static point-cloud calibration', () => {
+  const lane: Vector = { id: 'lane', label: 'lane', points: [[-1, 0, 5], [1, 0, 5]], closed: false };
+  const corrected: Frame = {
+    ...frame,
+    lidar_to_ego: [[1, 0, 0, 9], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+    annotation_camera_from_lidar: {
+      front: [[1, 0, 0, 2], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+    },
+  };
+  expect(projectVector(lane, camera, corrected).segments).toEqual([[[340, 180], [380, 180]]]);
+});
+
 test('near-plane crossing lines are clipped and behind-camera results stay absent', () => {
   const visible = projectLidarSegment([-1, 0, -1], [0, 0, 2], camera, frame);
   expect(visible).toHaveLength(1);

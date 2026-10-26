@@ -66,8 +66,19 @@ class Frame(Model):
     pointcloud_file: str | None = Field(default=None, max_length=240)
     point_count: int | None = Field(default=None, ge=0)
     images: dict[str, str] = Field(default_factory=dict)
+    # Optional direct annotation-coordinate -> camera transforms. These let an
+    # imported clip carry per-frame projection corrections without changing
+    # the calibration used to render the raw point cloud.
+    annotation_camera_from_lidar: dict[Identifier, list[list[float]]] = Field(default_factory=dict)
 
     _transforms = field_validator("ego_to_world", "lidar_to_ego")(rigid_transform)
+
+    @field_validator("annotation_camera_from_lidar")
+    @classmethod
+    def validate_annotation_camera_transforms(cls, value):
+        for transform in value.values():
+            rigid_transform(transform)
+        return value
 
     @field_validator("points")
     @classmethod
@@ -98,7 +109,7 @@ class Clip(Model):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=10000)
     fps: float = Field(gt=0, le=1000)
-    cameras: list[Camera] = Field(min_length=1, max_length=32)
+    cameras: list[Camera] = Field(default_factory=list, max_length=32)
     frames: list[Frame] = Field(min_length=1, max_length=2000)
     source: str = Field(default="import", max_length=200)
 
@@ -110,6 +121,8 @@ class Clip(Model):
             raise ValueError("camera IDs and frame IDs must be unique")
         if any(set(f.images) - set(camera_ids) for f in self.frames):
             raise ValueError("frame images reference an unknown camera")
+        if any(set(f.annotation_camera_from_lidar) - set(camera_ids) for f in self.frames):
+            raise ValueError("frame annotation projection references an unknown camera")
         if any(self.frames[i].timestamp >= self.frames[i + 1].timestamp for i in range(len(self.frames) - 1)):
             raise ValueError("frame timestamps must be strictly increasing")
         return self
