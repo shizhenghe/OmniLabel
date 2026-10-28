@@ -17,8 +17,14 @@ export interface Frame {
   lidar_to_ego: number[][];
   points: number[][];
   point_count: number;
+  calibration_pointcloud_file?: string | null;
+  calibration_point_count?: number | null;
+  calibration_lidar_to_ego?: number[][] | null;
+  calibration_timestamp?: number | null;
   images: Record<string, string>;
   annotation_camera_from_lidar?: Record<string, number[][]>;
+  /** Per-frame physical correction, shared by raw points and 3D labels. */
+  projection_camera_from_lidar?: Record<string, number[][]>;
 }
 
 export interface Clip {
@@ -115,7 +121,7 @@ export interface ModelInfo {
   status?: string;
   status_detail?: string;
   reason?: string;
-  supports?: {point_prompt?: boolean; box_prompt?: boolean; text_prompt?: boolean; occupancy?: boolean};
+  supports?: {point_prompt?: boolean; box_prompt?: boolean; text_prompt?: boolean; occupancy?: boolean; lane_vectors?: boolean; weight_variants?: string[]; active_weight_variant?: string};
 }
 
 export interface SceneKeyframe { frame_id: string; center: Vec3; size: Vec3; yaw: number; }
@@ -123,6 +129,8 @@ export interface SceneTrack { id: string; label: string; mode: 'static' | 'dynam
 export interface SceneAnnotations { revision: number; coordinate_frame: 'world'; vectors: Vector[]; tracks: SceneTrack[]; }
 export interface SceneMap {
   points: number[][];
+  /** Full XYZI cloud loaded from NPY; avoids expanding millions of rows into JSON objects. */
+  point_buffer?: Float32Array;
   point_labels: Record<string, string>;
   coordinate_frame: 'world';
   frame_count: number;

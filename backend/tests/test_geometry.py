@@ -42,6 +42,16 @@ def test_projection_composes_lidar_extrinsic_and_radial_tangential_distortion():
     assert result["points"][0]["v"] == pytest.approx(55.60)
 
 
+def test_projection_uses_same_imported_frame_correction_as_annotations():
+    cloud = frame([[0, 0, 2]])
+    imported = np.eye(4); imported[0, 3] = 1
+    cloud["annotation_camera_from_lidar"] = {"front": imported.tolist()}
+    assert project_points(cloud, camera())["points"][0]["u"] == pytest.approx(55)
+    published = np.eye(4); published[0, 3] = 2
+    cloud["projection_camera_from_lidar"] = {"front": published.tolist()}
+    assert project_points(cloud, camera())["points"][0]["u"] == pytest.approx(60)
+
+
 def test_projection_empty_and_bad_transform():
     assert project_points(frame([]), camera())["points"] == []
     invalid = camera()

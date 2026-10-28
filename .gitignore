@@ -3,6 +3,7 @@ dist/
 .venv/
 data/
 tests/
+docs/
 prelabel_ckpt/
 __pycache__/
 *.py[cod]
@@ -17,3 +18,19 @@ playwright-report/
 .model-envs/
 .models/
 model_weights/
+
+# Keep the automatic camera/LiDAR calibration documentation and regression checks.
+!docs/
+docs/*
+!docs/koide-calibration.md
+!backend/tests/
+backend/tests/*
+!backend/tests/test_automatic_calibration.py
+!backend/tests/test_automatic_projection.py
+!backend/tests/test_koide_runtime.py
+!backend/tests/test_import_4d_draft.py
+!tests/
+tests/*
+!tests/e2e/
+tests/e2e/*
+!tests/e2e/automatic-calibration.spec.ts

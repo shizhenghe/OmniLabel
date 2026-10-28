@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .storage import atomic_json
 
-MODEL_ENV = {"sam2": "SAM2", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
+MODEL_ENV = {"sam2": "SAM2", "latr": "LATR", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
 
 
 class Connection(BaseModel):
@@ -26,7 +26,7 @@ class Connection(BaseModel):
 
 class ConnectionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    connections: list[Connection] = Field(max_length=3)
+    connections: list[Connection] = Field(max_length=4)
 
 
 class ModelConnections:
@@ -66,7 +66,7 @@ class ModelConnections:
         values = self.saved()
         for connection in connections:
             if connection.model_id not in MODEL_ENV:
-                raise ValueError("Unknown model; choose sam2, mmdetection3d or openoccupancy")
+                raise ValueError("Unknown model; choose sam2, latr, mmdetection3d or openoccupancy")
             if connection.endpoint:
                 try:
                     validate_worker_url(connection.endpoint)
@@ -125,6 +125,7 @@ class ModelConnections:
                             if not ready:
                                 reasons = {"missing_dependencies": "服务缺少模型运行依赖", "missing_checkpoint": "服务缺少模型权重",
                                            "missing_config": "服务缺少模型配置或训练相机定义", "configured": "服务已配置，模型尚未加载",
+                                           "missing_repository": "服务缺少 LATR 源码目录",
                                            "error": "模型加载失败，请检查运行环境与权重版本"}
                                 result["status_detail"] = reasons.get(entry.get("status"), result["status_detail"])
                             tasks = entry.get("tasks", [])
@@ -136,7 +137,7 @@ class ModelConnections:
         return result
 
     def statuses(self):
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             values = list(pool.map(self.probe, MODEL_ENV))
         return {item["model_id"]: item for item in values}
 

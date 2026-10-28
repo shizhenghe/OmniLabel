@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from math import pi
+import os
 import time
 
 import numpy as np
@@ -13,13 +14,13 @@ from pydantic import ValidationError
 from omnilabel.main import create_app
 from omnilabel.models import Annotations, Clip
 from omnilabel.scene import (
-    evaluate_scene, frame_annotations, get_scene, get_scene_map, initialize_scene,
+    evaluate_scene, frame_annotations, get_scene, get_scene_map, initialize_scene, legacy_source_fingerprint,
     reconstruct_scene, registered_poses, restore_scene, sample_track,
     save_reconstruction, save_scene, scene_export, source_fingerprint,
     source_poses, validate_scene_import,
 )
 from omnilabel.scene_models import ReconstructionRequest, SceneAnnotations
-from omnilabel.storage import ConflictError, Store
+from omnilabel.storage import ConflictError, Store, atomic_json
 
 
 def clip_data(points=None):
@@ -241,6 +242,46 @@ def test_reconstruction_rejects_concurrent_annotation_changes(tmp_path):
     result = reconstruct_scene(clip, {}, ReconstructionRequest())
     with pytest.raises(ConflictError, match="during reconstruction"):
         save_reconstruction(store, clip, result, fingerprint, scene, source_poses(clip))
+
+
+@pytest.mark.parametrize("changed", ["scene", "frame"])
+def test_source_fingerprint_detects_same_size_atomic_write_with_same_timestamp(tmp_path, changed):
+    clip = Clip.model_validate(clip_data())
+    store = Store(tmp_path)
+    store.add_clip(clip, {clip.frames[0].id: Annotations()})
+    get_scene(store, clip)
+    before = source_fingerprint(store, clip)
+    if changed == "scene":
+        path = store.root / "scenes" / f"{clip.id}.json"
+    else:
+        path = store.root / "annotations" / clip.id / f"{clip.frames[0].id}.json"
+    stat = path.stat()
+    raw = json.loads(path.read_text())
+    raw["revision"] += 1
+    atomic_json(path, raw)
+    assert path.stat().st_size == stat.st_size
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert source_fingerprint(store, clip) != before
+
+
+def test_legacy_scene_map_and_registered_poses_survive_fingerprint_upgrade(tmp_path):
+    from omnilabel.scene import FUSION_VERSION, _clip_fingerprint
+    clip = Clip.model_validate(clip_data())
+    store = Store(tmp_path)
+    store.add_clip(clip)
+    get_scene(store, clip)
+    poses = source_poses(clip)
+    poses["f0"][0, 3] = 12
+    atomic_json(store.root / "scene_poses" / f"{clip.id}.json",
+                {"clip_fingerprint": _clip_fingerprint(store, clip),
+                 "world_from_lidar": {key: value.tolist() for key, value in poses.items()}})
+    legacy = legacy_source_fingerprint(store, clip)
+    assert not legacy.startswith("v2:") and source_fingerprint(store, clip).startswith("v2:")
+    atomic_json(store.root / "scene_maps" / f"{clip.id}.json",
+                {"fusion_version": FUSION_VERSION, "source_fingerprint": legacy,
+                 "points": [[1, 2, 3, .5]], "point_count": 1})
+    assert get_scene_map(store, clip)["points"] == [[1, 2, 3, .5]]
+    assert registered_poses(store, clip)["f0"][0, 3] == 12
 
 
 def test_scene_export_restore_preserves_world_registration_and_legacy_labels(tmp_path):

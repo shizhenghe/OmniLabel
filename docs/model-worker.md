@@ -1,15 +1,16 @@
-# SAM2、MMDetection3D、OpenOccupancy 模型接入
+# SAM2、LATR、MMDetection3D、OpenOccupancy 模型接入
 
-平台提供三个实际推理适配器，位于 `model_workers/`。它们分别调用官方模型 API，
+平台提供四个实际推理适配器，位于 `model_workers/`。它们分别调用官方模型 API，
 不使用几何结果冒充模型预测。当前云环境未安装 GPU 运行时和权重；远程 GPU 服务地址
 尚未提供，因此真实权重推理还需在目标 GPU 机器上验收。协议和转换测试使用明确的测试数据。
 
 ## 连接已有服务
 
-在「模型与预标注」面板分别填写三个完整推理地址，点击「保存并检查连接」。
+在「模型与预标注」面板分别填写四个完整推理地址，点击「保存并检查连接」。
 配置持久化在数据目录的 `model-connections.json`，不提交到 Git。
 
 - `sam2`：SAM2 / SAM2.1 图像提示分割。
+- `latr`：LATR ONCE 单目三维车道线检测，输出 LiDAR 坐标折线。
 - `mmdetection3d`：LiDAR 目标检测，或配置 `MMDET3D_TASK=segmentation` 的逐点分割。
 - `openoccupancy`：OpenOccupancy / CONet 的学习型语义占用预测。
 
@@ -18,19 +19,19 @@
 `/predict` 和 `/models`。地址要求 HTTPS；本机调试允许 loopback HTTP。
 如果已有服务采用其他协议，需要将其封装成下面的请求/响应协议，不能只填任意模型网页地址。
 
-也可通过服务端环境变量配置 `OMNILABEL_SAM2_URL`、`OMNILABEL_MMDET3D_URL`、
+也可通过服务端环境变量配置 `OMNILABEL_SAM2_URL`、`OMNILABEL_LATR_URL`、`OMNILABEL_MMDET3D_URL`、
 `OMNILABEL_OPENOCCUPANCY_URL`。界面保存的单模型设置优先；旧的
 `OMNILABEL_INFERENCE_URL` 继续作为统一网关的兼容回退。
 
-鉴权可分别注入 `OMNILABEL_SAM2_TOKEN`、`OMNILABEL_MMDET3D_TOKEN`、
+鉴权可分别注入 `OMNILABEL_SAM2_TOKEN`、`OMNILABEL_LATR_TOKEN`、`OMNILABEL_MMDET3D_TOKEN`、
 `OMNILABEL_OPENOCCUPANCY_TOKEN`，或共享 `OMNILABEL_INFERENCE_TOKEN`。
 它们通过 Bearer header 发送，不能放在 URL、提示词或 Git 文件中。
 TLS 校验保持开启，不跟随重定向。受限网络还需要在环境设置允许目标 GPU 域名。
 
 ## 在远程 GPU 机器运行本仓库 Worker
 
-三个模型使用**独立 Python 环境和进程**，尤其不能把旧版 OpenOccupancy 与现代
-MMDetection3D / SAM2 的依赖安装到同一个环境。主平台环境不安装 CUDA 模型依赖。
+四个模型使用**独立 Python 环境和进程**，尤其不能把 LATR 的旧版 OpenMMLab、旧版
+OpenOccupancy 与现代 MMDetection3D / SAM2 的依赖安装到同一个环境。主平台环境不安装 CUDA 模型依赖。
 
 1. 在目标机器准备与 CUDA 驱动匹配的模型环境及可信 checkpoint。
 2. 激活对应环境，在本仓库运行 `bash model_workers/setup.sh <模型ID>`。
@@ -62,6 +63,42 @@ SAM2 调用 `build_sam2`、`SAM2ImagePredictor`；没有点/框提示时使用�
 自动掩码生成的 `SAM2_POINTS_PER_BATCH` 默认 16，可在小显存卡上降低后重启。
 在左侧相机添加正点、负点或拖动提示框。`label` 是人工赋予的类别；SAM2 不根据文本类别做检测。
 输出的原图 mask 转换为多边形，转换会报告孔洞和简化误差，需要检查复杂边界。
+
+### LATR（本机 ONCE / OpenLane 权重）
+
+本机已有源码 `/data2/szh_data/LATR-main`，以及 ONCE 的 `ckpt/once.pth` 和 OpenLane 的
+`ckpt/openlane.pth`。预标注面板可选择权重；适配器会同步切换匹配配置，使用当前帧所选
+前视相机的真实内外参运行单目三维车道检测，并将 LATR 的 `[右, 前, 上]` 坐标转换为
+OmniLabel 当前帧的 LiDAR `[前, 左, 上]` 坐标。若帧上存在逐帧投影修正，也会用于推理投影。
+
+LATR 依赖旧版 PyTorch/OpenMMLab 和已编译 CUDA 算子，必须使用它自己的 Python 环境。
+本机存在 `/opt/anaconda3/envs/Latr/bin/python` 时启动脚本会自动使用它；其他安装位置可用
+`LATR_PYTHON` 指定。首次只需补装轻量 Worker 依赖以及源码运行所需的 `fvcore` / `geffnet`：
+
+```bash
+# 本机 Latr 环境会被自动检测；其他环境再设置 LATR_PYTHON。
+bash model_workers/latr-local.sh prepare
+bash model_workers/latr-local.sh check
+bash model_workers/latr-local.sh serve
+```
+
+默认端口为 `9104`。在平台模型面板为 LATR 填写
+`http://127.0.0.1:9104/predict`；若主平台不在同一台机器，应使用带 TLS 的反向代理或安全隧道。
+也可直接设置：
+
+```bash
+export OMNILABEL_LATR_URL=http://127.0.0.1:9104/predict
+```
+
+默认配置分别为 `config/release_iccv/once.py` 和
+`config/release_iccv/latr_1000_baseline.py`。可用 `LATR_REPO`、`LATR_ONCE_CHECKPOINT`、
+`LATR_ONCE_CONFIG`、`LATR_OPENLANE_CHECKPOINT`、`LATR_OPENLANE_CONFIG` 覆盖；
+`LATR_DEFAULT_VARIANT=once|openlane` 控制启动时预加载项。旧的 `LATR_CHECKPOINT`、
+`LATR_CONFIG` 继续作为 ONCE 配置兼容。切换变体时 Worker 会释放当前 GPU 模型后加载另一套结构。
+`OMNILABEL_MODEL_DEVICE` 默认
+`cuda:0`，`LATR_VISIBILITY_THRESHOLD` 默认 `0`。界面的置信度阈值过滤 query 分类概率。
+ONCE 权重仅适用于前视相机；侧视/后视相机会被明确拒绝。非 ONCE 数据、相机标定误差和
+道路域偏移都会直接影响三维结果，候选必须在 BEV 和图像投影中人工复核。
 
 ### MMDetection3D
 

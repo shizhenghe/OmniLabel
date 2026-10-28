@@ -60,7 +60,7 @@ def quaternion_transform(rotation, translation) -> np.ndarray:
 
 
 def correction_transform(raw: dict) -> np.ndarray:
-    """Interpret source projection corrections as ego-local cm/degrees."""
+    """Interpret source projection corrections as ego-local metres/degrees."""
     roll, pitch, yaw = np.deg2rad([
         float(raw.get("droll", 0)), float(raw.get("dpitch", 0)), float(raw.get("dyaw", 0)),
     ])
@@ -69,7 +69,7 @@ def correction_transform(raw: dict) -> np.ndarray:
     rz = np.asarray([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
     result = np.eye(4, dtype=np.float64)
     result[:3, :3] = rz @ ry @ rx
-    result[:3, 3] = np.asarray([raw.get("dx", 0), raw.get("dy", 0), raw.get("dz", 0)], dtype=float) / 100.0
+    result[:3, 3] = np.asarray([raw.get("dx", 0), raw.get("dy", 0), raw.get("dz", 0)], dtype=float)
     if not np.isfinite(result).all():
         raise ValueError("projection correction contains a non-finite value")
     return result
@@ -113,16 +113,21 @@ def read_pcd_header(path: Path) -> tuple[int, int]:
     return offset, count
 
 
-def convert_pcd_preview(source: Path, destination: Path, max_points: int,
+def convert_pcd_preview(source: Path, destination: Path, max_points: int | None,
                         detail_intensity: float = 60.0) -> dict:
     offset, count = read_pcd_header(source)
-    stride = max(1, math.ceil(count / max_points))
+    if max_points is not None and max_points < count:
+        raise ValueError(
+            f"refusing to sparsify {count:,} source points to {max_points:,}; "
+            "this importer must retain every supplied reconstructed-map point"
+        )
+    stride = 1
     dtype = np.dtype([("x", "<f8"), ("y", "<f8"), ("z", "<f8"), ("intensity", "<f4")])
     records = np.memmap(source, dtype=dtype, mode="r", offset=offset, shape=(count,))
     minimum = np.full(3, np.inf)
     maximum = np.full(3, -np.inf)
     intensity_min, intensity_max = np.inf, -np.inf
-    detail_indices = []
+    detail_point_count = 0
     for start in range(0, count, 250_000):
         stop = min(count, start + 250_000)
         chunk = records[start:stop]
@@ -134,30 +139,66 @@ def convert_pcd_preview(source: Path, destination: Path, max_points: int,
         maximum = np.maximum(maximum, xyz.max(axis=0))
         intensity_min = min(intensity_min, float(intensities.min()))
         intensity_max = max(intensity_max, float(intensities.max()))
-        detail_indices.append(np.flatnonzero(intensities >= detail_intensity).astype(np.int64) + start)
-    base_indices = np.arange(0, count, stride, dtype=np.int64)
-    detail = np.concatenate(detail_indices) if detail_indices else np.empty(0, dtype=np.int64)
-    selected = np.union1d(base_indices, detail)
-    output_count = len(selected)
+        local_detail = np.flatnonzero(intensities >= detail_intensity).astype(np.int64)
+        detail_point_count += len(local_detail)
+    output_count = count
     destination.parent.mkdir(parents=True, exist_ok=True)
     points = np.lib.format.open_memmap(destination, mode="w+", dtype="<f4", shape=(output_count, 4))
     for start in range(0, output_count, 250_000):
-        indices = selected[start:start + 250_000]
-        chunk = records[indices]
-        points[start:start + len(indices), 0] = chunk["x"]
-        points[start:start + len(indices), 1] = chunk["y"]
-        points[start:start + len(indices), 2] = chunk["z"]
-        points[start:start + len(indices), 3] = chunk["intensity"]
+        stop = min(output_count, start + 250_000)
+        chunk = records[start:stop]
+        points[start:stop, 0] = chunk["x"]
+        points[start:stop, 1] = chunk["y"]
+        points[start:stop, 2] = chunk["z"]
+        points[start:stop, 3] = chunk["intensity"]
     points.flush()
     return {
         "source_count": count,
         "point_count": output_count,
         "stride": stride,
         "detail_intensity": detail_intensity,
-        "detail_point_count": len(detail),
+        "detail_point_count": detail_point_count,
         "bounds": {"min": minimum.tolist(), "max": maximum.tolist()},
         "intensity_range": [intensity_min, intensity_max],
     }
+
+
+def convert_sensor_pcd(source: Path, destination: Path) -> int:
+    """Convert one binary float32 XYZI sensor scan into the store's NPY format."""
+    header = {}
+    with source.open("rb") as stream:
+        while True:
+            line = stream.readline()
+            if not line:
+                raise ValueError(f"{source}: incomplete PCD header")
+            try:
+                text = line.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{source}: DATA declaration is missing") from exc
+            if text and not text.startswith("#"):
+                key, *values = text.split()
+                header[key.upper()] = values
+            if text.upper().startswith("DATA "):
+                offset = stream.tell()
+                break
+    expected = {"FIELDS": ["x", "y", "z", "intensity"], "SIZE": ["4"] * 4,
+                "TYPE": ["F"] * 4, "COUNT": ["1"] * 4, "DATA": ["binary"]}
+    for key, value in expected.items():
+        if header.get(key) != value:
+            raise ValueError(f"{source}: unsupported sensor PCD {key} {header.get(key)!r}")
+    count = int(header.get("POINTS", ["0"])[0])
+    if count <= 0 or source.stat().st_size != offset + count * 16:
+        raise ValueError(f"{source}: sensor PCD point count or byte size is inconsistent")
+    records = np.memmap(source, dtype="<f4", mode="r", offset=offset, shape=(count, 4))
+    for start in range(0, count, 250_000):
+        if not np.isfinite(records[start:start + 250_000]).all():
+            raise ValueError(f"{source}: sensor point cloud contains non-finite values")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output = np.lib.format.open_memmap(destination, mode="w+", dtype="<f4", shape=(count, 4))
+    for start in range(0, count, 250_000):
+        output[start:start + 250_000] = records[start:start + 250_000]
+    output.flush()
+    return count
 
 
 def link_or_copy(source: Path, destination: Path):
@@ -216,8 +257,8 @@ def sync_existing_frame_annotations(data_root: Path, clip_id: str) -> dict:
 
 
 def refresh_existing_point_preview(source: Path, data_root: Path, clip_id: str,
-                                   max_points: int, detail_intensity: float) -> dict:
-    """Replace a sparse installed preview with a lane-detail-preserving one."""
+                                   max_points: int | None, detail_intensity: float) -> dict:
+    """Replace an installed point cloud while retaining every source point."""
     store = Store(data_root)
     clip = store.clip(clip_id)
     pcd_files = sorted((source / "lidar_point_cloud").glob("*.pcd"))
@@ -239,12 +280,14 @@ def refresh_existing_point_preview(source: Path, data_root: Path, clip_id: str,
         raw_clip = clip.model_dump()
         for frame in raw_clip["frames"]:
             frame["point_count"] = cloud["point_count"]
+        reduction_text = ("all source points; no sampling or filtering"
+                          if cloud["point_count"] == cloud["source_count"] else
+                          f"every {cloud['stride']}th background point plus all intensity >= {detail_intensity:g} points")
         raw_clip["description"] = (
             "50-frame, seven-camera 4D clip imported from tests/4D_clip_DATA_01_20260808160513v12. "
             "Global detection/map labels use 147 per-frame projection corrections. "
-            f"Interactive cloud keeps every {cloud['stride']}th background point plus all "
-            f"{cloud['detail_point_count']:,} points with intensity >= {detail_intensity:g}, preserving lane-marking detail "
-            f"from the supplied {cloud['source_count']:,}-point reconstructed map."
+            f"Interactive cloud uses {reduction_text} from the supplied "
+            f"{cloud['source_count']:,}-point reconstructed map."
         )
         updated = Clip.model_validate(raw_clip)
         atomic_json(data_root / "clips" / f"{clip_id}.json", updated.model_dump())
@@ -259,7 +302,10 @@ def refresh_existing_point_preview(source: Path, data_root: Path, clip_id: str,
         metadata = load_json(map_path)
         metadata.update(
             point_count=cloud["point_count"], bounds=cloud["bounds"],
-            point_reduction=(f"all intensity >= {detail_intensity:g} plus deterministic source-order "
+            source_map="supplied",
+            point_reduction=("none; all supplied reconstructed points retained"
+                             if cloud["point_count"] == cloud["source_count"] else
+                             f"all intensity >= {detail_intensity:g} plus deterministic source-order "
                              f"background stride {cloud['stride']}"),
             intensity_range=cloud["intensity_range"], input_point_count=cloud["source_count"],
             output_truncated=cloud["point_count"] < cloud["source_count"],
@@ -272,8 +318,8 @@ def refresh_existing_point_preview(source: Path, data_root: Path, clip_id: str,
         temporary_scene.unlink(missing_ok=True)
 
 
-def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int,
-                detail_intensity: float) -> dict:
+def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int | None,
+                detail_intensity: float, calibration_pointcloud_dir: Path | None = None) -> dict:
     pose_files = sorted((source / "global_pose").glob("*.json"))
     if len(pose_files) != 1:
         raise ValueError("global_pose must contain exactly one JSON file")
@@ -319,6 +365,20 @@ def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int,
             configs = config_by_stem[stem]
             if not isinstance(configs, list) or len(configs) != len(CAMERAS):
                 raise ValueError(f"{stem}: expected seven camera configurations")
+            calibration_fields = {}
+            if calibration_pointcloud_dir is not None:
+                sensor_source = calibration_pointcloud_dir / f"{item['source_frame_name']}.pcd"
+                if not sensor_source.is_file():
+                    raise ValueError(f"missing synchronized calibration scan {sensor_source}")
+                sensor_relative = f"{clip_id}/calibration/{frame_id}.npy"
+                sensor_count = convert_sensor_pcd(sensor_source, staged_points / "calibration" / f"{frame_id}.npy")
+                calibration_fields = {
+                    "calibration_pointcloud_file": sensor_relative,
+                    "calibration_point_count": sensor_count,
+                    "calibration_lidar_to_ego": matrix_list(quaternion_transform(
+                        item["lidar_calib"]["rotation"], item["lidar_calib"]["translation"])),
+                    "calibration_timestamp": int(item["lidar_timestamp_us"]) / 1_000_000,
+                }
             images, annotation_transforms = {}, {}
             for camera_index, (camera_id, _, _) in enumerate(CAMERAS):
                 image = image_dirs[camera_index] / f"{stem}.jpg"
@@ -354,6 +414,7 @@ def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int,
                 "point_count": cloud["point_count"],
                 "images": images,
                 "annotation_camera_from_lidar": annotation_transforms,
+                **calibration_fields,
             })
 
         for frame_index, item in enumerate(frame_items):
@@ -380,15 +441,20 @@ def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int,
 
         diffs = np.diff(np.asarray(timestamps, dtype=np.float64)) / 1_000_000
         fps = float(1 / np.median(diffs)) if len(diffs) else 1.0
+        reduction_text = ("all source points with no sampling or filtering"
+                          if cloud["point_count"] == cloud["source_count"] else
+                          f"every {cloud['stride']}th background point plus all "
+                          f"intensity >= {detail_intensity:g} detail points")
         clip = Clip.model_validate({
             "id": clip_id,
             "name": "4D DATA_01 20260808160513 v12",
             "description": (
                 "50-frame, seven-camera 4D clip imported from tests/4D_clip_DATA_01_20260808160513v12. "
                 f"Global detection/map labels use {correction_count} per-frame projection corrections. "
-                f"Interactive point-cloud preview retains every {cloud['stride']}th background point and all "
-                f"intensity >= {detail_intensity:g} detail points from the supplied "
+                f"Interactive point cloud uses {reduction_text} from the supplied "
                 f"{cloud['source_count']:,}-point reconstructed map."
+                + (" Automatic image/LiDAR calibration uses exact-timestamp single sensor scans."
+                   if calibration_pointcloud_dir is not None else "")
             ),
             "fps": fps, "cameras": cameras, "frames": frames, "source": "4d-clip-import",
         })
@@ -452,12 +518,15 @@ def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int,
             "coordinate_frame": "world", "frame_count": len(frames), "point_count": cloud["point_count"],
             "trajectory": [],
             "bounds": cloud["bounds"], "method": "supplied reconstructed local-world map",
+            "source_map": "supplied",
             "voxel_size": float(pose_data.get("map_voxel_m", 0.1)),
             "registration": {"method": "supplied-global-poses", "successful_frames": len(frames)},
             "exclude_dynamic": True, "fusion_version": FUSION_VERSION, "preserve_detail": True,
             "detail_voxel_size": float(pose_data.get("map_voxel_m", 0.1)),
             "effective_voxel_size": float(pose_data.get("map_voxel_m", 0.1)),
-            "point_reduction": (f"all intensity >= {detail_intensity:g} plus deterministic source-order "
+            "point_reduction": ("none; all supplied reconstructed points retained"
+                                if cloud["point_count"] == cloud["source_count"] else
+                                f"all intensity >= {detail_intensity:g} plus deterministic source-order "
                                 f"background stride {cloud['stride']}"),
             "intensity_available": True,
             "intensity_has_contrast": cloud["intensity_range"][1] > cloud["intensity_range"][0],
@@ -495,37 +564,126 @@ def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int,
         shutil.rmtree(staged_root, ignore_errors=True)
 
 
+def install_calibration_scans(source: Path, calibration_pointcloud_dir: Path,
+                              data_root: Path, clip_id: str) -> dict:
+    """Attach exact-timestamp sensor scans to an installed fused-map clip."""
+    pose_files = sorted((source / "global_pose").glob("*.json"))
+    if len(pose_files) != 1:
+        raise ValueError("global_pose must contain exactly one JSON file")
+    frame_items = load_json(pose_files[0]).get("frame_items")
+    store = Store(data_root)
+    clip = store.source_clip(clip_id)
+    if not isinstance(frame_items, list) or len(frame_items) != len(clip.frames):
+        raise ValueError("global pose frames do not match the installed clip")
+    destination = data_root / "pointclouds" / clip_id / "calibration"
+    if destination.exists():
+        raise FileExistsError(f"calibration scans already exist for {clip_id}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".calibration-", dir=destination.parent))
+    installed = False
+    published = False
+    counts = []
+    try:
+        raw = clip.model_dump()
+        first_timestamp = int(frame_items[0]["lidar_timestamp_us"])
+        for index, (frame, item) in enumerate(zip(raw["frames"], frame_items)):
+            expected_id = f"frame-{index:03d}"
+            timestamp = int(item["lidar_timestamp_us"])
+            if int(item["source_frame_name"].rsplit("_", 1)[-1]) != timestamp:
+                raise ValueError(f"source frame name timestamp does not match {timestamp}")
+            if frame["id"] != expected_id or not np.isclose(
+                    frame["timestamp"], (timestamp - first_timestamp) / 1_000_000, atol=1e-6):
+                raise ValueError(f"installed frame {frame['id']} does not match source timestamp")
+            source_scan = calibration_pointcloud_dir / f"{item['source_frame_name']}.pcd"
+            if not source_scan.is_file():
+                raise ValueError(f"missing exact-timestamp scan {source_scan}")
+            count = convert_sensor_pcd(source_scan, staging / f"{expected_id}.npy")
+            counts.append(count)
+            frame.update(
+                calibration_pointcloud_file=f"{clip_id}/calibration/{expected_id}.npy",
+                calibration_point_count=count,
+                calibration_lidar_to_ego=matrix_list(quaternion_transform(
+                    item["lidar_calib"]["rotation"], item["lidar_calib"]["translation"])),
+                calibration_timestamp=timestamp / 1_000_000,
+            )
+        note = " Automatic image/LiDAR calibration uses exact-timestamp single sensor scans."
+        if note.strip() not in raw["description"]:
+            raw["description"] += note
+        updated = Clip.model_validate(raw)
+        os.replace(staging, destination)
+        installed = True
+        atomic_json(data_root / "clips" / f"{clip_id}.json", updated.model_dump())
+        published = True
+
+        # Only the calibration input changed. Keep the supplied scene map and
+        # its identity registration valid instead of forcing a map rebuild.
+        refreshed_store = Store(data_root)
+        from omnilabel.scene import _clip_fingerprint
+        poses_path = data_root / "scene_poses" / f"{clip_id}.json"
+        if poses_path.is_file():
+            poses = load_json(poses_path)
+            poses["clip_fingerprint"] = _clip_fingerprint(refreshed_store, updated)
+            atomic_json(poses_path, poses)
+        map_path = data_root / "scene_maps" / f"{clip_id}.json"
+        if map_path.is_file():
+            metadata = load_json(map_path)
+            metadata["source_fingerprint"] = source_fingerprint(refreshed_store, updated)
+            atomic_json(map_path, metadata)
+        return {"clip_id": clip_id, "frames": len(counts), "point_count": sum(counts),
+                "minimum_points_per_frame": min(counts), "maximum_points_per_frame": max(counts),
+                "input": "exact-timestamp single sensor scans"}
+    except Exception:
+        if published:
+            atomic_json(data_root / "clips" / f"{clip_id}.json", clip.model_dump())
+        if installed:
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("--data-root", type=Path, default=ROOT / "data")
     parser.add_argument("--clip-id", default="4d-clip-data-01-20260808160513-v12")
-    parser.add_argument("--max-preview-points", type=int, default=750_000)
+    parser.add_argument("--max-preview-points", type=int, default=None,
+                        help="optional safety cap; must be at least the source point count because sampling is disabled")
     parser.add_argument("--detail-intensity", type=float, default=60.0,
                         help="retain every point at or above this intensity in addition to the background preview")
     parser.add_argument("--sync-frame-annotations", action="store_true",
                         help="mirror scene labels into empty per-frame annotations of an installed clip")
     parser.add_argument("--refresh-point-preview", action="store_true",
                         help="replace an installed sparse preview with a lane-detail-preserving preview")
+    parser.add_argument("--calibration-pointcloud-dir", type=Path,
+                        help="directory containing exact-timestamp float32 XYZI PCD sensor scans")
+    parser.add_argument("--install-calibration-scans", action="store_true",
+                        help="attach synchronized sensor scans to an already installed fused-map clip")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.max_preview_points <= 0:
+    if args.max_preview_points is not None and args.max_preview_points <= 0:
         raise SystemExit("--max-preview-points must be positive")
     clip_id = safe_id(args.clip_id)
-    if args.sync_frame_annotations and args.refresh_point_preview:
+    if sum((args.sync_frame_annotations, args.refresh_point_preview, args.install_calibration_scans)) > 1:
         raise SystemExit("choose only one maintenance action")
+    if args.install_calibration_scans and args.calibration_pointcloud_dir is None:
+        raise SystemExit("--install-calibration-scans requires --calibration-pointcloud-dir")
     if not np.isfinite(args.detail_intensity):
         raise SystemExit("--detail-intensity must be finite")
-    result = (sync_existing_frame_annotations(args.data_root.resolve(), clip_id)
+    result = (install_calibration_scans(args.source.resolve(), args.calibration_pointcloud_dir.resolve(),
+                                        args.data_root.resolve(), clip_id)
+              if args.install_calibration_scans else
+              sync_existing_frame_annotations(args.data_root.resolve(), clip_id)
               if args.sync_frame_annotations else
               refresh_existing_point_preview(args.source.resolve(), args.data_root.resolve(), clip_id,
                                              args.max_preview_points, args.detail_intensity)
               if args.refresh_point_preview else
               build_scene(args.source.resolve(), clip_id, args.data_root.resolve(), args.max_preview_points,
-                          args.detail_intensity))
+                          args.detail_intensity,
+                          args.calibration_pointcloud_dir.resolve() if args.calibration_pointcloud_dir else None))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

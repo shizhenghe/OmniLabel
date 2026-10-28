@@ -81,16 +81,27 @@ def _clip_fingerprint(store: Store, clip: Clip) -> str:
     return sha256(json.dumps(token, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def source_fingerprint(store: Store, clip: Clip) -> str:
-    """Cheap on repeated reads; saved scans are immutable and annotations atomic."""
+def _source_fingerprint(store: Store, clip: Clip, *, include_inode: bool) -> str:
     tokens = [_clip_fingerprint(store, clip)]
     for path in [_scene_path(store, clip.id)] + [store.root / "annotations" / clip.id / f"{f.id}.json" for f in clip.frames]:
         if path.exists():
             stat = path.stat()
-            tokens.append([path.name, stat.st_size, stat.st_mtime_ns])
+            # Atomic publication replaces the inode. Equal-sized edits can
+            # share a timestamp on some filesystems and must still conflict.
+            tokens.append([path.name, *([stat.st_ino] if include_inode else []), stat.st_size, stat.st_mtime_ns])
         else:
             tokens.append([path.name, None])
     return sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest()
+
+
+def legacy_source_fingerprint(store: Store, clip: Clip) -> str:
+    """Validate maps saved before atomic annotation identity was included."""
+    return _source_fingerprint(store, clip, include_inode=False)
+
+
+def source_fingerprint(store: Store, clip: Clip) -> str:
+    """Cheap on repeated reads; saved scans are immutable and annotations atomic."""
+    return "v2:" + _source_fingerprint(store, clip, include_inode=True)
 
 
 def _heading(yaw: float, transform: np.ndarray) -> float:
@@ -415,8 +426,15 @@ def get_scene_map(store: Store, clip: Clip, *, max_points: int | None = None,
         value = json.loads(path.read_text())
         if value.get("fusion_version") != FUSION_VERSION:
             raise KeyError("Scene fusion profile changed; reconstruct the scene map to retain measured surface detail")
-        if value.get("source_fingerprint") != source_fingerprint(store, clip):
-            raise KeyError("Scene source annotations changed; reconstruct the scene map to refresh dynamic filtering")
+        supplied_map = (value.get("source_map") == "supplied" or
+                        value.get("method") == "supplied reconstructed local-world map")
+        if not supplied_map:
+            saved_token = value.get("source_fingerprint")
+            current_token = source_fingerprint(store, clip)
+            legacy_match = (isinstance(saved_token, str) and not saved_token.startswith("v2:")
+                            and saved_token == legacy_source_fingerprint(store, clip))
+            if saved_token != current_token and not legacy_match:
+                raise KeyError("Scene source annotations changed; reconstruct the scene map to refresh dynamic filtering")
         if not include_points:
             value.pop("points", None)
             value.pop("pointcloud_file", None)

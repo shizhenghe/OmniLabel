@@ -24,6 +24,7 @@ MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 24 * 1024 * 1024
 TIMEOUT = httpx.Timeout(connect=10, read=120, write=60, pool=5)
+MONOCULAR_FRAME_MODELS = frozenset({"latr"})
 
 
 class InferenceError(RuntimeError):
@@ -60,7 +61,7 @@ def validate_worker_url(value: str) -> str:
 
 
 def _worker_url(model_id: str | None = None, endpoint: str | None = None) -> str:
-    names = {"sam2": "SAM2", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
+    names = {"sam2": "SAM2", "latr": "LATR", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
     if endpoint is None:
         prefix = names.get(model_id)
         endpoint = os.environ.get(f"OMNILABEL_{prefix}_URL", "") if prefix else ""
@@ -147,13 +148,33 @@ def infer_proposal(
     except (ValidationError, ValueError, KeyError, TypeError):
         raise InferenceError("Current frame or annotation data is invalid for model inference.") from None
     outbound_frame = frame_model.model_dump()
+    outbound_cameras = cameras
+    if model_id in MONOCULAR_FRAME_MODELS:
+        camera_id = (options or {}).get("camera_id")
+        if model_id == "latr" and not camera_id:
+            raise InferenceError("LATR requires one selected camera image.")
+        if camera_id:
+            selected_camera = next((camera for camera in cameras if camera.id == camera_id), None)
+            if selected_camera is None or camera_id not in frame_model.images:
+                raise InferenceError("The selected camera image is unavailable for model inference.")
+            # Monocular workers need only the active image and its calibration.
+            # Do this before base64 embedding: sending every camera can inflate a
+            # seven-camera frame beyond the worker's bounded request size.
+            outbound_cameras = [selected_camera]
+            outbound_frame["images"] = {camera_id: frame_model.images[camera_id]}
+            for field in ("annotation_camera_from_lidar", "projection_camera_from_lidar"):
+                outbound_frame[field] = ({camera_id: outbound_frame[field][camera_id]}
+                                         if camera_id in outbound_frame[field] else {})
+        # Image-only inference must never serialize a materialized LiDAR scan.
+        outbound_frame["points"] = []
+        outbound_frame["pointcloud_file"] = None
     try:
         outbound_frame["images"] = _outbound_images(outbound_frame, assets_root)
     except OSError:
         raise InferenceError("A camera image could not be read for model inference.") from None
     payload = {
         "schema_version": "1.0", "model_id": model_id, "prompt": prompt,
-        "clip": {"id": clip["id"], "cameras": [camera.model_dump() for camera in cameras]},
+        "clip": {"id": clip["id"], "cameras": [camera.model_dump() for camera in outbound_cameras]},
         "frame": outbound_frame, "annotations": current.model_dump(),
     }
     if options:
@@ -168,7 +189,7 @@ def infer_proposal(
         raise InferenceError("Worker request exceeds 64 MiB; resize images or split the frame.")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if token is None:
-        names = {"sam2": "SAM2", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
+        names = {"sam2": "SAM2", "latr": "LATR", "mmdetection3d": "MMDET3D", "openoccupancy": "OPENOCCUPANCY"}
         prefix = names.get(model_id)
         token = os.environ.get(f"OMNILABEL_{prefix}_TOKEN", os.environ.get("OMNILABEL_INFERENCE_TOKEN", "")) if prefix else os.environ.get("OMNILABEL_INFERENCE_TOKEN", "")
     if token:
@@ -211,6 +232,9 @@ def infer_proposal(
         "model_version": model_version, "review_required": True,
         "source": "external-worker",
     }
+    weight_variant = result.get("weight_variant")
+    if weight_variant in ("once", "openlane"):
+        output["weight_variant"] = weight_variant
     if "occupancy" in result:
         output["occupancy"] = validate_occupancy(result["occupancy"])
     warnings = result.get("warnings", [])

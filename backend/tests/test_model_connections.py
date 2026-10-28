@@ -9,7 +9,7 @@ from omnilabel.main import create_app
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    for suffix in ("INFERENCE", "SAM2", "MMDET3D", "OPENOCCUPANCY"):
+    for suffix in ("INFERENCE", "SAM2", "LATR", "MMDET3D", "OPENOCCUPANCY"):
         monkeypatch.delenv(f"OMNILABEL_{suffix}_URL", raising=False)
     with TestClient(create_app(tmp_path, seed_demo=False)) as client:
         yield client
@@ -26,6 +26,7 @@ def test_model_endpoints_persist_independently_and_disable_environment_fallback(
         values = {c["model_id"]: c for c in reopened.get("/api/model-connections").json()["connections"]}
         assert values["sam2"]["endpoint"] == "http://127.0.0.1:9101/predict"
         assert values["mmdetection3d"]["endpoint"] == "https://lidar.example/v1/predict"
+        assert not values["latr"]["configured"]
         assert not values["openoccupancy"]["configured"]
     result = client.put("/api/model-connections", json={"connections": [{"model_id": "sam2", "endpoint": ""}]})
     assert not result.json()["connections"][0]["configured"]

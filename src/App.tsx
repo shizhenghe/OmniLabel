@@ -2,15 +2,17 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {CameraView} from './components/CameraView';
 import {PointCloudView} from './components/PointCloudView';
 import {CalibrationEditor, type CalibrationDocument} from './components/CalibrationEditor';
-import {applyCalibration} from './geometry/calibration';
-import {projectFramePoints} from './geometry/liveProjection';
+import {ProjectionCalibrationEditor, type ProjectionCalibrationDocument, type ProjectionCorrespondence, type ProjectionPickMode} from './components/ProjectionCalibrationEditor';
+import {AutomaticCalibrationPanel} from './components/AutomaticCalibrationPanel';
+import {applyCalibration, type Matrix4} from './geometry/calibration';
+import {projectFramePoints, projectMapPreview} from './geometry/liveProjection';
 import {Icon, type IconName} from './components/Icon';
-import {request, jsonRequest, download} from './api';
+import {request, requestPointNpy, jsonRequest, download} from './api';
 import {annotationId} from './ids';
 import {loadPlaybackFrame, type PlaybackFrame} from './playback';
 import {useClipPlayback} from './useClipPlayback';
 import {reviewWorldAnnotations} from './reviewAnnotations';
-import {EMPTY_ANNOTATIONS as EMPTY, IDENTITY, evaluateScene, evaluateTrack, sceneInLidar, transformBox, transformPoint, upsertKeyframe, worldFromLidar} from './scene';
+import {EMPTY_ANNOTATIONS as EMPTY, IDENTITY, evaluateScene, evaluateTrack, inverseRigid, sceneInLidar, transformBox, transformPoint, upsertKeyframe, worldFromLidar} from './scene';
 import type {Annotations, Box, Clip, ClipSummary, Frame, ModelConnection, ModelInfo, SceneAnnotations, SceneMap, SceneTrack, Vec3, Voxel} from './types';
 
 const tasks: {id: string; name: string; short: string; icon: IconName; subtitle: string}[] = [
@@ -25,13 +27,26 @@ const tasks: {id: string; name: string; short: string; icon: IconName; subtitle:
 const objectClasses = [{id: 'vehicle', name: '车辆', color: '#37ddbf'}, {id: 'car', name: '汽车', color: '#37ddbf'}, {id: 'truck', name: '卡车', color: '#fbad5c'}, {id: 'pedestrian', name: '行人', color: '#f476aa'}, {id: 'cyclist', name: '骑行者', color: '#aa96ff'}, {id: 'unknown', name: '未知目标', color: '#ff3b5c'}];
 const semanticClasses = [{id: 'road', name: '路面', color: '#65acff'}, {id: 'vehicle', name: '车辆', color: '#37ddbf'}, {id: 'building', name: '建筑', color: '#c39dff'}, {id: 'vegetation', name: '植被', color: '#a3d465'}, {id: 'pedestrian', name: '行人', color: '#f476aa'}, {id: 'unlabeled', name: '未分类', color: '#98a8b8'}];
 const vectorClasses = [{id: 'lane', name: '车道线', color: '#f7d16a'}, {id: 'lane_solid', name: '实线', color: '#f7d16a'}, {id: 'lane_dashed', name: '虚线', color: '#f7d16a'}, {id: 'road_boundary', name: '道路边界', color: '#37ddbf'}, {id: 'stop_line', name: '停止线', color: '#f476aa'}, {id: 'crosswalk', name: '人行横道', color: '#aa96ff'}, {id: 'direction_arrow', name: '导向箭头轮廓', color: '#aa96ff'}];
-const modelNames: Record<string, string> = {sam2: 'SAM2 · 图像分割', mmdetection3d: 'MMDetection3D · 三维检测', openoccupancy: 'OpenOccupancy · 语义占用'};
+const modelNames: Record<string, string> = {sam2: 'SAM2 · 图像分割', latr: 'LATR · 三维车道线', mmdetection3d: 'MMDetection3D · 三维检测', openoccupancy: 'OpenOccupancy · 语义占用'};
 type Tool = 'select' | 'box' | 'vector' | 'brush';
 type JobView = {id: string; kind: string; status: string; error?: string; result?: Record<string, unknown>};
-type Proposal = {annotations: Annotations; frameId: string; clipId: string; revision: number; sceneRevision: number; sceneMode: boolean; model: string; occupancy?: {voxels: Voxel[]; voxel_size: number; voxel_dimensions?: Vec3}; warnings?: string[]};
+type Proposal = {annotations: Annotations; frameId: string; clipId: string; revision: number; sceneRevision: number; sceneMode: boolean; model: string; weightVariant?: string; occupancy?: {voxels: Voxel[]; voxel_size: number; voxel_dimensions?: Vec3}; warnings?: string[]};
 const uid = annotationId;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const modelStatus = (model?: ModelInfo) => model?.available ? '推理就绪' : model?.status_detail || model?.reason || (model?.configured ? '服务未就绪，请检查部署' : '尚未配置推理服务');
+
+async function loadCachedSceneMap(id: string): Promise<SceneMap | null> {
+  const encoded = encodeURIComponent(id);
+  const response = await fetch(`/api/clips/${encoded}/scene/map?include_points=false`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`读取场景地图失败 HTTP ${response.status}`);
+  const metadata = await response.json() as Omit<SceneMap, 'points'>;
+  const pointBuffer = await requestPointNpy(`/clips/${encoded}/scene/map.npy`);
+  if (pointBuffer.length / 4 !== metadata.point_count) {
+    throw new Error(`场景点云数量不一致：元数据 ${metadata.point_count}，二进制 ${pointBuffer.length / 4}`);
+  }
+  return {...metadata, points: [], point_buffer: pointBuffer};
+}
 
 export default function App() {
   const [clips, setClips] = useState<ClipSummary[]>([]);
@@ -42,9 +57,19 @@ export default function App() {
   const [sceneMap, setSceneMap] = useState<SceneMap | null>(null);
   const [registeredMatrices, setRegisteredMatrices] = useState<Record<string, number[][]>>({});
   const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [automaticCalibrationOpen, setAutomaticCalibrationOpen] = useState(false);
   const [calibrationDirty, setCalibrationDirty] = useState(false);
   const [calibrationPreview, setCalibrationPreview] = useState<CalibrationDocument | null>(null);
   const calibrationBase = useRef<CalibrationDocument | null>(null);
+  const calibrationClipBase = useRef<Clip | null>(null);
+  const [projectionOpen, setProjectionOpen] = useState(false);
+  const [projectionDirty, setProjectionDirty] = useState(false);
+  const [projectionBusy, setProjectionBusy] = useState(false);
+  const [projectionPickMode, setProjectionPickMode] = useState<ProjectionPickMode>(null);
+  const [projectionPickedPoint, setProjectionPickedPoint] = useState<Vec3 | null>(null);
+  const [projectionPickedPixel, setProjectionPickedPixel] = useState<[number, number] | null>(null);
+  const [projectionPreview, setProjectionPreview] = useState<{clipId: string; frameId: string; cameraId: string; matrix: Matrix4} | null>(null);
+  const [projectionAnchors, setProjectionAnchors] = useState<{anchors: ProjectionCorrespondence[]; pending: Vec3 | null; selected: string | null}>({anchors: [], pending: null, selected: null});
   const [sceneMode, setSceneMode] = useState(true);
   const [frameDirty, setFrameDirty] = useState(false);
   const [sceneDirty, setSceneDirty] = useState(false);
@@ -102,6 +127,7 @@ export default function App() {
   const [occupancy, setOccupancy] = useState<{frameId: string; voxels: Voxel[]; size: number; dimensions?: Vec3} | null>(null);
   const [workerModel, setWorkerModel] = useState('sam2');
   const [workerLabel, setWorkerLabel] = useState('road');
+  const [latrWeight, setLatrWeight] = useState<'once' | 'openlane'>('once');
   const [scoreThreshold, setScoreThreshold] = useState(0.3);
   const [modelList, setModelList] = useState<ModelInfo[] | null>(null);
   const [connections, setConnections] = useState<ModelConnection[]>([]);
@@ -124,12 +150,15 @@ export default function App() {
   const editGeneration = useRef(0);
   const runningJob = useRef(false);
   const runningReconstruction = useRef(false);
-  const frame = clip?.frames[frameIndex] ?? null;
+  const sourceFrame = clip?.frames[frameIndex] ?? null;
+  const frame = useMemo(() => sourceFrame && projectionPreview && projectionPreview.clipId === clip?.id && projectionPreview.frameId === sourceFrame.id
+    ? {...sourceFrame, projection_camera_from_lidar: {...sourceFrame.projection_camera_from_lidar, [projectionPreview.cameraId]: projectionPreview.matrix}} : sourceFrame,
+  [sourceFrame, projectionPreview, clip?.id]);
   const dirty = frameDirty || sceneDirty;
   const busy = loading || saving || reviewStarting;
   const jobBusy = job?.status === 'running' || job?.status === 'queued';
   const reconstructing = reconstruction?.status === 'running' || reconstruction?.status === 'queued';
-  const editBlocked = reviewing || busy || jobBusy || !clip || !frame || (sceneMode && !scene);
+  const editBlocked = reviewing || busy || jobBusy || projectionOpen || automaticCalibrationOpen || !clip || !frame || (sceneMode && !scene);
   const currentKey = clip && frame ? `${clip.id}/${frame.id}` : '';
   context.current = currentKey;
   clipContext.current = clip?.id ?? '';
@@ -144,20 +173,36 @@ export default function App() {
   const usingSceneMap = Boolean(sceneMap && !calibrationLidarPreview && (!reviewing || playbackCloud === 'scene'));
   const reviewAnnotations = useMemo(() => reviewing && frame ? reviewWorldAnnotations(worldAnnotations, annotations, frame, coordinateMap) : worldAnnotations,
     [reviewing, worldAnnotations, annotations, frame, coordinateMap]);
-  const projections = useMemo(() => rawProjection && clip && frame ? projectFramePoints(frame, clip.cameras) : {},
-    [rawProjection, clip?.cameras, frame?.points, frame?.lidar_to_ego]);
+  const projections = useMemo(() => {
+    if (!rawProjection || !clip || !frame) return {};
+    if (!frame.points.length && sceneMap?.point_buffer) {
+      const camera = clip.cameras.find(item => item.id === activeCamera);
+      return camera ? {[camera.id]: projectMapPreview(frame, camera, sceneMap.point_buffer, inverseRigid(worldFromLidar(frame, coordinateMap)))} : {};
+    }
+    return projectFramePoints(frame, clip.cameras);
+  }, [rawProjection, clip?.cameras, frame?.points, frame?.lidar_to_ego, frame?.projection_camera_from_lidar, frame?.annotation_camera_from_lidar, sceneMap?.point_buffer, activeCamera, coordinateMap]);
   const imageAnnotations = useMemo(() => {
     if (!sceneMode || !frame) return annotations;
     return {...sceneInLidar(reviewAnnotations, frame, coordinateMap), image_polygons: annotations.image_polygons, point_labels: annotations.point_labels};
   }, [sceneMode, reviewAnnotations, frame, coordinateMap, annotations]);
   const sceneFrame = useMemo<Frame | null>(() => {
-    if (sceneMap && usingSceneMap) return {id: 'scene-world', timestamp: 0, ego_to_world: IDENTITY, lidar_to_ego: IDENTITY, points: sceneMap.points, point_count: sceneMap.rendered_point_count ?? sceneMap.points.length, images: {}};
+    if (sceneMap && usingSceneMap) return {id: 'scene-world', timestamp: 0, ego_to_world: IDENTITY, lidar_to_ego: IDENTITY, points: [], point_count: sceneMap.point_count, images: {}};
     if (!frame) return null;
     const matrix = worldFromLidar(frame, coordinateMap);
     return {...frame, id: `world-${frame.id}`, ego_to_world: IDENTITY, lidar_to_ego: IDENTITY,
       points: frame.points.map(point => [...transformPoint(point, matrix), point[3] ?? 0])};
   }, [sceneMap, frame, coordinateMap, usingSceneMap]);
   const renderedAnnotations = sceneMode ? {...reviewAnnotations, point_labels: usingSceneMap ? sceneMap?.point_labels ?? {} : annotations.point_labels} : annotations;
+  const projectionMarkers = useMemo(() => {
+    if (!projectionOpen || !frame) return [];
+    const matrix = sceneMode ? worldFromLidar(frame, coordinateMap) : IDENTITY;
+    const markers = projectionAnchors.anchors.map((anchor, index) => ({id: anchor.id, point: transformPoint(anchor.point, matrix),
+      label: String(index + 1), selected: projectionAnchors.selected === anchor.id, enabled: anchor.enabled}));
+    if (projectionAnchors.pending) markers.push({id: '__pending__', point: transformPoint(projectionAnchors.pending, matrix), label: '+', selected: true, enabled: true});
+    return markers;
+  }, [projectionOpen, projectionAnchors, frame, coordinateMap, sceneMode]);
+  const cameraProjectionAnchors = useMemo(() => projectionOpen ? projectionAnchors.anchors.map((anchor, index) => ({...anchor,
+    label: String(index + 1), selected: projectionAnchors.selected === anchor.id})) : [], [projectionOpen, projectionAnchors]);
   const selectedBox = renderedAnnotations.boxes.find(b => b.id === selectedId);
   const selectedVector = renderedAnnotations.vectors.find(v => v.id === selectedId);
   const selectedPolygon = annotations.image_polygons.find(p => p.id === selectedId);
@@ -169,7 +214,19 @@ export default function App() {
   const groundZ = sceneMode ? sceneGroundZ : frameGroundZ;
   const vectorTask = task === 'lane' || task === 'vector';
   const closedDraft = classId === 'crosswalk' || classId === 'direction_arrow';
+  const displayedPointBuffer = (usingSceneMap || (!sceneMode && clip?.source === '4d-clip-import')) ? sceneMap?.point_buffer : undefined;
   const surfaceInfo = useMemo(() => {
+    if (displayedPointBuffer) {
+      if (!groundOnly) return {count: displayedPointBuffer.length / 4, contrast: sceneMap?.intensity_has_contrast ?? true};
+      let min = Infinity, max = -Infinity, count = 0;
+      for (let offset = 0; offset < displayedPointBuffer.length; offset += 4) {
+        if (Math.abs(displayedPointBuffer[offset + 2] - groundZ) > groundBand) continue;
+        count++;
+        const intensity = displayedPointBuffer[offset + 3];
+        if (Number.isFinite(intensity)) {min = Math.min(min, intensity); max = Math.max(max, intensity);}
+      }
+      return {count, contrast: Number.isFinite(min) && max - min > 1e-6};
+    }
     const points = sceneMode ? sceneFrame?.points : frame?.points;
     let min = Infinity, max = -Infinity, count = 0;
     for (const p of points ?? []) {
@@ -178,9 +235,30 @@ export default function App() {
       if (p.length > 3 && Number.isFinite(p[3])) {min = Math.min(min, p[3]); max = Math.max(max, p[3]);}
     }
     return {count, contrast: Number.isFinite(min) && max - min > 1e-6};
-  }, [sceneMode, sceneFrame?.points, frame?.points, groundOnly, groundZ, groundBand]);
+  }, [displayedPointBuffer, sceneMap?.intensity_has_contrast, sceneMode, sceneFrame?.points, frame?.points, groundOnly, groundZ, groundBand]);
 
   const flash = useCallback((message: string, error = false) => setNotice({message, error}), []);
+  const projectionScope = useRef({clipId: '', frameId: '', cameraId: ''});
+  projectionScope.current = {clipId: clip?.id ?? '', frameId: sourceFrame?.id ?? '', cameraId: activeCamera};
+  const previewProjection = useCallback((matrix: Matrix4 | null) => {
+    setProjectionPreview(matrix ? {...projectionScope.current, matrix} : null);
+  }, []);
+  const consumeProjectionPick = useCallback(() => {setProjectionPickedPoint(null); setProjectionPickedPixel(null);}, []);
+  const changeProjectionAnchors = useCallback((anchors: ProjectionCorrespondence[], pending: Vec3 | null, selected: string | null) => {
+    setProjectionAnchors({anchors, pending, selected});
+  }, []);
+  const savedProjection = useCallback((document: ProjectionCalibrationDocument) => {
+    setClip(current => current?.id === document.clip_id ? {...current, frames: current.frames.map(item => {
+      if (item.id !== document.frame_id) return item;
+      const matrices = {...item.projection_camera_from_lidar};
+      const matrix = document.projection_matrix ?? document.saved_matrix;
+      if (matrix) matrices[document.camera_id] = matrix;
+      else delete matrices[document.camera_id];
+      return {...item, projection_camera_from_lidar: matrices};
+    })} : current);
+    setProjectionDirty(false);
+    flash('当前帧相机投影已保存，点云与三维标注共用该修正。');
+  }, [flash]);
   useEffect(() => {if (!notice) return; const timer = setTimeout(() => setNotice(null), notice.error ? 10000 : 5000); return () => clearTimeout(timer);}, [notice]);
   const refreshModels = useCallback(async () => {
     const [catalog, config] = await Promise.all([request<{models: ModelInfo[]}>('/models'), request<{connections: ModelConnection[]}>('/model-connections')]);
@@ -205,9 +283,10 @@ export default function App() {
       if (generation !== clipGeneration.current) return;
       const [updated, rebuiltMap] = await Promise.all([
         request<SceneAnnotations>(`/clips/${encodeURIComponent(id)}/scene/annotations`),
-        next.result?.points ? Promise.resolve(next.result as unknown as SceneMap) : request<SceneMap>(`/clips/${encodeURIComponent(id)}/scene/map`),
+        loadCachedSceneMap(id),
       ]);
       if (generation !== clipGeneration.current) return;
+      if (!rebuiltMap) throw new Error('重建已完成，但场景地图文件不存在');
       setSceneMap(rebuiltMap);
       setPreserveDetail(detail); setDetailVoxelSize(detailSize); setVoxelSize(size);
       setFusionMode(fusion);
@@ -224,22 +303,26 @@ export default function App() {
     ++frameGeneration.current;
     seekController.current?.abort(); setReviewing(false); setPreparedFrame(null); setBuffering(false); setPlaybackSession(value => value + 1);
     setCalibrationOpen(false); setCalibrationDirty(false); setCalibrationPreview(null); calibrationBase.current = null;
+    setAutomaticCalibrationOpen(false);
+    calibrationClipBase.current = null;
+    setProjectionOpen(false); setProjectionDirty(false); setProjectionBusy(false); setProjectionPreview(null); setProjectionPickMode(null);
+    setProjectionPickedPoint(null); setProjectionPickedPixel(null);
     setPlaying(false); setLoading(true); seekController.current = null; setSceneMap(null); setRegisteredMatrices({}); setReconstruction(null); setModelPromptMode(null);
     try {
       const next = await request<Clip>(`/clips/${encodeURIComponent(id)}`);
-      const [labels, sceneLabels, framePoints, mapResponse, registrationResponse] = await Promise.all([
+      const [labels, sceneLabels, map, registrationResponse] = await Promise.all([
         request<Annotations>(`/clips/${encodeURIComponent(id)}/frames/${next.frames[0].id}/annotations`),
         request<SceneAnnotations>(`/clips/${encodeURIComponent(id)}/scene/annotations`),
-        request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(id)}/frames/${next.frames[0].id}/points`),
-        fetch(`/api/clips/${encodeURIComponent(id)}/scene/map`),
+        loadCachedSceneMap(id),
         fetch(`/api/clips/${encodeURIComponent(id)}/scene/registration`),
       ]);
-      if (!mapResponse.ok && mapResponse.status !== 404) throw new Error(`读取场景地图失败 HTTP ${mapResponse.status}`);
       if (!registrationResponse.ok && registrationResponse.status !== 404) throw new Error(`读取场景位姿失败 HTTP ${registrationResponse.status}`);
-      const map = mapResponse.ok ? await mapResponse.json() as SceneMap : null;
       const registered = registrationResponse.ok ? await registrationResponse.json() as {world_from_lidar: Record<string, number[][]>} : null;
+      if (next.source === '4d-clip-import' && !map) throw new Error('外部预重建场景地图不可用；请重启后端以启用全量 NPY 点云接口');
+      const skipDuplicateGlobalCloud = next.source === '4d-clip-import' && map;
+      const framePoints = skipDuplicateGlobalCloud ? null : await request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(id)}/frames/${next.frames[0].id}/points`);
       if (generation !== clipGeneration.current) return;
-      next.frames[0] = {...next.frames[0], points: framePoints.points, point_count: framePoints.point_count};
+      if (framePoints) next.frames[0] = {...next.frames[0], points: framePoints.points, point_count: framePoints.point_count};
       sceneDirtyRef.current = false; frameDirtyRef.current = false;
       setClip(next); setFrameIndex(0); setAnnotations(labels); setScene(sceneLabels); setSceneMap(map); setSceneMode(true);
       setRegisteredMatrices(registered?.world_from_lidar ?? map?.world_from_lidar ?? {});
@@ -247,6 +330,9 @@ export default function App() {
       setFrameDirty(false); setSceneDirty(false); setSelectedId(null); setDraftVector([]); setDraftPolygon([]);
       setActiveCamera(next.cameras[0]?.id ?? ''); setExpandedCamera(null); setOccupancy(null); setProposal(null); setJob(null);
       setModelPoints([]); setModelPointLabels([]); setModelBox(undefined);
+      const url = new URL(window.location.href);
+      url.searchParams.set('clip', next.id);
+      window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
       if (!map) void reconstruct(id, generation, 'poses', 0.3, true);
     } catch (error) {if (generation === clipGeneration.current) flash(`读取 clip 失败：${errorText(error)}`, true);}
     finally {if (generation === clipGeneration.current) setLoading(false);}
@@ -254,7 +340,17 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    refreshClips().then(rows => {if (active && rows[0]) return loadClip(rows[0].id); if (active) setLoading(false);}).catch(error => {if (active) {flash(`连接服务失败：${errorText(error)}`, true); setLoading(false);}});
+    Promise.all([
+      refreshClips(),
+      request<{default_clip_id?: string}>('/workspace').catch((): {default_clip_id?: string} => ({})),
+    ]).then(([rows, workspace]) => {
+      if (!active) return;
+      const requestedId = new URLSearchParams(window.location.search).get('clip');
+      const initial = rows.find(row => row.id === requestedId)
+        ?? rows.find(row => row.id === workspace.default_clip_id) ?? rows[0];
+      if (initial) return loadClip(initial.id);
+      setLoading(false);
+    }).catch(error => {if (active) {flash(`连接服务失败：${errorText(error)}`, true); setLoading(false);}});
     void refreshModels().catch(() => {});
     return () => {active = false;};
   }, [loadClip, refreshClips, refreshModels, flash]);
@@ -264,7 +360,8 @@ export default function App() {
   }, []);
 
   const confirmDiscard = (frameOnly = false) => {
-    if (!(frameOnly ? frameDirty : dirty || calibrationDirty) && !draftVector.length && !draftPolygon.length) return true;
+    if (projectionBusy) return false;
+    if (!(frameOnly ? frameDirty || projectionDirty : dirty || calibrationDirty || projectionDirty) && !draftVector.length && !draftPolygon.length) return true;
     return window.confirm(frameOnly ? '当前帧有未保存的像素/点级标注或未完成绘制，放弃并切帧？全场景轨迹修改会继续保留。' : '存在未保存标注、外参或未完成绘制，放弃这些修改并继续？');
   };
   const applyPlaybackFrame = useCallback((bundle: PlaybackFrame) => {
@@ -303,31 +400,34 @@ export default function App() {
   useEffect(() => () => seekController.current?.abort(), []);
   const moveFrame = useCallback(async (index: number, playback = false) => {
     if (reviewing) {await seekPlayback(index); return;}
-    if (!clip || busy || jobBusy || index === frameIndex || index < 0 || index >= clip.frames.length) return;
+    if (!clip || busy || jobBusy || projectionBusy || index === frameIndex || index < 0 || index >= clip.frames.length) return;
     if (!playback && !confirmDiscard(true)) return;
-    if (playback && (frameDirtyRef.current || sceneDirtyRef.current)) {setPlaying(false); return;}
+    if (playback && (frameDirtyRef.current || sceneDirtyRef.current || projectionOpen)) {setPlaying(false); return;}
+    setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();
     const generation = ++frameGeneration.current;
     const clipId = clip.id;
     setLoading(true);
     try {
       const frameId = clip.frames[index].id;
+      const skipDuplicateGlobalCloud = clip.source === '4d-clip-import' && Boolean(sceneMap?.point_buffer);
       const [next, framePoints] = await Promise.all([
         request<Annotations>(`/clips/${encodeURIComponent(clipId)}/frames/${frameId}/annotations`),
-        request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(clipId)}/frames/${frameId}/points`),
+        skipDuplicateGlobalCloud ? Promise.resolve(null) : request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(clipId)}/frames/${frameId}/points`),
       ]);
       if (generation !== frameGeneration.current || clipContext.current !== clipId) return;
       setClip(current => current?.id === clipId ? {
         ...current,
         frames: current.frames.map((item, position) => position === index
-          ? {...item, points: framePoints.points, point_count: framePoints.point_count}
+          ? {...item, points: framePoints?.points ?? [], point_count: framePoints?.point_count ?? item.point_count}
           : {...item, points: []}),
       } : current);
       setFrameIndex(index); setAnnotations(next); setFrameDirty(false); frameDirtyRef.current = false;
       if (!sceneMode) setSelectedId(null);
       setDraftVector([]); setDraftPolygon([]); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined); setProposal(null);
+      return true;
     } catch (error) {flash(`切换帧失败：${errorText(error)}`, true); setPlaying(false);}
     finally {if (generation === frameGeneration.current) setLoading(false);}
-  }, [clip, busy, jobBusy, frameIndex, frameDirty, sceneMode, draftVector.length, draftPolygon.length, flash, reviewing, seekPlayback]);
+  }, [clip, busy, jobBusy, projectionBusy, projectionDirty, projectionOpen, frameIndex, frameDirty, sceneMode, sceneMap, draftVector.length, draftPolygon.length, flash, reviewing, seekPlayback]);
 
   const editFrame = (change: (a: Annotations) => Annotations) => {
     if (reviewing || busy || jobBusy) return;
@@ -365,6 +465,7 @@ export default function App() {
     if (!clip || busy || jobBusy || reviewStarting) return;
     if (reviewing) {await seekPlayback(0, true); return;}
     if (calibrationDirty) {flash('请先保存或还原外参修改，再回放已保存的标注。', true); return;}
+    if (projectionOpen) {flash('请先关闭逐帧投影校正，再开始回放。', true); return;}
     if (draftPolygon.length) {flash('请先完成或取消图像多边形绘制，再回放。', true); return;}
     setReviewStarting(true);
     try {
@@ -415,8 +516,21 @@ export default function App() {
     if (next === 'semantic' || next === 'occupancy') {setSceneMode(false); setPointColorMode('semantic');}
     else if (next === 'fusion') setSceneMode(true);
   };
-  const switchSpace = (next: boolean) => {
+  const switchSpace = async (next: boolean) => {
     if (draftVector.length && !window.confirm('切换坐标空间将放弃未完成矢量绘制，是否继续？')) return;
+    if (clip?.source === '4d-clip-import') {
+      if (next) {
+        setClip(current => current ? {...current, frames: current.frames.map(item => ({...item, points: []}))} : current);
+      } else if (frame && !frame.points.length && !sceneMap?.point_buffer) {
+        setLoading(true);
+        try {
+          const loaded = await request<{points: number[][]; point_count: number}>(`/clips/${encodeURIComponent(clip.id)}/frames/${frame.id}/points`);
+          setClip(current => current?.id === clip.id ? {...current, frames: current.frames.map(item => item.id === frame.id
+            ? {...item, points: loaded.points, point_count: loaded.point_count} : {...item, points: []})} : current);
+        } catch (error) {flash(`读取全量点云失败：${errorText(error)}`, true); return;}
+        finally {setLoading(false);}
+      }
+    }
     setSceneMode(next); setSelectedId(null); setDraftVector([]); setTool('select'); setPlaying(false);
   };
   const createBox = (center: Vec3) => {
@@ -451,6 +565,8 @@ export default function App() {
   };
   const chooseCamera = (id: string) => {
     if (activeCamera === id) return true;
+    if (projectionBusy) return false;
+    if (projectionOpen && projectionDirty && !window.confirm('切换相机会丢弃尚未保存的对应点和投影候选，确定切换？')) return false;
     if ((draftPolygon.length || modelPoints.length || modelBox) && !window.confirm('切换相机将清除未完成多边形和 SAM2 提示，是否继续？')) return false;
     setActiveCamera(id); setDraftPolygon([]); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined); return true;
   };
@@ -470,7 +586,7 @@ export default function App() {
     setTool('vector'); setView('top'); setPlaying(false); setSelectedId(null); setShowVectors(true);
   };
   useEffect(() => {
-    if (!vectorTask || tool !== 'vector' || modal || expandedCamera || calibrationOpen) return;
+    if (!vectorTask || tool !== 'vector' || modal || expandedCamera || calibrationOpen || projectionOpen) return;
     const key = (event: KeyboardEvent) => {
       if (editBlocked || event.ctrlKey || event.metaKey || event.altKey || (event.target instanceof HTMLElement && event.target.closest('input, textarea, select, [contenteditable="true"]'))) return;
       if (event.key === 'Enter') {event.preventDefault(); finishVector();}
@@ -513,7 +629,7 @@ export default function App() {
     const key = currentKey, clipId = clip.id, frameId = frame.id, initialSceneRevision = scene?.revision ?? 0;
     try {
       let next = await jsonRequest<JobView>(`/clips/${clip.id}/jobs`, {kind, frame_id: frame.id, voxel_size: voxelSize,
-        ...(kind === 'prelabel' ? {model_id: workerModel, prompt: workerLabel, scene_mode: sceneMode, options: {camera_id: activeCamera, label: workerLabel, points: modelPoints, point_labels: modelPointLabels, ...(modelBox ? {box: modelBox} : {}), score_threshold: scoreThreshold}} : {}),
+        ...(kind === 'prelabel' ? {model_id: workerModel, prompt: workerLabel, scene_mode: sceneMode, options: {camera_id: activeCamera, label: workerLabel, points: modelPoints, point_labels: modelPointLabels, ...(modelBox ? {box: modelBox} : {}), score_threshold: scoreThreshold, ...(workerModel === 'latr' ? {weight_variant: latrWeight} : {})}} : {}),
         ...(kind === 'propagate' ? {target_frame_id: clip.frames[frameIndex + 1].id} : {})});
       setJob(next);
       for (let attempts = 0; next.status === 'queued' || next.status === 'running'; attempts++) {
@@ -525,7 +641,7 @@ export default function App() {
       if (kind === 'occupancy') setOccupancy({frameId, voxels: (next.result?.voxels ?? []) as Voxel[], size: Number(next.result?.voxel_size ?? voxelSize)});
       else if (kind === 'prelabel') setProposal({annotations: next.result?.proposal as Annotations, frameId, clipId,
         revision: Number((next.result?.proposal as Annotations)?.revision), sceneRevision: Number(next.result?.scene_revision ?? initialSceneRevision), sceneMode,
-        model: String(next.result?.model_id ?? workerModel), occupancy: next.result?.occupancy as Proposal['occupancy'], warnings: next.result?.warnings as string[]});
+        model: String(next.result?.model_id ?? workerModel), weightVariant: next.result?.weight_variant as string | undefined, occupancy: next.result?.occupancy as Proposal['occupancy'], warnings: next.result?.warnings as string[]});
       else if (!frameDirtyRef.current) {
         const before = editGeneration.current;
         const saved = await request<Annotations>(`/clips/${clipId}/frames/${frameId}/annotations`);
@@ -555,6 +671,7 @@ export default function App() {
       editFrame(a => ({...a, image_polygons: proposal.annotations.image_polygons, point_labels: proposal.annotations.point_labels}));
     } else editFrame(() => ({...proposal.annotations, revision: annotations.revision}));
     if (proposal.occupancy) {setOccupancy({frameId: frame.id, voxels: proposal.occupancy.voxels, size: proposal.occupancy.voxel_size, dimensions: proposal.occupancy.voxel_dimensions}); setTask('occupancy'); setSceneMode(false);}
+    if (proposal.model === 'latr') {setTask('lane'); setShowVectors(true);}
     setProposal(null); setModal(null); setModelPromptMode(null); flash('候选已应用为未保存修改，请核验后保存');
   };
   const openModels = async () => {setModal('models'); try {await refreshModels();} catch (error) {flash(`模型状态读取失败：${errorText(error)}`, true);}};
@@ -566,41 +683,95 @@ export default function App() {
   };
   const rebuildScene = async () => {if (reviewing || !clip || reconstructing || !(await save())) return; void reconstruct(clip.id, clipGeneration.current, registration, voxelSize, excludeDynamic, preserveDetail, detailVoxelSize, fusionMode);};
 
+  const openProjectionCalibration = async () => {
+    if (!clip || !frame || reviewing || busy || jobBusy || reconstructing || projectionBusy) return;
+    if (calibrationDirty) {flash('请先保存或还原全局外参，再进行逐帧投影校正。', true); return;}
+    if (draftVector.length || draftPolygon.length) {flash('请先完成或取消正在绘制的标注，再进行投影校正。', true); return;}
+    if (!(await save())) return;
+    setCalibrationOpen(false); setProjectionOpen(true); setPlaying(false); setTool('select');
+    setModelPromptMode(null); setRawProjection(true); setAnnotationProjection(true); setSelectedId(null);
+    setProjectionPickMode(null); consumeProjectionPick();
+  };
+
+  const openAutomaticCalibration = async () => {
+    if (!clip || !frame || reviewing || busy || jobBusy || reconstructing || projectionBusy) return;
+    if (calibrationDirty || projectionDirty) {flash('请先保存或还原当前外参修改与投影候选，再进行自动标定。', true); return;}
+    if (draftVector.length || draftPolygon.length) {flash('请先完成或取消正在绘制的标注，再进行自动标定。', true); return;}
+    if (!(await save())) return;
+    setCalibrationOpen(false); setProjectionOpen(false); setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();
+    setAutomaticCalibrationOpen(true); setPlaying(false); setTool('select'); setModelPromptMode(null);
+    setRawProjection(true); setAnnotationProjection(true);
+  };
+  const refreshProjectionParameters = async (clipId: string) => {
+    const updated = await request<Clip>(`/clips/${encodeURIComponent(clipId)}`);
+    const frames = new Map(updated.frames.map(item => [item.id, item]));
+    // Preserve loaded point buffers and current labels while refreshing projection parameters.
+    setClip(current => current?.id === clipId ? {...current, frames: current.frames.map(item => ({...item,
+      projection_camera_from_lidar: frames.get(item.id)?.projection_camera_from_lidar,
+    }))} : current);
+  };
+  const automaticCalibrationSaved = async () => {
+    if (!clip) return;
+    await refreshProjectionParameters(clip.id);
+    setProjectionPreview(null);
+    flash('自动标定参数已保存，点云与三维标注投影已更新。');
+  };
+  const inspectAutomaticCalibration = async (frameId: string, cameraId: string) => {
+    if (!clip) return;
+    const index = clip.frames.findIndex(item => item.id === frameId);
+    if (index < 0 || !clip.cameras.some(item => item.id === cameraId)) throw new Error('该帧或相机已不存在，请重新读取场景。');
+    if (index !== frameIndex && !(await moveFrame(index))) return;
+    setActiveCamera(cameraId); setAutomaticCalibrationOpen(false); setProjectionOpen(true);
+    setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();
+    setRawProjection(true); setAnnotationProjection(true); setPlaying(false); setTool('select');
+  };
+  const closeProjectionCalibration = () => {
+    setProjectionOpen(false); setProjectionDirty(false); setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();
+  };
+
   const previewCalibration = (draft: Clip | null, document?: CalibrationDocument) => {
     if (!clip) return;
     if (!draft || !document) {
       const base = calibrationBase.current;
       if (base?.clip_id === clip.id) {
-        setClip(current => current?.id === base.clip_id ? applyCalibration(current, base) : current);
+        const original = calibrationClipBase.current;
+        setClip(current => current?.id === base.clip_id ? (original ?? applyCalibration(current, base)) : current);
         setRegisteredMatrices(base.world_from_lidar);
       }
       calibrationBase.current = null;
+      calibrationClipBase.current = null;
       setCalibrationPreview(null);
       return;
     }
     if (draft.id !== clip.id) return;
-    if (!calibrationBase.current) calibrationBase.current = {
+    if (!calibrationBase.current) {calibrationClipBase.current = clip; calibrationBase.current = {
       schema_version: '1.0', clip_id: clip.id, revision: '',
       cameras: Object.fromEntries(clip.cameras.map(camera => [camera.id, camera.camera_from_ego])),
       lidar_to_ego: Object.fromEntries(clip.frames.map(item => [item.id, item.lidar_to_ego])),
       world_from_lidar: Object.fromEntries(clip.frames.map(item => [item.id, worldFromLidar(item, coordinateMap)])),
-    };
+    };}
     setClip(current => current?.id === document.clip_id ? applyCalibration(current, document) : current);
     setCalibrationPreview(document); setPlaying(false);
   };
-  const calibrationSaved = (document: CalibrationDocument, options: {lidarChanged: boolean}) => {
+  const calibrationSaved = async (document: CalibrationDocument, options: {lidarChanged: boolean}) => {
     if (document.clip_id !== clip?.id) return;
     setClip(current => current?.id === document.clip_id ? applyCalibration(current, document) : current);
     setRegisteredMatrices(document.world_from_lidar);
     if (options.lidarChanged) {setSceneMap(null); setReconstruction(null);}
     calibrationBase.current = null;
+    calibrationClipBase.current = null;
     setCalibrationPreview(null); setCalibrationDirty(false);
     flash(options.lidarChanged ? '外参已保存并保留原始标定备份。请重建完整场景，复核世界坐标标注。' : '相机外参已保存，投影已更新，可导出标定。');
+    try {await refreshProjectionParameters(document.clip_id);}
+    catch (error) {flash(`外参已保存，但最新投影参数刷新失败：${errorText(error)}。请重新加载场景。`, true);}
   };
 
   const cameraCards = (expanded = false) => clip?.cameras.filter(c => !expanded || c.id === expandedCamera).map(camera => <div className={`camera-card ${activeCamera === camera.id ? 'camera-active' : ''}`} key={camera.id}>
     <CameraView camera={camera} frame={frame} annotations={imageAnnotations} preparedImage={reviewing && preparedFrame?.frameId === frame?.id ? preparedFrame?.images[camera.id] : undefined} projections={projections[camera.id] ?? []}
-      selected={activeCamera === camera.id} tool={task === 'image' && !reviewing && !busy && !jobBusy && !modelPromptMode ? 'polygon' : 'select'}
+      selected={activeCamera === camera.id} tool={task === 'image' && !projectionOpen && !reviewing && !busy && !jobBusy && !modelPromptMode ? 'polygon' : 'select'}
+      calibrationPicking={projectionOpen && projectionPickMode === '2d' && activeCamera === camera.id}
+      onCalibrationPixel={pixel => {if (!projectionBusy) setProjectionPickedPixel(pixel);}}
+      calibrationAnchors={projectionOpen && activeCamera === camera.id ? cameraProjectionAnchors : []}
       onSelect={() => chooseCamera(camera.id)} onAddPolygonPoint={point => {if (busy || jobBusy) return; if (activeCamera !== camera.id) {setActiveCamera(camera.id); setDraftPolygon([point]);} else setDraftPolygon(p => [...p, point]); setPlaying(false);}}
       onFinishPolygon={finishPolygon} draftPolygon={activeCamera === camera.id ? draftPolygon : []}
       showAnnotationProjection={annotationProjection} showProjection={rawProjection} showBoxes={showBoxes} showVectors={showVectors} selectedId={selectedId}
@@ -611,19 +782,19 @@ export default function App() {
   </div>);
 
   const modelControls = <>
-    <label className="field-label">预标注模型<select aria-label="预标注模型" value={workerModel} onChange={e => {setWorkerModel(e.target.value); setModelPromptMode(null);}}>{Object.entries(modelNames).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select></label>
+    <label className="field-label">预标注模型<select aria-label="预标注模型" value={workerModel} onChange={e => {setWorkerModel(e.target.value); setModelPromptMode(null); if (e.target.value === 'latr') setWorkerLabel('lane');}}>{Object.entries(modelNames).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select></label>
     <div className={`model-readiness ${selectedModel?.available ? 'ready' : ''}`}><span className="status-dot"/>{modelStatus(selectedModel)}</div>
     <label className="field-label">候选类别<input aria-label="候选类别" value={workerLabel} maxLength={80} onChange={e => setWorkerLabel(e.target.value)}/></label>
-    {workerModel === 'sam2' ? <><p className="micro-copy">在左侧所选相机添加正/负提示点或拖出提示框。无提示时执行自动掩码生成；类别名称不会触发文本识别。</p><div className="prompt-tools"><button className={`button subtle ${modelPromptMode === 'point' && !negativePrompt ? 'active' : ''}`} aria-label="SAM2正提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(false);}}>＋ 正点</button><button className={`button subtle ${modelPromptMode === 'point' && negativePrompt ? 'active' : ''}`} aria-label="SAM2负提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(true);}}>− 负点</button><button className={`button subtle ${modelPromptMode === 'box' ? 'active' : ''}`} aria-label="SAM2提示框" onClick={() => setModelPromptMode('box')}>提示框</button><button className="button ghost" onClick={() => {setModelPromptMode(null); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined);}}>清除</button></div><p className="micro-copy">{modelPoints.length} 个提示点 · {modelBox ? '已选提示框' : '未选提示框'} · {activeCamera}</p></> : <label className="field-label">置信度阈值<input type="number" aria-label="模型置信度阈值" min="0" max="1" step="0.05" value={scoreThreshold} onChange={e => {if (Number.isFinite(e.target.valueAsNumber)) setScoreThreshold(Math.min(1, Math.max(0, e.target.valueAsNumber)));}}/></label>}
+    {workerModel === 'sam2' ? <><p className="micro-copy">在左侧所选相机添加正/负提示点或拖出提示框。无提示时执行自动掩码生成；类别名称不会触发文本识别。</p><div className="prompt-tools"><button className={`button subtle ${modelPromptMode === 'point' && !negativePrompt ? 'active' : ''}`} aria-label="SAM2正提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(false);}}>＋ 正点</button><button className={`button subtle ${modelPromptMode === 'point' && negativePrompt ? 'active' : ''}`} aria-label="SAM2负提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(true);}}>− 负点</button><button className={`button subtle ${modelPromptMode === 'box' ? 'active' : ''}`} aria-label="SAM2提示框" onClick={() => setModelPromptMode('box')}>提示框</button><button className="button ghost" onClick={() => {setModelPromptMode(null); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined);}}>清除</button></div><p className="micro-copy">{modelPoints.length} 个提示点 · {modelBox ? '已选提示框' : '未选提示框'} · {activeCamera}</p></> : <>{workerModel === 'latr' && <><p className="micro-copy">请选择当前帧的前视相机。LATR 使用图像与真实标定生成 LiDAR 坐标三维车道折线。</p><label className="field-label">LATR 推理权重<select aria-label="LATR推理权重" value={latrWeight} onChange={e => setLatrWeight(e.target.value as 'once' | 'openlane')}><option value="once">ONCE · once.pth</option><option value="openlane">OpenLane · openlane.pth</option></select></label></>}<label className="field-label">置信度阈值<input type="number" aria-label="模型置信度阈值" min="0" max="1" step="0.05" value={scoreThreshold} onChange={e => {if (Number.isFinite(e.target.valueAsNumber)) setScoreThreshold(Math.min(1, Math.max(0, e.target.valueAsNumber)));}}/></label></>}
     <button className="button primary full-width" aria-label="生成候选标注" disabled={!clip || busy || jobBusy || reconstructing || !workerLabel.trim() || !selectedModel?.available} onClick={() => void runJob('prelabel')}><Icon name="model" size={15}/>{jobBusy ? '模型推理中…' : '运行模型预标注'}</button>
     <button className="button ghost full-width" onClick={() => void openModels()}>配置 / 检查模型服务</button>
   </>;
 
   return <div className={`app-shell scene-app ${reviewing ? 'is-review' : ''}`}>
     <header className="topbar"><div className="brand"><span className="brand-mark"><Icon name="cube" size={26}/></span><span>Omni<span className="brand-light">Label</span><small>4D SCENE ANNOTATION</small></span><span className="version">4D</span></div><div className="workspace-breadcrumb"><span>工作空间</span><Icon name="chevron" size={12}/><strong>整场景多任务标注</strong></div><div className="topbar-actions"><span className={`save-status ${dirty || calibrationDirty ? 'is-dirty' : ''}`}><span className="status-dot"/>{saving ? '正在保存…' : dirty || calibrationDirty ? '有未保存修改' : '已同步至工作区'}</span><button className="button ghost" onClick={() => setModal('help')}><Icon name="help" size={16}/>使用说明</button><button className="button subtle" aria-label="回放标注clip" disabled={!clip || busy || jobBusy || reviewStarting} onClick={() => void startReview()}><Icon name="play" size={15}/>{reviewStarting ? '正在保存…' : reviewing ? '从头回放' : dirty || draftVector.length ? '保存并回放' : '回放标注'}</button><button className="button primary" aria-label="保存标注" disabled={reviewing || busy || jobBusy || (!dirty && !draftVector.length)} onClick={() => void save()}><Icon name="save" size={15}/>{saving ? '保存中' : '保存标注'}</button><span className="avatar">OL</span></div></header>
-    <aside className="sidebar"><div className="nav-label">标注任务 <span>WORKSPACE</span></div><nav aria-label="标注任务">{tasks.map(t => <button key={t.id} className={`task-button ${task === t.id ? 'active' : ''}`} disabled={reviewing || reviewStarting} onClick={() => switchTask(t.id)}><Icon name={t.icon} size={19}/><span>{t.name}</span><small>{t.short}</small>{task === t.id && <i/>}</button>)}</nav><div className="sidebar-divider"/><div className="nav-label">自动化工具</div><button className="task-button model-link" disabled={reviewing} onClick={() => void openModels()}><Icon name="model" size={19}/><span>模型预标注</span><span className="small-badge">3</span></button><div className="sidebar-bottom"><div className="sensor-orbit"><Icon name="cube" size={25}/><span/><span/><span/></div><strong>一个场景 · 连续时空</strong><p>统一地图 / 轨迹关键帧<br/>3D 标签与七路图像实时联动</p><div className="local-indicator"><span className="status-dot"/>世界场景 · 持久化标注</div></div></aside>
+    <aside className="sidebar"><div className="nav-label">标注任务 <span>WORKSPACE</span></div><nav aria-label="标注任务">{tasks.map(t => <button key={t.id} className={`task-button ${task === t.id ? 'active' : ''}`} disabled={reviewing || reviewStarting} onClick={() => switchTask(t.id)}><Icon name={t.icon} size={19}/><span>{t.name}</span><small>{t.short}</small>{task === t.id && <i/>}</button>)}</nav><div className="sidebar-divider"/><div className="nav-label">自动化工具</div><button className="task-button model-link" disabled={reviewing} onClick={() => void openModels()}><Icon name="model" size={19}/><span>模型预标注</span><span className="small-badge">4</span></button><div className="sidebar-bottom"><div className="sensor-orbit"><Icon name="cube" size={25}/><span/><span/><span/></div><strong>一个场景 · 连续时空</strong><p>统一地图 / 轨迹关键帧<br/>3D 标签与七路图像实时联动</p><div className="local-indicator"><span className="status-dot"/>世界场景 · 持久化标注</div></div></aside>
     <main className="main-workspace">
-      <section className="dataset-bar"><div className="dataset-select"><span className="dataset-icon"><Icon name="layers" size={20}/></span><div><label htmlFor="clip-select">当前场景 CLIP</label><select id="clip-select" aria-label="选择clip" value={clip?.id ?? ''} disabled={busy || jobBusy || reconstructing} onChange={e => {if (confirmDiscard()) void loadClip(e.target.value);}}>{!clip && <option value="">{loading ? '正在加载…' : '导入 clip 开始重建'}</option>}{clips.map(c => <option value={c.id} key={c.id}>{c.name}</option>)}</select></div><span className="demo-badge">{clip?.source === 'synthetic' || clip?.id === 'demo' ? '合成示例' : 'CLIP'}</span></div><div className="dataset-metrics"><span><strong>{clip?.frames.length ?? '—'}</strong> 帧</span><span><strong>{clip?.cameras.length ?? '—'}</strong> 相机</span><span><strong>{(sceneMode ? sceneFrame?.point_count : frame?.point_count)?.toLocaleString() ?? '—'}</strong> {reviewing && playbackCloud === 'frame' ? '当前扫描点' : sceneMode ? '场景点' : '源点'}</span></div><div className="dataset-actions"><button className="button subtle" aria-label="编辑标定外参" disabled={reviewing || !clip || busy || jobBusy} onClick={() => {setCalibrationOpen(true); setRawProjection(true); setAnnotationProjection(true); setPlaying(false); setModelPromptMode(null);}}><Icon name="settings" size={15}/>外参校准</button><input ref={fileInput} type="file" accept=".json,.zip" hidden onChange={e => {void importFile(e.target.files?.[0]); e.target.value = '';}}/><button className="button ghost" aria-label="导入clip" disabled={reviewing || busy || jobBusy || reconstructing} onClick={() => fileInput.current?.click()}><Icon name="upload" size={15}/>导入</button><button className="button subtle" aria-label="导出clip" disabled={!clip || busy || jobBusy || reconstructing} onClick={exportClip}><Icon name="download" size={15}/>导出场景</button></div></section>
+      <section className="dataset-bar"><div className="dataset-select"><span className="dataset-icon"><Icon name="layers" size={20}/></span><div><label htmlFor="clip-select">当前场景 CLIP</label><select id="clip-select" aria-label="选择clip" value={clip?.id ?? ''} disabled={busy || jobBusy || reconstructing} onChange={e => {if (confirmDiscard()) void loadClip(e.target.value);}}>{!clip && <option value="">{loading ? '正在加载…' : '导入 clip 开始重建'}</option>}{clips.map(c => <option value={c.id} key={c.id}>{c.name}</option>)}</select></div><span className="demo-badge">{clip?.source === 'synthetic' || clip?.id === 'demo' ? '合成示例' : 'CLIP'}</span></div><div className="dataset-metrics"><span><strong>{clip?.frames.length ?? '—'}</strong> 帧</span><span><strong>{clip?.cameras.length ?? '—'}</strong> 相机</span><span><strong>{(sceneMode ? sceneFrame?.point_count : frame?.point_count)?.toLocaleString() ?? '—'}</strong> {reviewing && playbackCloud === 'frame' ? '当前扫描点' : sceneMode ? '场景点' : '源点'}</span></div><div className="dataset-actions"><button className="button subtle" aria-label="逐帧投影校准" disabled={reviewing || !clip || !frame || busy || jobBusy || reconstructing || projectionBusy} onClick={() => void openProjectionCalibration()}><Icon name="settings" size={15}/>逐帧校准</button><button className="button subtle" aria-label="全clip自动标定" disabled={reviewing || !clip || busy || jobBusy || reconstructing || projectionBusy} onClick={() => void openAutomaticCalibration()}><Icon name="settings" size={15}/>自动标定</button><button className="button subtle" aria-label="编辑标定外参" disabled={reviewing || !clip || busy || jobBusy || projectionBusy} onClick={() => {if (projectionDirty) {flash('请先保存或丢弃逐帧投影候选，再编辑全局外参。', true); return;} closeProjectionCalibration(); setCalibrationOpen(true); setRawProjection(true); setAnnotationProjection(true); setPlaying(false); setModelPromptMode(null);}}><Icon name="settings" size={15}/>外参校准</button><input ref={fileInput} type="file" accept=".json,.zip" hidden onChange={e => {void importFile(e.target.files?.[0]); e.target.value = '';}}/><button className="button ghost" aria-label="导入clip" disabled={reviewing || busy || jobBusy || reconstructing} onClick={() => fileInput.current?.click()}><Icon name="upload" size={15}/>导入</button><button className="button subtle" aria-label="导出clip" disabled={!clip || busy || jobBusy || reconstructing} onClick={exportClip}><Icon name="download" size={15}/>导出场景</button></div></section>
       <div className="workspace-grid scene-layout">
          <aside className="camera-rail" aria-label="左侧相机标注投影"><div className="camera-rail-heading"><h2><Icon name="image" size={16}/>相机标注投影 <span>{clip?.cameras.length ?? 0}</span></h2><div className="camera-overlay-toggles"><button className={`toggle-button ${annotationProjection ? 'on' : ''}`} aria-label="切换标注投影" onClick={() => setAnnotationProjection(!annotationProjection)}>标注结果<i className="toggle-switch"/></button><button className={`toggle-button ${rawProjection ? 'on' : ''}`} aria-label="切换点云投影" onClick={() => setRawProjection(!rawProjection)}>原始点云<i className="toggle-switch"/></button></div><p>框、车道线与矢量地图随当前时刻投影</p>{modelPromptMode && <div className="seed-banner">SAM2 {modelPromptMode === 'box' ? '拖动提示框' : negativePrompt ? '负提示点' : '正提示点'} · {activeCamera}<button onClick={() => setModelPromptMode(null)}>退出</button></div>}</div><div className="camera-grid camera-scroll" data-testid="camera-scroll">{cameraCards()}{!clip && <div className="camera-placeholder">导入场景后显示同步相机</div>}{clip && !clip.cameras.length && <div className="camera-placeholder">此场景未包含相机图像</div>}</div>{task === 'image' && <div className="image-draw-footer"><span>{draftPolygon.length} 个区域顶点</span><button className="button subtle" disabled={draftPolygon.length < 3} onClick={finishPolygon}>完成多边形</button><button className="button ghost" onClick={() => setDraftPolygon([])}>取消</button><button className="button ghost" aria-label="导出语义掩码" disabled={!clip || busy || !activeCamera} onClick={() => clip && frame && activeCamera && void exportFile(`/clips/${clip.id}/frames/${frame.id}/masks/${activeCamera}.zip`, `${frame.id}-${activeCamera}-mask.zip`)}>导出掩码</button></div>}</aside>
         <section className="view-workspace"><div className="section-header"><div><span className="section-eyebrow">{taskInfo.short} / {sceneMode ? 'WORLD SCENE' : 'LIDAR FRAME'}</span><h1>{taskInfo.name}<span>{taskInfo.subtitle}</span></h1></div><span className="coordinate-tag"><span/>{sceneMode ? 'WORLD' : 'LiDAR'} · 米</span></div>
@@ -636,17 +807,17 @@ export default function App() {
             {groundOnly && surfaceInfo.count === 0 && !reconstructing && <p className="surface-hint" role="status">当前地面高度范围内没有点，请调整右侧「地面参考高度 / 高度半带宽」，或关闭「仅看地面」。</p>}
             {pointColorMode === 'intensity' && surfaceInfo.count > 0 && !surfaceInfo.contrast && <p className="surface-hint" role="status">这些点没有可区分的反射强度。仅有 XYZ 或固定强度无法显示路面油漆纹理；请导入包含真实强度的 XYZI 点云，并参考左侧原图标注。</p>}
             {!reviewing && selectedBox && task === 'detection' && <div className="transform-toolbar"><span>鼠标直接编辑</span>{(['translate', 'scale', 'rotate'] as const).map((mode, i) => <button key={mode} className={transformMode === mode ? 'active' : ''} aria-label={['平移标注框', '缩放标注框', '旋转标注框'][i]} disabled={editBlocked} onClick={() => {setTransformMode(mode); setTool('select');}}>{['平移', '拖动改尺寸', '旋转'][i]}</button>)}<small>{sceneMode ? currentIsKeyframe ? '当前关键帧' : '拖动即创建关键帧' : '当前帧'}</small></div>}
-            <div className={`scene-canvas ${editBlocked && !reviewing ? 'scene-disabled' : ''}`}>
-              <PointCloudView frame={sceneMode ? sceneFrame : frame} annotations={renderedAnnotations} selectedId={selectedId} onSelect={selectAnnotation} onCreateBox={createBox} onUpdateBox={updateBoxById} focusSelection={focusSelection} transformMode={transformMode} editable={!editBlocked && task === 'detection'} sceneMode={sceneMode} trajectory={sceneMode ? sceneMap?.trajectory : undefined} activeFrameId={frame?.id} followPosition={reviewing && playbackCloud === 'frame' && frame ? worldFromLidar(frame, coordinateMap).slice(0, 3).map(row => row[3]) as Vec3 : undefined} autoFitReference={reviewing && playbackCloud === 'frame' ? reviewFitReference.current ?? frame?.points : usingSceneMap ? sceneMap?.points : frame?.points} onTransformStart={() => setPlaying(false)} onAddVectorPoint={point => {if (!editBlocked) setDraftVector(p => [...p, point]);}} onPaint={indices => {if (!sceneMode && indices.length) editFrame(a => ({...a, point_labels: {...a.point_labels, ...Object.fromEntries(indices.map(i => [String(i), classId]))}}));}} tool={editBlocked ? 'select' : tool} view={view} groundZ={groundZ} voxels={!sceneMode && task === 'occupancy' && occupancy?.frameId === frame?.id ? occupancy?.voxels : undefined} voxelSize={occupancy?.size ?? voxelSize} voxelDimensions={occupancy?.dimensions} showFree={showFree} showBoxes={showBoxes} showVectors={showVectors} colorMode={pointColorMode} groundOnly={groundOnly} groundBand={groundBand} drawOnGround={vectorTask} draftVector={draftVector} brushRadius={brushRadius}/>
+            <div className={`scene-canvas ${editBlocked && !reviewing && !projectionOpen ? 'scene-disabled' : ''}`}>
+              <PointCloudView calibrationPicking={projectionOpen && projectionPickMode === '3d' && !projectionBusy} onCalibrationPoint={point => {if (!projectionBusy && frame) setProjectionPickedPoint(sceneMode ? transformPoint(point, inverseRigid(worldFromLidar(frame, coordinateMap))) : point);}} calibrationPoints={projectionMarkers} frame={sceneMode ? sceneFrame : frame} binaryPoints={displayedPointBuffer} cloudBounds={usingSceneMap ? sceneMap?.bounds : undefined} intensityRangeHint={displayedPointBuffer ? sceneMap?.intensity_range : undefined} annotations={renderedAnnotations} selectedId={selectedId} onSelect={selectAnnotation} onCreateBox={createBox} onUpdateBox={updateBoxById} focusSelection={focusSelection} transformMode={transformMode} editable={!editBlocked && task === 'detection'} sceneMode={sceneMode} trajectory={sceneMode ? sceneMap?.trajectory : undefined} activeFrameId={frame?.id} followPosition={reviewing && playbackCloud === 'frame' && frame ? worldFromLidar(frame, coordinateMap).slice(0, 3).map(row => row[3]) as Vec3 : undefined} autoFitReference={reviewing && playbackCloud === 'frame' ? reviewFitReference.current ?? frame?.points : usingSceneMap ? sceneMap?.point_buffer : frame?.points} onTransformStart={() => setPlaying(false)} onAddVectorPoint={point => {if (!editBlocked) setDraftVector(p => [...p, point]);}} onPaint={indices => {if (!sceneMode && indices.length) editFrame(a => ({...a, point_labels: {...a.point_labels, ...Object.fromEntries(indices.map(i => [String(i), classId]))}}));}} tool={editBlocked ? 'select' : tool} view={view} groundZ={groundZ} voxels={!sceneMode && task === 'occupancy' && occupancy?.frameId === frame?.id ? occupancy?.voxels : undefined} voxelSize={occupancy?.size ?? voxelSize} voxelDimensions={occupancy?.dimensions} showFree={showFree} showBoxes={showBoxes} showVectors={showVectors} colorMode={pointColorMode} groundOnly={groundOnly} groundBand={groundBand} drawOnGround={vectorTask} draftVector={draftVector} brushRadius={brushRadius}/>
               <div className="scene-top-info"><span className="live-pill"><i/>{sceneMode ? 'WORLD SCENE' : `FRAME ${String(frameIndex + 1).padStart(4, '0')}`}</span><span>{sceneMode && sceneMap?.rendered_point_count != null && sceneMap.rendered_point_count !== sceneMap.point_count ? `${sceneMap.rendered_point_count.toLocaleString()} / ${sceneMap.point_count.toLocaleString()}` : (sceneMode ? sceneFrame?.point_count : frame?.point_count)?.toLocaleString() ?? 0} POINTS</span></div>
               {loading && <div className="loading-overlay"><span className="spinner"/>正在加载多模态数据…</div>}
               {!clip && !loading && <div className="empty-scene"><Icon name="layers" size={38}/><h2>{clip ? '场景地图尚未生成' : '从一个 clip 开始'}</h2><p>{reconstruction?.error ?? '将整段点云配准、融合为可标注场景'}</p>{clip && <button className="button primary" onClick={() => void rebuildScene()}>重建整个场景</button>}</div>}
               {vectorTask && tool === 'vector' && <div className="drawing-bar"><span>{draftVector.length} 个{sceneMode ? '世界' : 'LiDAR'}顶点</span><button disabled={editBlocked || draftVector.length < (closedDraft ? 3 : 2)} onClick={finishVector}>完成绘制</button><button disabled={!draftVector.length} onClick={() => setDraftVector(p => p.slice(0, -1))}>撤回一点</button><button onClick={() => {setDraftVector([]); setTool('select');}}>取消</button></div>}
             </div><div className="scene-footer"><span><span className="keycap">左键</span>{reviewing ? '转动视角 / 选择查看' : selectedBox && task === 'detection' ? '拖动控制柄编辑框' : tool === 'vector' ? '添加矢量顶点' : tool === 'brush' ? '语义涂刷' : '旋转 / 选择'}<span className="keycap">右键</span>平移<span className="keycap">滚轮</span>缩放</span><span>{sceneMode ? '统一世界坐标 · 时间连续' : '当前 LiDAR 坐标'}</span></div></div>
           <div className="scene-summary"><span><Icon name="layers" size={14}/>{sceneMap ? `${sceneMap.frame_count} 帧已融合 · ${sceneMap.point_count.toLocaleString()} 个静态地图点` : sceneMode && frame ? (reconstructing ? '后台重建中 · 当前扫描已转为世界坐标，可继续标注' : '当前扫描 · 世界坐标') : '等待场景重建'}</span><span>{scene?.tracks.length ?? 0} 条轨迹 · {scene?.vectors.length ?? 0} 个全局矢量</span>{sceneDirty && <b>场景修改保留中，切帧不会丢失</b>}</div>
-          {proposal && <div className="inline-proposal"><Icon name="model" size={18}/><div><strong>{modelNames[proposal.model] ?? proposal.model} 候选已生成</strong><p>{proposal.annotations.boxes.length} 个框 / {proposal.annotations.image_polygons.length} 个图像区域，需人工审核</p></div><button className="button primary" disabled={busy || jobBusy} onClick={applyProposal}>应用候选标注</button><button className="button ghost" onClick={() => setProposal(null)}>丢弃</button></div>}
+          {proposal && <div className="inline-proposal"><Icon name="model" size={18}/><div><strong>{modelNames[proposal.model] ?? proposal.model}{proposal.weightVariant ? ` · ${proposal.weightVariant.toUpperCase()}` : ''} 候选已生成</strong><p>{proposal.annotations.boxes.length} 个框 / {proposal.annotations.vectors.length} 条三维矢量 / {proposal.annotations.image_polygons.length} 个图像区域，需人工审核</p></div><button className="button primary" disabled={busy || jobBusy} onClick={applyProposal}>应用候选标注</button><button className="button ghost" onClick={() => setProposal(null)}>丢弃</button></div>}
         </section>
-        <aside className={`inspector ${calibrationOpen ? 'calibration-active' : ''}`}>{calibrationOpen && clip && frame && <CalibrationEditor clip={clip} frameId={frame.id} disabled={busy || jobBusy || reconstructing} onPreview={previewCalibration} onSaved={calibrationSaved} onClose={() => setCalibrationOpen(false)} onError={message => flash(message, true)} onDirtyChange={setCalibrationDirty}/>}<div className="inspector-heading"><h2>{reviewing ? '标注结果' : '标注属性'}</h2><span className="count-badge">{renderedAnnotations.boxes.length + renderedAnnotations.vectors.length + annotations.image_polygons.length}</span><button className="icon-button" aria-label="标注帮助" onClick={() => setModal('help')}><Icon name="settings" size={15}/></button></div><div className="inspector-body">
+        <aside className={`inspector ${calibrationOpen || projectionOpen ? 'calibration-active' : ''}`}>{projectionOpen && clip && frame && <ProjectionCalibrationEditor clipId={clip.id} frameId={frame.id} cameras={clip.cameras} cameraId={activeCamera} disabled={busy || jobBusy || reconstructing} pickedPoint={projectionPickedPoint} pickedPixel={projectionPickedPixel} onCameraChange={id => {setActiveCamera(id); setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();}} onPickModeChange={setProjectionPickMode} onConsumedPick={consumeProjectionPick} onPreview={previewProjection} onSaved={savedProjection} onClose={closeProjectionCalibration} onDirtyChange={setProjectionDirty} onBusyChange={setProjectionBusy} onError={message => flash(message, true)} onAnchorsChange={changeProjectionAnchors}/>} {calibrationOpen && clip && frame && <CalibrationEditor clip={clip} frameId={frame.id} disabled={busy || jobBusy || reconstructing} onPreview={previewCalibration} onSaved={calibrationSaved} onClose={() => setCalibrationOpen(false)} onError={message => flash(message, true)} onDirtyChange={setCalibrationDirty}/>}<div className="inspector-heading"><h2>{reviewing ? '标注结果' : '标注属性'}</h2><span className="count-badge">{renderedAnnotations.boxes.length + renderedAnnotations.vectors.length + annotations.image_polygons.length}</span><button className="icon-button" aria-label="标注帮助" onClick={() => setModal('help')}><Icon name="settings" size={15}/></button></div><div className="inspector-body">
           <section className="inspector-section"><div className="mini-heading"><span>类别标签</span><small>{sceneMode ? 'WORLD SCENE' : 'FRAME LABEL'}</small></div><div className="class-list">{classes.map(c => <button key={c.id} className={`class-option ${classId === c.id ? 'selected' : ''}`} onClick={() => {setClassId(c.id); if (selectedBox && task === 'detection') updateBox({label: c.id});}}><i style={{background: c.color}}/><span>{c.name}</span><small>{c.id}</small>{classId === c.id && <Icon name="check" size={13}/>}</button>)}</div></section>
           {selectedBox ? <section className="inspector-section"><div className="mini-heading"><span>{sceneMode ? '4D 轨迹 / 当前状态' : '目标属性'}</span><span className="text-cyan">{sceneMode ? 'WORLD' : 'LiDAR'}</span></div><label className="field-label">轨迹 ID<input aria-label="轨迹ID" value={selectedBox.track_id} disabled={editBlocked} onChange={e => updateBox({track_id: e.target.value})}/></label>{selectedTrack && <><label className="field-label">时序模式<select aria-label="轨迹时序模式" value={selectedTrack.mode} disabled={editBlocked} onChange={e => {const mode = e.target.value as SceneTrack['mode']; editScene(s => ({...s, tracks: s.tracks.map(t => t.id === selectedId ? {...t, mode, keyframes: mode === 'static' && frame ? [{frame_id: frame.id, center: selectedBox.center, size: selectedBox.size, yaw: selectedBox.yaw}] : t.keyframes} : t)}));}}><option value="dynamic">动态轨迹 · 关键帧插值</option><option value="static">静态目标 · 全场景共享</option></select></label><div className="keyframe-actions"><span>{selectedTrack.keyframes.length} 个关键帧 · {currentIsKeyframe ? '当前已设关键帧' : '当前为插值状态'}</span><button className="button subtle" aria-label="添加当前关键帧" disabled={editBlocked} onClick={() => updateBox({})}>设为关键帧</button><button className="button ghost" disabled={editBlocked || !currentIsKeyframe || selectedTrack.keyframes.length < 2} onClick={() => editScene(s => ({...s, tracks: s.tracks.map(t => t.id === selectedId ? {...t, keyframes: t.keyframes.filter(k => k.frame_id !== frame?.id)} : t)}))}>删除本关键帧</button></div></>}
             <div className="coordinate-fields">{(['center', 'size'] as const).map(key => <div key={key}><label>{key === 'center' ? `中心位置 · ${sceneMode ? '世界' : 'LiDAR'}米` : '尺寸 · 米（拖动实时更新）'}</label><div className="numeric-triplet">{(key === 'center' ? ['X', 'Y', 'Z'] : ['长', '宽', '高']).map((axis, i) => <label key={axis}><span>{axis}</span><input type="number" step="0.1" min={key === 'size' ? '0.01' : undefined} aria-label={`${key === 'center' ? '位置' : '尺寸'}${axis}`} value={Number(selectedBox[key][i].toFixed(3))} disabled={editBlocked} onChange={e => {if (!Number.isFinite(e.target.valueAsNumber) || (key === 'size' && e.target.valueAsNumber <= 0)) return; const values = [...selectedBox[key]] as Vec3; values[i] = e.target.valueAsNumber; updateBox({[key]: values});}}/></label>)}</div></div>)}</div><label className="field-label">航向角 · 度<input type="number" step="1" aria-label="航向角" value={Number((selectedBox.yaw * 180 / Math.PI).toFixed(2))} disabled={editBlocked} onChange={e => {if (Number.isFinite(e.target.valueAsNumber)) updateBox({yaw: e.target.valueAsNumber * Math.PI / 180});}}/></label><button className="button danger full-width" disabled={editBlocked} onClick={deleteSelected}><Icon name="trash" size={14}/>{sceneMode ? '删除选中轨迹（所有时刻）' : '删除选中目标'}</button></section> : selectedVector || selectedPolygon ? <section className="inspector-section"><div className="mini-heading"><span>{selectedVector && sceneMode ? '全场景矢量' : '选中要素'}</span></div><label className="field-label">要素类别<input aria-label="要素类别" value={selectedVector?.label ?? selectedPolygon?.label ?? ''} disabled={editBlocked} onChange={e => updateElement({label: e.target.value})}/></label>{selectedVector && <label className="closed-field"><input type="checkbox" checked={selectedVector.closed} disabled={editBlocked || selectedVector.points.length < 3} onChange={e => updateElement({closed: e.target.checked})}/>闭合面要素</label>}<div className="vertex-list">{(selectedVector?.points ?? selectedPolygon?.points ?? []).map((point, index) => <div className="vertex-row" key={index}><span>{String(index + 1).padStart(2, '0')}</span>{point.map((value, axis) => <label key={axis}><small>{['X', 'Y', 'Z'][axis]}</small><input type="number" step="0.1" aria-label={`顶点${index + 1}${['X', 'Y', 'Z'][axis]}`} value={Number(value.toFixed(3))} disabled={editBlocked} onChange={e => {if (!Number.isFinite(e.target.valueAsNumber)) return; const points = (selectedVector?.points ?? selectedPolygon!.points).map((p, i) => i === index ? p.map((v, j) => j === axis ? e.target.valueAsNumber : v) : p); updateElement({points});}}/></label>)}</div>)}</div><button className="button danger full-width" disabled={editBlocked} onClick={deleteSelected}><Icon name="trash" size={14}/>删除选中要素</button></section> : <section className="inspector-section selection-empty"><Icon name={taskInfo.icon} size={29}/><p>{reviewing ? '选择轨迹或矢量查看属性' : sceneMode ? '选择场景中的轨迹或矢量以编辑' : '选择目标或开启绘制工具'}</p>{task === 'detection' && <button className="button subtle full-width" disabled={!frame || editBlocked} onClick={() => {setTool('box'); setShowBoxes(true); setPlaying(false);}}><Icon name="plus" size={15}/>新建 3D 目标框</button>}</section>}
@@ -658,8 +829,18 @@ export default function App() {
       </div>
       <section className="timeline" aria-label="clip时间轴"><div className="timeline-top"><div className="playback-controls"><button className="icon-button" aria-label="上一帧" disabled={!clip || frameIndex === 0 || busy || jobBusy} onClick={() => void moveFrame(frameIndex - 1)}><Icon name="prev" size={16}/></button><button className={`play-button ${playing ? 'playing' : ''}`} aria-label={playing ? '暂停' : '播放'} disabled={!clip || (!playing && (busy || jobBusy || reviewStarting))} onClick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={15}/></button><button className="icon-button" aria-label="下一帧" disabled={!clip || frameIndex >= clip.frames.length - 1 || busy || jobBusy} onClick={() => void moveFrame(frameIndex + 1)}><Icon name="next" size={16}/></button><span className="frame-position"><strong>{String(frameIndex + 1).padStart(4, '0')}</strong><span>/ {String(clip?.frames.length ?? 0).padStart(4, '0')}</span></span></div><span className="timeline-title">4D SCENE TIMELINE <span>● 关键帧 / 区间插值</span></span><span className="timestamp">t = {frame?.timestamp.toFixed(3) ?? '0.000'} s <span className="timebase">{reviewing ? `${playbackSpeed}×` : `${clip?.fps ?? 0} Hz`}</span></span></div><div className="timeline-track"><div className="timeline-ruler">{[0, 1, 2, 3, 4].map(i => <span key={i}>{((clip && clip.frames.length > 1 ? clip.frames.at(-1)!.timestamp - clip.frames[0].timestamp : 0) * i / 4).toFixed(1)}s</span>)}</div><div className="frame-cells">{clip?.frames.map((f, i) => <button key={f.id} className={`${frameIndex === i ? 'current' : ''} ${selectedTrack?.keyframes.some(k => k.frame_id === f.id) ? 'has-keyframe' : ''}`} aria-label={`跳转到第${i + 1}帧`} disabled={busy || jobBusy} title={`${f.id} · ${f.timestamp.toFixed(3)}s`} onClick={() => void moveFrame(i)}><i/>{selectedTrack?.keyframes.some(k => k.frame_id === f.id) ? <b>◆</b> : null}{frameIndex === i && <span>{String(i + 1).padStart(2, '0')}</span>}</button>)}</div></div></section>
     </main>
+    {automaticCalibrationOpen && clip && <AutomaticCalibrationPanel clip={clip} frameId={frame?.id} cameraId={activeCamera} disabled={busy || jobBusy || reconstructing} onSaved={automaticCalibrationSaved} onInspect={inspectAutomaticCalibration} onClose={() => setAutomaticCalibrationOpen(false)}/>}
     {notice && <div className={`toast ${notice.error ? 'error' : ''}`} role={notice.error ? 'alert' : 'status'}><Icon name={notice.error ? 'help' : 'check'} size={18}/><span>{notice.message}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice(null)}><Icon name="close" size={15}/></button></div>}
     {expandedCamera && <div className="modal-backdrop" onClick={() => setExpandedCamera(null)}><div className="expanded-camera" onClick={e => e.stopPropagation()}>{cameraCards(true)}{task === 'image' && <div className="image-draw-footer"><span>{draftPolygon.length} 个区域顶点</span><button className="button primary" disabled={draftPolygon.length < 3} onClick={finishPolygon}>完成多边形</button></div>}</div></div>}
-    {modal && <div className="modal-backdrop" onClick={() => setModal(null)}><div className="modal" role="dialog" aria-modal="true" aria-label={modal === 'models' ? '模型与预标注' : '使用说明'} onClick={e => e.stopPropagation()}><div className="modal-heading"><div><span className="section-eyebrow">{modal === 'models' ? 'MODEL INFERENCE' : '4D WORKFLOW'}</span><h2>{modal === 'models' ? '真实模型服务与预标注' : '4D 整场景标注工作流'}</h2></div><button className="icon-button" aria-label="关闭对话框" onClick={() => setModal(null)}><Icon name="close"/></button></div>{modal === 'models' ? <><p className="modal-intro">SAM2、MMDetection3D、OpenOccupancy 使用各自的实际模型运行时。服务状态、依赖和权重检查通过后才可执行。推理失败不会以几何结果冒充模型结果。</p><div className="model-list">{Object.keys(modelNames).map(id => {const model = modelList?.find(m => m.id === id); const connection = connections.find(c => c.model_id === id); return <div className="model-card" key={id}><div><Icon name="model" size={19}/><h3>{id === 'sam2' ? 'SAM2' : id === 'mmdetection3d' ? 'MMDetection3D' : 'OpenOccupancy'}</h3><span className={model?.available ? 'available-tag' : 'unavailable-tag'}>{model?.available ? '推理就绪' : model?.configured ? '未就绪' : '未配置'}</span></div><p>{modelStatus(model)}</p><label className="field-label">推理服务完整地址<input aria-label={`${id}服务地址`} placeholder="https://gpu.example/predict" value={connection?.endpoint ?? ''} onChange={e => setConnections(rows => [...rows.filter(c => c.model_id !== id), {model_id: id, endpoint: e.target.value}])}/></label><button className="button subtle full-width" disabled={connectionBusy} onClick={() => void saveConnection(id)}>保存并检查连接</button><button className="button ghost full-width" onClick={() => {setWorkerModel(id); setModal(null); if (id === 'sam2') {setModelPromptMode('point'); setNegativePrompt(false);}}}>选择此模型</button>{model?.url && <a href={model.url} target="_blank" rel="noreferrer">官方项目 ↗</a>}</div>;})}</div><div className="worker-panel">{modelControls}</div>{proposal && <div className="proposal-review"><strong>候选标注等待审核</strong><p>{proposal.model} · {proposal.frameId} · {proposal.annotations.boxes.length} 个框 / {proposal.annotations.image_polygons.length} 个图像区域</p>{proposal.warnings?.map(w => <p key={w}>{w}</p>)}<button className="button primary" onClick={applyProposal}>应用候选标注</button><button className="button ghost" onClick={() => setProposal(null)}>丢弃候选</button></div>}<p className="micro-copy">鉴权 token 在服务端安全变量中配置，不写入浏览器。部署方式见 docs/model-worker.md。</p></> : <div className="help-content"><ol><li><strong>整场景重建：</strong>导入 clip 自动用输入车辆位姿融合整段点云；需要配准修正时选择 ICP 重建。切换时刻不会重置地图。</li><li><strong>4D 轨迹：</strong>世界坐标目标在关键帧间按时间插值。编辑任一时刻自动建立关键帧；静态目标或道路矢量在整个场景共享。</li><li><strong>拖动框：</strong>选中目标即显示框面尺寸控制柄：红色改长、绿色改宽、蓝色改高，中心 ↔ 移动位置；无需输入尺寸。切换旋转可调整航向角，俯视图调整高度需切回透视 3D。右侧数值与左侧图像投影同步更新。</li><li><strong>车道线：</strong>进入车道线标注，选择类别，点击「开始绘制车道线」，在俯视路面上逐点点击，Enter 完成、Backspace 撤回、Esc 取消，最后保存。右侧可逐顶点编辑坐标；世界坐标车道线在整个 clip 共享。</li><li><strong>地面标线：</strong>选择反射强度着色并开启「仅看地面」，按坐标设置地面参考高度和半带宽。重建时启用「保留标线反射细节」。车道线和箭头需要源数据测得的强度差异，几何重建无法补出未采样纹理。</li><li><strong>相机栏：</strong>七路图像位于左侧可滚动栏，默认显示框和矢量标注投影。原始点云投影是独立可选图层。</li><li><strong>模型预标注：</strong>配置实际模型 Worker，检查就绪状态，选择模型和类别。SAM2 支持图像正负点与框提示，模型结果需人工应用并保存。</li></ol><div className="help-coordinate"><strong>坐标与数据</strong><p>场景地图和轨迹使用世界米坐标；源帧使用 LiDAR 坐标；相机为光学坐标。投影通过校准矩阵链，并采用重建后的实际配准变换。逐点语义标签始终对应源帧点索引。</p></div></div>}</div></div>}
+    {modal && <div className="modal-backdrop" onClick={() => setModal(null)}><div className="modal" role="dialog" aria-modal="true" aria-label={modal === 'models' ? '模型与预标注' : '使用说明'} onClick={e => e.stopPropagation()}>
+      <div className="modal-heading"><div><span className="section-eyebrow">{modal === 'models' ? 'MODEL INFERENCE' : '4D WORKFLOW'}</span><h2>{modal === 'models' ? '真实模型服务与预标注' : '4D 整场景标注工作流'}</h2></div><button className="icon-button" aria-label="关闭对话框" onClick={() => setModal(null)}><Icon name="close"/></button></div>
+      {modal === 'models' ? <>
+        <p className="modal-intro">SAM2、LATR、MMDetection3D、OpenOccupancy 使用各自的实际模型运行时。服务状态、依赖和权重检查通过后才可执行。推理失败不会以几何结果冒充模型结果。</p>
+        <div className="model-list">{Object.keys(modelNames).map(id => {const model = modelList?.find(m => m.id === id); const connection = connections.find(c => c.model_id === id); return <div className="model-card" key={id}><div><Icon name="model" size={19}/><h3>{modelNames[id].split(' · ')[0]}</h3><span className={model?.available ? 'available-tag' : 'unavailable-tag'}>{model?.available ? '推理就绪' : model?.configured ? '未就绪' : '未配置'}</span></div><p>{modelStatus(model)}</p><label className="field-label">推理服务完整地址<input aria-label={`${id}服务地址`} placeholder="https://gpu.example/predict" value={connection?.endpoint ?? ''} onChange={e => setConnections(rows => [...rows.filter(c => c.model_id !== id), {model_id: id, endpoint: e.target.value}])}/></label><button className="button subtle full-width" disabled={connectionBusy} onClick={() => void saveConnection(id)}>保存并检查连接</button><button className="button ghost full-width" onClick={() => {setWorkerModel(id); setModal(null); if (id === 'sam2') {setModelPromptMode('point'); setNegativePrompt(false);} if (id === 'latr') {setWorkerLabel('lane'); setTask('lane');}}}>选择此模型</button>{model?.url && <a href={model.url} target="_blank" rel="noreferrer">官方项目 ↗</a>}</div>;})}</div>
+        <div className="worker-panel">{modelControls}</div>
+        {proposal && <div className="proposal-review"><strong>候选标注等待审核</strong><p>{proposal.model}{proposal.weightVariant ? `/${proposal.weightVariant}` : ''} · {proposal.frameId} · {proposal.annotations.boxes.length} 个框 / {proposal.annotations.vectors.length} 条三维矢量 / {proposal.annotations.image_polygons.length} 个图像区域</p>{proposal.warnings?.map(w => <p key={w}>{w}</p>)}<button className="button primary" onClick={applyProposal}>应用候选标注</button><button className="button ghost" onClick={() => setProposal(null)}>丢弃候选</button></div>}
+        <p className="micro-copy">鉴权 token 在服务端安全变量中配置，不写入浏览器。部署方式见 docs/model-worker.md。</p>
+      </> : <div className="help-content"><ol><li><strong>整场景重建：</strong>导入 clip 自动用输入车辆位姿融合整段点云；需要配准修正时选择 ICP 重建。切换时刻不会重置地图。</li><li><strong>4D 轨迹：</strong>世界坐标目标在关键帧间按时间插值。编辑任一时刻自动建立关键帧；静态目标或道路矢量在整个场景共享。</li><li><strong>拖动框：</strong>选中目标即显示框面尺寸控制柄：红色改长、绿色改宽、蓝色改高，中心 ↔ 移动位置；无需输入尺寸。切换旋转可调整航向角，俯视图调整高度需切回透视 3D。右侧数值与左侧图像投影同步更新。</li><li><strong>车道线：</strong>进入车道线标注，选择类别，点击「开始绘制车道线」，在俯视路面上逐点点击，Enter 完成、Backspace 撤回、Esc 取消，最后保存。右侧可逐顶点编辑坐标；世界坐标车道线在整个 clip 共享。</li><li><strong>地面标线：</strong>选择反射强度着色并开启「仅看地面」，按坐标设置地面参考高度和半带宽。重建时启用「保留标线反射细节」。车道线和箭头需要源数据测得的强度差异，几何重建无法补出未采样纹理。</li><li><strong>相机栏：</strong>七路图像位于左侧可滚动栏，默认显示框和矢量标注投影。原始点云投影是独立可选图层。</li><li><strong>模型预标注：</strong>配置实际模型 Worker，检查就绪状态，选择模型和类别。SAM2 支持图像提示；LATR 使用前视图像和标定生成三维车道线；所有结果需人工应用并保存。</li></ol><div className="help-coordinate"><strong>坐标与数据</strong><p>场景地图和轨迹使用世界米坐标；源帧使用 LiDAR 坐标；相机为光学坐标。投影通过校准矩阵链，并采用重建后的实际配准变换。逐点语义标签始终对应源帧点索引。</p></div></div>}
+    </div></div>}
   </div>;
 }

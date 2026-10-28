@@ -75,6 +75,31 @@ def test_local_camera_pixels_are_embedded_and_external_urls_are_not_fetched(inpu
         inference.infer_proposal(*inputs, "sam2", "road", assets_root=assets)
 
 
+def test_latr_sends_only_selected_image_and_never_sends_lidar_points(inputs, monkeypatch):
+    side = {**inputs[0]["cameras"][0], "id": "side", "name": "Side"}
+    inputs[0]["cameras"].append(side)
+    image = io.BytesIO()
+    Image.new("RGB", (100, 80), color=(10, 20, 30)).save(image, format="PNG")
+    encoded = "data:image/png;base64," + base64.b64encode(image.getvalue()).decode()
+    inputs[1]["images"] = {"front": encoded, "side": encoded}
+
+    def worker(request):
+        payload = json.loads(request.content)
+        assert list(payload["frame"]["images"]) == ["front"]
+        assert [camera["id"] for camera in payload["clip"]["cameras"]] == ["front"]
+        assert payload["frame"]["points"] == []
+        assert payload["frame"]["pointcloud_file"] is None
+        assert payload["options"]["weight_variant"] == "openlane"
+        return httpx.Response(200, json={"annotations": payload["annotations"], "model_version": "latr-test",
+                                         "weight_variant": "openlane"})
+
+    transport(monkeypatch, worker)
+    result = inference.infer_proposal(*inputs, "latr", "lane", options={"camera_id": "front", "weight_variant": "openlane"})
+    assert result["weight_variant"] == "openlane"
+    assert set(inputs[1]["images"]) == {"front", "side"}
+    assert inputs[1]["points"] == [[1, 2, 3, 0.5]]
+
+
 @pytest.mark.parametrize("proposed", [
     {"point_labels": {"1": "road"}},  # out-of-range point
     {"point_labels": {"0": ""}},

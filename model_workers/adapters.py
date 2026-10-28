@@ -15,7 +15,7 @@ import math
 import os
 from pathlib import Path
 import sys
-
+from PIL import Image
 import numpy as np
 
 from .common import (InvalidInput, ModelUnavailable, as_numpy, current_annotations,
@@ -182,6 +182,266 @@ class SAM2Adapter(Adapter):
                 "confidence": confidence, "conversion": conversions,
                 "warnings": ["SAM2 predicts class-agnostic masks. The selected label is assigned by the annotator, not inferred from text.",
                              "Simple polygon conversion approximates raster boundaries; holes are reported and require manual review."]}
+
+
+def latr_coordinate_matrices(payload, camera_id):
+    """Build LATR-ground -> LiDAR/camera transforms from OmniLabel calibration.
+
+    LATR lanes are [right, forward, up]. OmniLabel ego/LiDAR axes are
+    [forward, left, up], and frame vectors are stored in LiDAR coordinates.
+    """
+    camera = next((item for item in payload["clip"]["cameras"] if item.get("id") == camera_id), None)
+    if camera is None:
+        raise InvalidInput("Choose a camera present in this clip")
+    frame = payload["frame"]
+    try:
+        lidar_to_ego = np.asarray(frame["lidar_to_ego"], dtype=np.float64)
+        camera_from_ego = np.asarray(camera["camera_from_ego"], dtype=np.float64)
+        direct = frame.get("projection_camera_from_lidar", {}).get(camera_id)
+        if direct is None:
+            direct = frame.get("annotation_camera_from_lidar", {}).get(camera_id)
+        camera_from_lidar = (np.asarray(direct, dtype=np.float64) if direct is not None
+                             else camera_from_ego @ lidar_to_ego)
+        intrinsic = np.asarray(camera["intrinsics"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError):
+        raise InvalidInput("LATR requires valid camera intrinsics and LiDAR/ego/camera extrinsics") from None
+    if (lidar_to_ego.shape != (4, 4) or camera_from_lidar.shape != (4, 4)
+            or intrinsic.shape != (3, 3)
+            or not all(np.isfinite(value).all() for value in (lidar_to_ego, camera_from_lidar, intrinsic))):
+        raise InvalidInput("LATR requires finite 4x4 extrinsics and a finite 3x3 intrinsic matrix")
+    latr_to_ego = np.array([[0, 1, 0, 0], [-1, 0, 0, 0],
+                            [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
+    try:
+        latr_to_lidar = np.linalg.inv(lidar_to_ego) @ latr_to_ego
+    except np.linalg.LinAlgError:
+        raise InvalidInput("LATR cannot use a singular LiDAR-to-ego transform") from None
+    camera_from_latr = camera_from_lidar @ latr_to_lidar
+    # ONCE LATR is trained for a forward camera. Side/rear views violate both
+    # its query anchors and learned image distribution, so fail explicitly.
+    if camera_from_latr[2, 1] <= 0.2:
+        raise InvalidInput("LATR ONCE requires a forward-facing camera; select the front camera")
+    return camera, intrinsic, latr_to_lidar, camera_from_latr
+
+
+def decode_latr_predictions(output, anchor_y_steps, threshold, visibility_threshold,
+                            label, annotations, latr_to_lidar):
+    """Convert the final LATR decoder layer to OmniLabel LiDAR polylines."""
+    try:
+        lines = as_numpy(output["all_line_preds"])[-1, 0]
+        logits = as_numpy(output["all_cls_scores"])[-1, 0]
+    except (KeyError, IndexError, TypeError):
+        raise InvalidInput("LATR returned an unsupported prediction structure") from None
+    anchors = np.asarray(anchor_y_steps, dtype=np.float64)
+    transform = np.asarray(latr_to_lidar, dtype=np.float64)
+    if (lines.ndim != 2 or logits.ndim != 2 or len(lines) != len(logits)
+            or anchors.ndim != 1 or len(anchors) < 2
+            or lines.shape[1] != 3 * len(anchors) or logits.shape[1] < 2
+            or transform.shape != (4, 4)):
+        raise InvalidInput("LATR prediction dimensions do not match its configured lane anchors/classes")
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    categories = probabilities.argmax(axis=1)
+    scores = probabilities.max(axis=1)
+    confidence = {}
+    for prediction, category, score in zip(lines, categories, scores):
+        if int(category) == 0 or float(score) < threshold:
+            continue
+        visible = prediction[2 * len(anchors):] > visibility_threshold
+        if int(visible.sum()) < 2:
+            continue
+        latr_points = np.column_stack((prediction[:len(anchors)][visible], anchors[visible],
+                                       prediction[len(anchors):2 * len(anchors)][visible],
+                                       np.ones(int(visible.sum()), dtype=np.float64)))
+        lidar_points = (transform @ latr_points.T).T[:, :3]
+        if not np.isfinite(lidar_points).all():
+            raise InvalidInput("LATR returned non-finite lane coordinates")
+        annotation_id = new_id("latr")
+        annotations["vectors"].append({"id": annotation_id, "label": label,
+                                       "points": lidar_points.astype(float).tolist(), "closed": False})
+        confidence[annotation_id] = float(score)
+    return confidence
+
+
+class LATRAdapter(Adapter):
+    id, name = "latr", "LATR (ONCE / OpenLane)"
+    tasks = ["3d-lane-detection"]
+    dependencies = ["torch", "torchvision", "mmcv", "mmdet", "mmdet3d", "mmseg",
+                    "cv2", "scipy", "matplotlib", "geffnet", "fvcore"]
+    checkpoint_variable, config_variable = "LATR_CHECKPOINT", "LATR_CONFIG"
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = None
+        self.repo = None
+        self.active_variant = None
+
+    def variant_paths(self, variant):
+        if variant not in ("once", "openlane"):
+            raise InvalidInput("LATR weight_variant must be once or openlane")
+        repo = Path(os.environ.get("LATR_REPO", "")) if os.environ.get("LATR_REPO") else None
+        if repo is None:
+            return None, None
+        if variant == "once":
+            checkpoint = os.environ.get("LATR_ONCE_CHECKPOINT", os.environ.get("LATR_CHECKPOINT", str(repo / "ckpt" / "once.pth")))
+            config = os.environ.get("LATR_ONCE_CONFIG", os.environ.get("LATR_CONFIG", str(repo / "config" / "release_iccv" / "once.py")))
+        else:
+            checkpoint = os.environ.get("LATR_OPENLANE_CHECKPOINT", str(repo / "ckpt" / "openlane.pth"))
+            config = os.environ.get("LATR_OPENLANE_CONFIG", str(repo / "config" / "release_iccv" / "latr_1000_baseline.py"))
+        return Path(checkpoint), Path(config)
+
+    def default_variant(self):
+        variant = os.environ.get("LATR_DEFAULT_VARIANT", "once").lower()
+        if variant not in ("once", "openlane"):
+            raise ModelUnavailable("LATR_DEFAULT_VARIANT must be once or openlane")
+        return variant
+
+    def status(self):
+        missing = [name for name in self.dependencies if not module_present(name)]
+        repo = Path(os.environ.get("LATR_REPO", "")) if os.environ.get("LATR_REPO") else None
+        variants = {}
+        for variant in ("once", "openlane"):
+            checkpoint, config = self.variant_paths(variant)
+            variants[variant] = bool(checkpoint and checkpoint.is_file() and config and config.is_file())
+        status, reason = "configured", "LATR weight variants configured; model has not been loaded"
+        try:
+            default = self.default_variant()
+        except ModelUnavailable as exc:
+            default, status, reason = "once", "error", str(exc)
+        if missing:
+            status, reason = "missing_dependencies", "Missing runtime packages: " + ", ".join(missing)
+        elif repo is None or not (repo / "models" / "latr.py").is_file():
+            status, reason = "missing_repository", "Set LATR_REPO to the trusted LATR source checkout"
+        elif not variants.get(default):
+            status, reason = "missing_checkpoint", "The default LATR variant requires its matching checkpoint and config"
+        elif self.failure:
+            status, reason = "error", self.failure
+        elif self.model is not None:
+            status, reason = "ready", "Official LATR model loaded (" + str(self.active_variant) + ")"
+        value = {"id": self.id, "name": self.name, "tasks": self.tasks, "available": status == "ready",
+                 "status": status, "reason": reason, "device": self.device,
+                 "supports": {"point_prompt": False, "box_prompt": False, "text_prompt": False,
+                              "occupancy": False, "lane_vectors": True,
+                              "weight_variants": [name for name, ready in variants.items() if ready],
+                              "active_weight_variant": self.active_variant}}
+        return value
+
+    def prerequisites(self, variant=None):
+        variant = variant or self.default_variant()
+        status = self.status()
+        if status["status"] in ("missing_dependencies", "missing_repository"):
+            raise ModelUnavailable(status["reason"])
+        checkpoint, config = self.variant_paths(variant)
+        if checkpoint is None or not checkpoint.is_file():
+            raise ModelUnavailable("LATR " + variant + " checkpoint is missing")
+        if config is None or not config.is_file():
+            raise ModelUnavailable("LATR " + variant + " config is missing")
+        return checkpoint, config
+
+    def load(self, variant=None):
+        variant = variant or self.default_variant()
+        checkpoint_path, config_path = self.prerequisites(variant)
+        import torch
+        from mmcv.utils import Config
+        device = torch.device(self.device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ModelUnavailable("LATR requires a working CUDA runtime for its compiled deformable operators")
+        self.repo = Path(os.environ["LATR_REPO"]).resolve()
+        repo_text = str(self.repo)
+        if repo_text not in sys.path:
+            sys.path.insert(0, repo_text)
+        try:
+            from models.latr import LATR
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise ModelUnavailable("LATR source dependencies are incomplete (" + type(exc).__name__ + ")") from None
+        cfg = Config.fromfile(str(config_path))
+        if cfg.latr_cfg.encoder.get("init_cfg", None) is not None:
+            cfg.latr_cfg.encoder.init_cfg = None
+        # Upstream LATRHead mutates project_crit with pop('type'). When the
+        # argument is omitted it mutates the function's shared default dict,
+        # so constructing a second model in one worker fails. Pass a fresh
+        # per-load mapping to make ONCE/OpenLane switching repeatable.
+        cfg.latr_cfg.head.update(
+            loss_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0),
+            loss_reg=dict(type="L1Loss", loss_weight=2.0),
+            loss_vis=dict(type="BCEWithLogitsLoss", reduction="mean"),
+            project_crit=dict(type="SmoothL1Loss", reduction="none"),
+        )
+        cfg.anchor_y_steps_dense = cfg.get("anchor_y_steps_dense", np.linspace(3, 103, 200))
+        cfg.no_cuda = device.type != "cuda"
+        expected_categories = 2 if variant == "once" else 21
+        if int(cfg.num_category) != expected_categories:
+            raise ModelUnavailable("LATR " + variant + " config does not match the selected dataset variant")
+        # Release the previous GPU model before constructing a structurally
+        # different variant (12 vs 40 queries) to avoid double VRAM usage.
+        self.model, self.cfg, self.active_variant = None, None, None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        model = LATR(cfg)
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        state_dict = {(key[7:] if key.startswith("module.") else key): value for key, value in state_dict.items()}
+        model.load_state_dict(state_dict, strict=True)
+        self.model, self.cfg = model.to(device).eval(), cfg
+        self.active_variant = variant
+        self.version = model_version(self.id + "-" + variant, checkpoint_path)
+        self.failure = None
+
+    def predict(self, payload):
+        options = payload.get("options", {})
+        variant = options.get("weight_variant", self.default_variant())
+        if variant not in ("once", "openlane"):
+            raise InvalidInput("LATR weight_variant must be once or openlane")
+        if self.model is None or self.active_variant != variant:
+            self.load(variant)
+        import torch
+        import cv2
+        threshold, label = validate_options(options)
+        camera_id = options.get("camera_id") or next(iter(payload["frame"].get("images", {})), None)
+        if not camera_id:
+            raise InvalidInput("LATR requires a selected forward camera image")
+        image, _ = image_from_payload(payload, camera_id)
+        camera, intrinsic, latr_to_lidar, camera_from_latr = latr_coordinate_matrices(payload, camera_id)
+        pixels = np.asarray(image)
+        distortion = np.asarray(camera.get("distortion", []), dtype=np.float64)
+        if distortion.size and np.any(distortion != 0):
+            pixels = cv2.undistort(pixels, intrinsic, distortion, None, intrinsic)
+        height, width = pixels.shape[:2]
+        crop_y = int(self.cfg.crop_y)
+        if not 0 <= crop_y < height:
+            raise InvalidInput("LATR crop_y is outside the selected image")
+        resized = np.asarray(Image.fromarray(pixels[crop_y:]).resize(
+            (int(self.cfg.resize_w), int(self.cfg.resize_h)), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+        normalized = (resized - np.asarray(self.cfg.mean, dtype=np.float32)) / np.asarray(self.cfg.std, dtype=np.float32)
+        image_tensor = torch.from_numpy(normalized.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
+        ratio_x = float(self.cfg.resize_w) / width
+        ratio_y = float(self.cfg.resize_h) / (height - crop_y)
+        crop_resize = np.array([[ratio_x, 0, 0], [0, ratio_y, -ratio_y * crop_y], [0, 0, 1]], dtype=np.float64)
+        projection = crop_resize @ intrinsic @ camera_from_latr[:3]
+        lidar2img = np.eye(4, dtype=np.float32)
+        lidar2img[:3] = projection.astype(np.float32)
+        network_height, network_width = int(self.cfg.resize_h), int(self.cfg.resize_w)
+        extra = {
+            "seg_label": torch.zeros((1, 1, network_height, network_width), dtype=torch.float32, device=self.device),
+            "seg_idx_label": torch.zeros((1, int(self.cfg.max_lanes), network_height, network_width), dtype=torch.uint8, device=self.device),
+            "lidar2img": torch.from_numpy(lidar2img).unsqueeze(0).to(self.device),
+            "pad_shape": torch.tensor([[network_height, network_width]], dtype=torch.float32, device=self.device),
+        }
+        try:
+            visibility_threshold = float(os.environ.get("LATR_VISIBILITY_THRESHOLD", "0"))
+        except ValueError:
+            raise ModelUnavailable("LATR_VISIBILITY_THRESHOLD must be a finite number") from None
+        if not math.isfinite(visibility_threshold):
+            raise ModelUnavailable("LATR_VISIBILITY_THRESHOLD must be a finite number")
+        with torch.no_grad():
+            output = self.model(image=image_tensor, extra_dict=extra, is_training=False)
+        annotations = current_annotations(payload)
+        confidence = decode_latr_predictions(output, self.cfg.anchor_y_steps, threshold,
+                                             visibility_threshold, label, annotations, latr_to_lidar)
+        return {"annotations": annotations, "model_version": self.version, "confidence": confidence,
+                "weight_variant": variant,
+                "warnings": ["LATR used the " + variant.upper() + " weight/config pair on the selected forward monocular image; review domain shift and calibration before saving.",
+                             "Lane points were transformed from LATR [right, forward, up] coordinates into this frame's LiDAR coordinates."]}
 
 
 def normalize_detection(result, class_names, threshold, annotations):
@@ -408,4 +668,4 @@ class OpenOccupancyAdapter(Adapter):
                              "Published checkpoints are NuScenes-specific. This request uses uploaded calibration and a single scan; validate domain and sweep-density differences."]}
 
 
-ADAPTERS = {adapter.id: adapter for adapter in (SAM2Adapter, MMDetection3DAdapter, OpenOccupancyAdapter)}
+ADAPTERS = {adapter.id: adapter for adapter in (SAM2Adapter, LATRAdapter, MMDetection3DAdapter, OpenOccupancyAdapter)}

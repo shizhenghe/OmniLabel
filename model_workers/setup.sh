@@ -3,8 +3,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 model="${1:-}"
 case "$model" in
-  sam2|mmdetection3d|openoccupancy) ;;
-  *) echo 'Usage: bash model_workers/setup.sh sam2|mmdetection3d|openoccupancy' >&2; exit 2 ;;
+  sam2|latr|mmdetection3d|openoccupancy) ;;
+  *) echo 'Usage: bash model_workers/setup.sh sam2|latr|mmdetection3d|openoccupancy' >&2; exit 2 ;;
 esac
 # Run within the selected model's existing GPU Python environment. Do not
 # replace CUDA/PyTorch versions or combine incompatible OpenMMLab generations.
@@ -17,6 +17,11 @@ case "$model" in
     # Use the already selected torch build for model compilation. Build isolation
     # otherwise downloads another torch runtime from SAM2's build requirements.
     python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/sam2.git@${SAM2_SOURCE_REF:-2b90b9f5ceec907a1c18123530e92e794ad901a4}"
+    ;;
+  latr)
+    : "${LATR_REPO:?Set LATR_REPO to the trusted LATR source checkout}"
+    python -m pip install fvcore geffnet
+    python -c 'from mmcv.utils import Config; import mmdet, mmdet3d, mmseg, cv2, scipy, matplotlib, geffnet, fvcore; print("LATR legacy OpenMMLab runtime is importable")'
     ;;
   mmdetection3d)
     python -m pip install openmim

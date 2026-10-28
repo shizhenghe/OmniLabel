@@ -112,8 +112,9 @@ def main() -> None:
                                  "camera_count": len(other.cameras)})
         files = {path.name: [path.stat().st_size, path.stat().st_mtime_ns]
                  for path in sorted(clip_root.glob("*.json"))}
-        from omnilabel.storage import atomic_json
-        atomic_json(DATA / "clip_summaries.json", {"files": files, "summaries": summary_rows})
+        from omnilabel.storage import CLIP_SUMMARY_CACHE_VERSION, atomic_json
+        atomic_json(DATA / "clip_summaries.json", {"version": CLIP_SUMMARY_CACHE_VERSION,
+                                                     "files": files, "summaries": summary_rows})
         print(f"Created {destination_clip}")
         print(f"Frames: {len(merged_frames)}; points: {total_points:,}; existing annotation files copied: {annotations_found}")
         print(f"Point clouds: {final_points}")
