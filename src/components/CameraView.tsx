@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Annotations, Camera, Frame, ProjectionPoint } from '../types';
 import { labelColor } from './PointCloudView';
-import { projectAnnotationResults, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
+import { projectAnnotationResults, projectLidarPoint, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
 
 export { projectLidarPoint } from '../geometry/cameraProjection';
 
@@ -31,6 +31,9 @@ export interface CameraViewProps {
   modelBox?: number[];
   selectedId?: string | null;
   className?: string;
+  calibrationPicking?: boolean;
+  onCalibrationPixel?: (pixel: Pixel) => void;
+  calibrationAnchors?: {id: string; point: number[]; pixel: Pixel; label: string; selected?: boolean; enabled?: boolean}[];
 }
 
 export function CameraView(props: CameraViewProps) {
@@ -211,6 +214,21 @@ export function CameraView(props: CameraViewProps) {
       if (positive) { ctx.moveTo(x, y - 2.5); ctx.lineTo(x, y + 2.5); }
       ctx.stroke();
     });
+    for (const anchor of props.calibrationAnchors ?? []) {
+      const [x, y] = xy(anchor.pixel);
+      const projected = props.frame ? projectLidarPoint(anchor.point, props.camera, props.frame) : null;
+      const color = anchor.enabled === false ? '#8292a0' : anchor.selected ? '#ffffff' : '#ffcf70';
+      if (projected && projected[0] >= 0 && projected[0] <= width && projected[1] >= 0 && projected[1] <= height) {
+        const [px, py] = xy(projected);
+        ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(px, py); ctx.stroke(); ctx.setLineDash([]);
+        ctx.strokeRect(px - 3, py - 3, 6, 6);
+      }
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.7;
+      ctx.beginPath(); ctx.arc(x, y, anchor.selected ? 6 : 4, 0, Math.PI * 2); ctx.stroke();
+      ctx.font = 'bold 11px system-ui'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+      ctx.fillText(anchor.label, x + 7, y - 3);
+    }
     ctx.restore();
   }, [props, imageState, displayImage, size, visibleResults, draftModelBox]);
 
@@ -239,7 +257,9 @@ export function CameraView(props: CameraViewProps) {
     data-projection-signature={signature}
     data-model-point-count={props.modelPoints?.length ?? 0}
     data-model-box={props.modelBox?.join(',') ?? ''}
-    style={{ position: 'relative', width: '100%', height: '100%', minHeight: 92, overflow: 'hidden', background: '#0b1420', outline: props.selected ? '1px solid #60dbc3' : undefined, outlineOffset: -1, cursor: props.tool === 'polygon' || props.modelPromptMode ? 'crosshair' : props.onSelect ? 'pointer' : 'default' }}
+    data-calibration-anchor-count={props.calibrationAnchors?.length ?? 0}
+    data-calibration-picking={props.calibrationPicking ? 'true' : 'false'}
+    style={{ position: 'relative', width: '100%', height: '100%', minHeight: 92, overflow: 'hidden', background: '#0b1420', outline: props.selected ? '1px solid #60dbc3' : undefined, outlineOffset: -1, cursor: props.calibrationPicking || props.tool === 'polygon' || props.modelPromptMode ? 'crosshair' : props.onSelect ? 'pointer' : 'default' }}
     onPointerDown={event => {
       if (props.modelPromptMode !== 'box' || event.button !== 0 || imageState !== 'ready') return;
       if (props.onSelect?.() === false) return;
@@ -271,6 +291,13 @@ export function CameraView(props: CameraViewProps) {
     onPointerCancel={() => { modelDrag.current = null; setDraftModelBox(null); }}
     onClick={(event) => {
       if (props.onSelect?.() === false) return;
+      if (props.calibrationPicking) {
+        if (imageState === 'ready' && event.detail <= 1) {
+          const point = originalPixel(event.clientX, event.clientY);
+          if (point) props.onCalibrationPixel?.(point);
+        }
+        return;
+      }
       if (props.modelPromptMode) {
         if (props.modelPromptMode === 'point' && imageState === 'ready') {
           const point = originalPixel(event.clientX, event.clientY);

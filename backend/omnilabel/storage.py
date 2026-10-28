@@ -17,6 +17,11 @@ from .models import Annotations, Clip, Frame
 
 LOGGER = logging.getLogger(__name__)
 
+# Increment whenever the summary-building contract changes.  File mtimes alone
+# cannot invalidate a cache produced by an older server that rejected fields a
+# newer Clip schema accepts.
+CLIP_SUMMARY_CACHE_VERSION = 2
+
 
 class ConflictError(Exception):
     pass
@@ -63,6 +68,11 @@ class Store:
                     atomic_json(path, job)
 
     def clip(self, clip_id: str) -> Clip:
+        from .projection_calibration import overlay_projection_calibrations
+        return overlay_projection_calibrations(self, self.source_clip(clip_id))
+
+    def source_clip(self, clip_id: str) -> Clip:
+        """Read the source manifest without materializing local calibration overlays."""
         path = self.root / "clips" / f"{safe_id(clip_id)}.json"
         if not path.is_file():
             raise KeyError("clip not found")
@@ -77,30 +87,45 @@ class Store:
             raise ValueError("referenced point cloud is missing or outside the pointcloud store")
         return source
 
+    def calibration_pointcloud_path(self, frame: Frame) -> Path:
+        if frame.calibration_pointcloud_file is None:
+            raise ValueError("this frame has no synchronized calibration point cloud")
+        points_root = (self.root / "pointclouds").resolve()
+        source = (points_root / frame.calibration_pointcloud_file).resolve()
+        if not source.is_relative_to(points_root) or not source.is_file():
+            raise ValueError("referenced calibration point cloud is missing or outside the pointcloud store")
+        return source
+
+    def _stored_point_array(self, source: Path, expected_count: int | None, *, label: str) -> np.ndarray:
+        try:
+            points = np.load(source, allow_pickle=False, mmap_mode="r")
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"referenced {label} is not a valid NPY array") from exc
+        if (points.ndim != 2 or points.shape[1] not in (3, 4)
+                or len(points) != expected_count or points.dtype.kind not in "fiu"):
+            raise ValueError(f"referenced {label} has invalid shape, count, type, or values")
+        stat = source.stat()
+        key = (str(source), stat.st_size, stat.st_mtime_ns, expected_count)
+        if key not in self._point_validations:
+            for start in range(0, len(points), 100_000):
+                if not np.isfinite(points[start:start + 100_000]).all():
+                    raise ValueError(f"referenced {label} contains non-finite values")
+            self._point_validations[key] = True
+        if points.shape[1] == 3:
+            points = np.column_stack((points, np.zeros(len(points), dtype=points.dtype)))
+        return points
+
     def frame_point_array(self, frame: Frame) -> np.ndarray:
         if frame.pointcloud_file is None:
             points = np.asarray(frame.points, dtype=float)
             return points if points.size else np.empty((0, 4), dtype=float)
         source = self.pointcloud_path(frame)
-        try:
-            points = np.load(source, allow_pickle=False, mmap_mode="r")
-        except (OSError, ValueError) as exc:
-            raise ValueError("referenced point cloud is not a valid NPY array") from exc
-        if (points.ndim != 2 or points.shape[1] not in (3, 4)
-                or len(points) != frame.point_count or points.dtype.kind not in "fiu"):
-            raise ValueError("referenced point cloud has invalid shape, count, type, or values")
-        stat = source.stat()
-        key = (str(source), stat.st_size, stat.st_mtime_ns, frame.point_count)
-        if key not in self._point_validations:
-            # Validate all records in bounded working memory. This does not
-            # subsample or limit the scan, including labels at its last index.
-            for start in range(0, len(points), 100_000):
-                if not np.isfinite(points[start:start + 100_000]).all():
-                    raise ValueError("referenced point cloud contains non-finite values")
-            self._point_validations[key] = True
-        if points.shape[1] == 3:
-            points = np.column_stack((points, np.zeros(len(points), dtype=points.dtype)))
-        return points
+        return self._stored_point_array(source, frame.point_count, label="point cloud")
+
+    def calibration_point_array(self, frame: Frame) -> np.ndarray:
+        source = self.calibration_pointcloud_path(frame)
+        return self._stored_point_array(source, frame.calibration_point_count,
+                                        label="calibration point cloud")
 
     def frame_points(self, frame: Frame) -> list[list[float]]:
         return self.frame_point_array(frame).tolist()
@@ -119,7 +144,9 @@ class Store:
         cache_path = self.root / "clip_summaries.json"
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("files") == files and isinstance(cached.get("summaries"), list):
+            if (cached.get("version") == CLIP_SUMMARY_CACHE_VERSION
+                    and cached.get("files") == files
+                    and isinstance(cached.get("summaries"), list)):
                 return cached["summaries"]
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, AttributeError):
             pass
@@ -132,7 +159,8 @@ class Store:
                 continue
             summaries.append({"id": clip.id, "name": clip.name, "description": clip.description,
                               "fps": clip.fps, "frame_count": len(clip.frames), "camera_count": len(clip.cameras)})
-        atomic_json(cache_path, {"files": files, "summaries": summaries})
+        atomic_json(cache_path, {"version": CLIP_SUMMARY_CACHE_VERSION,
+                                 "files": files, "summaries": summaries})
         return summaries
 
     def add_clip(self, clip: Clip, annotations: dict[str, Annotations] | None = None):

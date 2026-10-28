@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import hmac
 import json
+import logging
 import os
 import threading
 
@@ -18,12 +19,13 @@ from .adapters import ADAPTERS
 from .common import InvalidInput, ModelUnavailable
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def create_app(model_id=None, adapter=None, eager_load=True):
     selected = model_id or os.environ.get("OMNILABEL_WORKER_MODEL", "sam2")
     if selected not in ADAPTERS:
-        raise ValueError("OMNILABEL_WORKER_MODEL must be sam2, mmdetection3d or openoccupancy")
+        raise ValueError("OMNILABEL_WORKER_MODEL must be sam2, latr, mmdetection3d or openoccupancy")
     runtime = adapter or ADAPTERS[selected]()
     lock = threading.Lock()
 
@@ -38,6 +40,7 @@ def create_app(model_id=None, adapter=None, eager_load=True):
                 runtime.failure = str(exc)
             except Exception as exc:
                 # Show an actionable class without URLs, checkpoint data or tokens.
+                LOGGER.exception("%s model initialization failed", selected)
                 runtime.failure = "Model initialization failed (" + type(exc).__name__ + "). Check the matching dependency/config/checkpoint versions on the worker."
         yield
 
@@ -91,6 +94,9 @@ def create_app(model_id=None, adapter=None, eager_load=True):
             raise HTTPException(503, str(exc)) from None
         except Exception as exc:
             # The model framework may include local paths or URLs in exceptions.
+            # Keep the HTTP response sanitized, but retain the full traceback in
+            # the operator-owned worker log so framework/CUDA failures are diagnosable.
+            LOGGER.exception("%s inference failed", selected)
             raise HTTPException(500, "Model inference failed (" + type(exc).__name__ + "); inspect the worker runtime and compatible checkpoint") from None
 
     return application

@@ -11,7 +11,8 @@ from PIL import Image
 import pytest
 
 from model_workers.app import create_app
-from model_workers.adapters import (SAM2Adapter, OpenOccupancyAdapter,
+from model_workers.adapters import (SAM2Adapter, LATRAdapter, OpenOccupancyAdapter,
+                                    decode_latr_predictions, latr_coordinate_matrices,
                                     normalize_detection, occupancy_from_logits, resolve_sam2_precision)
 from model_workers.common import (InvalidInput, image_from_payload,
                                   mask_to_polygons, ModelUnavailable, points_array, validate_options)
@@ -257,3 +258,67 @@ def test_points_are_original_xyzi_with_no_invented_measurements():
     points = points_array({"points": [[1, 2, 3]]})
     assert points.tolist() == [[1, 2, 3, 0]]
     with pytest.raises(InvalidInput): points_array({"points": [[float("nan"), 2, 3]]})
+
+
+def test_latr_calibration_converts_right_forward_up_to_lidar_coordinates():
+    identity = np.eye(4).tolist()
+    # Ego [forward,left,up] -> optical camera [right,down,forward].
+    camera_from_ego = [[0, -1, 0, 0], [0, 0, -1, 1.5],
+                       [1, 0, 0, 0], [0, 0, 0, 1]]
+    request = {"clip": {"cameras": [{"id": "front", "intrinsics": [[1000, 0, 960], [0, 1000, 640], [0, 0, 1]],
+                                        "camera_from_ego": camera_from_ego}]},
+               "frame": {"lidar_to_ego": identity}}
+    _, intrinsic, latr_to_lidar, camera_from_latr = latr_coordinate_matrices(request, "front")
+    np.testing.assert_array_equal(intrinsic, [[1000, 0, 960], [0, 1000, 640], [0, 0, 1]])
+    np.testing.assert_allclose(latr_to_lidar @ [2, 10, .5, 1], [10, -2, .5, 1])
+    # LATR forward points have positive optical depth for the chosen camera.
+    assert camera_from_latr[2, 1] == 1
+
+
+def test_latr_decoder_adds_only_visible_confident_3d_lane_vectors():
+    anchors = np.array([1, 2, 3], dtype=float)
+    output = {
+        "all_line_preds": np.array([[[
+            [1, 2, 3, .1, .2, .3, 1, 1, -1],
+            [-1, -2, -3, 0, 0, 0, 1, 1, 1],
+        ]]], dtype=float),
+        "all_cls_scores": np.array([[[[0, 4], [4, 0]]]], dtype=float),
+    }
+    annotations = {"boxes": [], "vectors": [{"id": "manual", "label": "lane", "points": [[0, 0, 0], [1, 0, 0]], "closed": False}],
+                   "image_polygons": [], "point_labels": {}, "revision": 3}
+    latr_to_lidar = np.array([[0, 1, 0, 0], [-1, 0, 0, 0],
+                              [0, 0, 1, 0], [0, 0, 0, 1]], dtype=float)
+    confidence = decode_latr_predictions(output, anchors, .8, 0, "lane_solid", annotations, latr_to_lidar)
+    assert len(annotations["vectors"]) == 2
+    predicted = annotations["vectors"][1]
+    assert predicted["label"] == "lane_solid" and not predicted["closed"]
+    np.testing.assert_allclose(predicted["points"], [[1, -1, .1], [2, -2, .2]])
+    assert list(confidence) == [predicted["id"]]
+    assert confidence[predicted["id"]] > .98
+
+
+def test_latr_rejects_side_or_rear_camera_calibration():
+    identity = np.eye(4).tolist()
+    request = {"clip": {"cameras": [{"id": "rear", "intrinsics": np.eye(3).tolist(),
+                                        "camera_from_ego": [[0, 1, 0, 0], [0, 0, -1, 1],
+                                                            [-1, 0, 0, 0], [0, 0, 0, 1]]}]},
+               "frame": {"lidar_to_ego": identity}}
+    with pytest.raises(InvalidInput, match="forward-facing"):
+        latr_coordinate_matrices(request, "rear")
+
+
+def test_latr_weight_variants_resolve_matching_checkpoint_and_config(tmp_path, monkeypatch):
+    repo = tmp_path / "latr"
+    for relative in ("models/latr.py", "ckpt/once.pth", "ckpt/openlane.pth",
+                     "config/release_iccv/once.py", "config/release_iccv/latr_1000_baseline.py"):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    monkeypatch.setenv("LATR_REPO", str(repo))
+    adapter = LATRAdapter()
+    once = adapter.variant_paths("once")
+    openlane = adapter.variant_paths("openlane")
+    assert once == (repo / "ckpt/once.pth", repo / "config/release_iccv/once.py")
+    assert openlane == (repo / "ckpt/openlane.pth", repo / "config/release_iccv/latr_1000_baseline.py")
+    with pytest.raises(InvalidInput, match="once or openlane"):
+        adapter.variant_paths("unknown")

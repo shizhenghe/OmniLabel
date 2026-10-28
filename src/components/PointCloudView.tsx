@@ -8,11 +8,18 @@ import {renderOriginForPoints, toRenderPoint} from '../geometry/renderCoordinate
 
 export interface PointCloudViewProps {
   frame: Frame | null;
+  /** Flat XYZI rows loaded directly from NPY for very large clouds. */
+  binaryPoints?: Float32Array;
+  cloudBounds?: {min: Vec3; max: Vec3};
+  intensityRangeHint?: [number, number] | null;
   annotations: Annotations;
   selectedId?: string | null;
   onSelect?: (id: string | null) => void;
   onCreateBox?: (center: Vec3) => void;
   onAddVectorPoint?: (point: Vec3) => void;
+  calibrationPicking?: boolean;
+  onCalibrationPoint?: (point: Vec3) => void;
+  calibrationPoints?: {id: string; point: Vec3; label: string; selected?: boolean; enabled?: boolean}[];
   onPaint?: (indices: number[]) => void;
   onUpdateBox?: (id: string, patch: Partial<Box>) => void;
   transformMode?: BoxTransformMode;
@@ -24,7 +31,7 @@ export interface PointCloudViewProps {
   trajectory?: {frame_id: string; timestamp: number; position: Vec3}[];
   activeFrameId?: string;
   /** Stable raw source identity prevents refitting the camera on every live calibration step. */
-  autoFitReference?: number[][];
+  autoFitReference?: number[][] | Float32Array;
   /** Review can follow ego translation while preserving the chosen view direction and zoom. */
   followPosition?: Vec3;
   /** Increment to frame the currently selected box once; dragging never refits. */
@@ -139,6 +146,7 @@ interface Runtime {
   annotationsGroup: THREE.Group;
   overlaysGroup: THREE.Group;
   trajectoryGroup: THREE.Group;
+  calibrationGroup: THREE.Group;
   cloud: THREE.Points | null;
   grid: THREE.GridHelper;
 }
@@ -152,12 +160,31 @@ export function PointCloudView(props: PointCloudViewProps) {
   const [cursor, setCursor] = useState('');
   const [ready, setReady] = useState(false);
   const pointerStart = useRef<[number, number] | null>(null);
-  const origin = useMemo(() => renderOriginForPoints(props.frame?.points ?? []), [props.autoFitReference ?? props.frame?.points]);
+  const origin = useMemo<Vec3>(() => {
+    if (!props.binaryPoints) return renderOriginForPoints(props.frame?.points ?? []);
+    for (let offset = 0; offset < props.binaryPoints.length; offset += 4) {
+      const first = [props.binaryPoints[offset], props.binaryPoints[offset + 1], props.binaryPoints[offset + 2]] as Vec3;
+      if (first.every(Number.isFinite)) return first.some(value => Math.abs(value) >= 10000) ? first : [0, 0, 0];
+    }
+    return [0, 0, 0];
+  }, [props.autoFitReference ?? props.binaryPoints ?? props.frame?.points]);
   const previousOrigin = useRef<Vec3>([0, 0, 0]);
   const colorMode = props.colorMode ?? (props.semantic ? 'semantic' : 'height');
   const pointLabelCount = useMemo(() => Object.keys(props.annotations.point_labels).length, [props.annotations.point_labels]);
-  const visibleIndices = useMemo(() => visiblePointIndices(props.frame?.points ?? [], props.groundOnly, props.groundZ ?? -1.7, props.groundBand),
-    [props.frame?.points, props.groundOnly, props.groundZ, props.groundBand]);
+  const pointCount = props.binaryPoints ? props.binaryPoints.length / 4 : props.frame?.points.length ?? 0;
+  const visibleIndices = useMemo<number[] | null>(() => {
+    if (!props.binaryPoints) return visiblePointIndices(props.frame?.points ?? [], props.groundOnly, props.groundZ ?? -1.7, props.groundBand);
+    if (!props.groundOnly) return null;
+    const result: number[] = [];
+    const groundZ = props.groundZ ?? -1.7;
+    const band = Math.max(0, props.groundBand ?? .35);
+    for (let offset = 0, index = 0; offset < props.binaryPoints.length; offset += 4, index++) {
+      const x = props.binaryPoints[offset], y = props.binaryPoints[offset + 1], z = props.binaryPoints[offset + 2];
+      if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) && Math.abs(z - groundZ) <= band) result.push(index);
+    }
+    return result;
+  }, [props.binaryPoints, props.frame?.points, props.groundOnly, props.groundZ, props.groundBand]);
+  const visibleCount = visibleIndices?.length ?? pointCount;
 
   useEffect(() => {
     const host = container.current;
@@ -198,8 +225,9 @@ export function PointCloudView(props: PointCloudViewProps) {
     const annotationsGroup = new THREE.Group();
     const overlaysGroup = new THREE.Group();
     const trajectoryGroup = new THREE.Group();
-    scene.add(pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup);
-    runtime.current = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, cloud: null, grid };
+    const calibrationGroup = new THREE.Group();
+    scene.add(pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup);
+    runtime.current = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup, cloud: null, grid };
     const resize = () => {
       const { width, height } = host.getBoundingClientRect();
       if (width <= 0 || height <= 0) return;
@@ -244,28 +272,55 @@ export function PointCloudView(props: PointCloudViewProps) {
     disposeObject(rt.pointsGroup);
     rt.pointsGroup.clear();
     rt.cloud = null;
-    const points = props.frame?.points;
-    if (!points?.length) return;
-    const positions = new Float32Array(visibleIndices.length * 3);
-    const colors = new Float32Array(visibleIndices.length * 3);
+    const points = props.frame?.points ?? [];
+    const binary = props.binaryPoints;
+    if (!pointCount) return;
+    const positions = new Float32Array(visibleCount * 3);
+    const colors = new Float32Array(visibleCount * 3);
     const color = new THREE.Color();
-    const range = colorMode === 'intensity' ? intensityRange(points, visibleIndices) : null;
-    visibleIndices.forEach((sourceIndex, displayIndex) => {
-      const p = points[sourceIndex];
-    positions.set(toRenderPoint(p, origin), displayIndex * 3);
+    let range = colorMode === 'intensity' && !binary ? intensityRange(points, visibleIndices ?? [])
+      : colorMode === 'intensity' ? props.intensityRangeHint ?? null : null;
+    if (colorMode === 'intensity' && binary && !range) {
+      let minimum = Infinity, maximum = -Infinity;
+      const samples: number[] = [];
+      const sampleStep = Math.max(1, Math.floor(visibleCount / 8192));
+      for (let displayIndex = 0; displayIndex < visibleCount; displayIndex++) {
+        const sourceIndex = visibleIndices?.[displayIndex] ?? displayIndex;
+        const value = binary[sourceIndex * 4 + 3];
+        if (!Number.isFinite(value)) continue;
+        minimum = Math.min(minimum, value); maximum = Math.max(maximum, value);
+        if (displayIndex % sampleStep === 0) samples.push(value);
+      }
+      if (Number.isFinite(minimum) && maximum - minimum > Math.max(1e-9, Math.abs(maximum) * 1e-7)) {
+        samples.sort((a, b) => a - b);
+        const low = samples[Math.floor((samples.length - 1) * .02)] ?? minimum;
+        const high = samples[Math.floor((samples.length - 1) * .995)] ?? maximum;
+        range = high > low ? [low, high] : [minimum, maximum];
+      }
+    }
+    for (let displayIndex = 0; displayIndex < visibleCount; displayIndex++) {
+      const sourceIndex = visibleIndices?.[displayIndex] ?? displayIndex;
+      const offset = sourceIndex * 4;
+      const row = binary ? undefined : points[sourceIndex];
+      const x = binary ? binary[offset] : row![0];
+      const y = binary ? binary[offset + 1] : row![1];
+      const z = binary ? binary[offset + 2] : row![2];
+      const intensity = binary ? binary[offset + 3] : row![3];
+      const target = displayIndex * 3;
+      positions[target] = x - origin[0]; positions[target + 1] = y - origin[1]; positions[target + 2] = z - origin[2];
       const label = props.annotations.point_labels[String(sourceIndex)];
       if (colorMode === 'semantic' && label) color.set(labelColor(label));
       else if (colorMode === 'semantic') color.set('#748a9e');
       else if (colorMode === 'intensity') {
-        const brightness = intensityBrightness(p[3], range);
+        const brightness = intensityBrightness(intensity, range);
         color.setRGB(brightness, brightness, brightness, THREE.SRGBColorSpace);
       }
       else {
-        const height = THREE.MathUtils.clamp((p[2] + 2.2) / 7, 0, 1);
+        const height = THREE.MathUtils.clamp((z + 2.2) / 7, 0, 1);
         color.setHSL(0.55 - height * 0.5, 0.64, 0.46 + height * 0.17);
       }
-      colors.set([color.r, color.g, color.b], displayIndex * 3);
-    });
+      colors[target] = color.r; colors[target + 1] = color.g; colors[target + 2] = color.b;
+    }
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -274,18 +329,26 @@ export function PointCloudView(props: PointCloudViewProps) {
     cloud.userData.sourceIndices = visibleIndices;
     rt.pointsGroup.add(cloud);
     rt.cloud = cloud;
-  }, [ready, props.frame?.points, props.annotations.point_labels, colorMode, visibleIndices, origin]);
+  }, [ready, props.frame?.points, props.binaryPoints, props.intensityRangeHint, props.annotations.point_labels, colorMode, visibleIndices, visibleCount, pointCount, origin]);
 
-  const fittedScene = useRef<number[][] | null>(null);
+  const fittedScene = useRef<number[][] | Float32Array | null>(null);
   useEffect(() => {
     const rt = runtime.current;
-    const points = props.frame?.points;
+    const points = props.frame?.points ?? [];
+    const binary = props.binaryPoints;
     if (!props.sceneMode) { fittedScene.current = null; return; }
-    const fitReference = props.autoFitReference ?? points;
-    if (!rt || !points?.length || fittedScene.current === fitReference) return;
+    const fitReference = props.autoFitReference ?? binary ?? points;
+    if (!rt || !pointCount || fittedScene.current === fitReference) return;
     fittedScene.current = fitReference ?? points;
     const bounds = new THREE.Box3();
-    points.forEach(point => bounds.expandByPoint(new THREE.Vector3(...toRenderPoint(point, origin))));
+    if (binary && props.cloudBounds) {
+      bounds.expandByPoint(new THREE.Vector3(...toRenderPoint(props.cloudBounds.min, origin)));
+      bounds.expandByPoint(new THREE.Vector3(...toRenderPoint(props.cloudBounds.max, origin)));
+    } else if (binary) {
+      for (let offset = 0; offset < binary.length; offset += 4) {
+        bounds.expandByPoint(new THREE.Vector3(binary[offset] - origin[0], binary[offset + 1] - origin[1], binary[offset + 2] - origin[2]));
+      }
+    } else points.forEach(point => bounds.expandByPoint(new THREE.Vector3(...toRenderPoint(point, origin))));
     const center = bounds.getCenter(new THREE.Vector3());
     const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 12);
     rt.controls.target.copy(center);
@@ -295,9 +358,9 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.camera.far = Math.max(radius * 40, 4000);
     rt.camera.updateProjectionMatrix();
     rt.controls.update();
-  }, [ready, props.sceneMode, props.frame?.points, props.autoFitReference, props.view, origin]);
+  }, [ready, props.sceneMode, props.frame?.points, props.binaryPoints, props.cloudBounds, props.autoFitReference, props.view, pointCount, origin]);
 
-  const followState = useRef<{reference: number[][] | undefined; position: THREE.Vector3} | null>(null);
+  const followState = useRef<{reference: number[][] | Float32Array | undefined; position: THREE.Vector3} | null>(null);
   useEffect(() => {
     const rt = runtime.current;
     if (!rt || !props.followPosition) {followState.current = null; return;}
@@ -333,6 +396,22 @@ export function PointCloudView(props: PointCloudViewProps) {
       rt.trajectoryGroup.add(label);
     }
   }, [ready, props.sceneMode, props.trajectory, props.activeFrameId, props.frame?.id, origin]);
+
+  useEffect(() => {
+    const rt = runtime.current;
+    if (!rt) return;
+    disposeObject(rt.calibrationGroup);
+    rt.calibrationGroup.clear();
+    for (const anchor of props.calibrationPoints ?? []) {
+      const color = anchor.enabled === false ? '#8292a0' : anchor.selected ? '#ffffff' : '#ffcf70';
+      const point = new THREE.Vector3(...toRenderPoint(anchor.point, origin));
+      rt.calibrationGroup.add(new THREE.Points(new THREE.BufferGeometry().setFromPoints([point]),
+        new THREE.PointsMaterial({color, size: anchor.selected ? 13 : 10, sizeAttenuation: false, depthTest: false})));
+      const label = makeLabel(anchor.label, color);
+      label.scale.set(1.8, .65, 1); label.position.copy(point).add(new THREE.Vector3(0, 0, .35));
+      rt.calibrationGroup.add(label);
+    }
+  }, [ready, props.calibrationPoints, origin]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -468,6 +547,20 @@ export function PointCloudView(props: PointCloudViewProps) {
     const raycaster = rayAt(event.clientX, event.clientY);
     if (!rt || !raycaster) return;
     const current = latest.current;
+    if (current.calibrationPicking) {
+      // Use the measured point itself, not the closest position on the mouse ray
+      // or a ground-plane intersection. Neither is a valid 3D calibration anchor.
+      const hit = rt.cloud ? raycaster.intersectObject(rt.cloud)[0] : undefined;
+      if (hit?.index === undefined) {setCursor('未选中实测点，请放大点云后重试'); return;}
+      const indices = rt.cloud!.userData.sourceIndices as number[] | null | undefined;
+      const index = indices?.[hit.index] ?? hit.index;
+      const offset = index * 4;
+      const point = current.binaryPoints
+        ? [current.binaryPoints[offset], current.binaryPoints[offset + 1], current.binaryPoints[offset + 2]] as Vec3
+        : current.frame?.points[index]?.slice(0, 3) as Vec3 | undefined;
+      if (point?.every(Number.isFinite)) current.onCalibrationPoint?.(point);
+      return;
+    }
     if (current.tool === 'select' || !current.tool) {
       const hit = raycaster.intersectObjects(rt.annotationsGroup.children, true).find((item) => item.object.userData.boxId || item.object.userData.vectorId);
       current.onSelect?.(hit?.object.userData.boxId ?? hit?.object.userData.vectorId ?? null);
@@ -478,7 +571,17 @@ export function PointCloudView(props: PointCloudViewProps) {
     const worldGround = ground?.clone().add(new THREE.Vector3(...origin));
     let point = cloudHit?.point.clone().add(new THREE.Vector3(...origin)) ?? worldGround;
     if (current.tool === 'vector' && current.drawOnGround && worldGround) {
-      point = new THREE.Vector3(...groundDrawingPoint(current.frame?.points ?? [], [worldGround.x, worldGround.y, worldGround.z], current.groundBand));
+      if (current.binaryPoints) {
+        const radiusSquared = .36;
+        let nearest = radiusSquared, height = worldGround.z;
+        for (let offset = 0; offset < current.binaryPoints.length; offset += 4) {
+          const x = current.binaryPoints[offset], y = current.binaryPoints[offset + 1], z = current.binaryPoints[offset + 2];
+          if (Math.abs(z - worldGround.z) > (current.groundBand ?? .35)) continue;
+          const distance = (x - worldGround.x) ** 2 + (y - worldGround.y) ** 2;
+          if (distance < nearest) {nearest = distance; height = z;}
+        }
+        point = new THREE.Vector3(worldGround.x, worldGround.y, height);
+      } else point = new THREE.Vector3(...groundDrawingPoint(current.frame?.points ?? [], [worldGround.x, worldGround.y, worldGround.z], current.groundBand));
     }
     if (!point) return;
     const coordinates: Vec3 = [point.x, point.y, point.z];
@@ -487,11 +590,16 @@ export function PointCloudView(props: PointCloudViewProps) {
     else if (current.tool === 'brush' && !current.sceneMode) {
       const radius = current.brushRadius ?? 1.5;
       const indices: number[] = [];
-      const sourceIndices: number[] = rt.cloud?.userData.sourceIndices ?? [];
-      sourceIndices.forEach(index => {
-        const p = current.frame!.points[index];
+      const sourceIndices = rt.cloud?.userData.sourceIndices as number[] | null | undefined;
+      const candidateCount = sourceIndices?.length ?? (current.binaryPoints ? current.binaryPoints.length / 4 : current.frame?.points.length ?? 0);
+      for (let displayIndex = 0; displayIndex < candidateCount; displayIndex++) {
+        const index = sourceIndices?.[displayIndex] ?? displayIndex;
+        const offset = index * 4;
+        const p = current.binaryPoints
+          ? [current.binaryPoints[offset], current.binaryPoints[offset + 1], current.binaryPoints[offset + 2]]
+          : current.frame!.points[index];
         if (Math.hypot(p[0] - point.x, p[1] - point.y, p[2] - point.z) <= radius) indices.push(index);
-      });
+      }
       if (indices.length) current.onPaint?.(indices);
     }
   };
@@ -501,15 +609,17 @@ export function PointCloudView(props: PointCloudViewProps) {
     className={props.className}
     data-testid="point-cloud-view"
     data-coordinate-frame={props.sceneMode ? 'world' : 'lidar'}
-    data-cloud-point-count={props.frame?.points.length ?? 0}
-    data-visible-point-count={visibleIndices.length}
+    data-cloud-point-count={pointCount}
+    data-visible-point-count={visibleCount}
     data-color-mode={colorMode}
     data-render-origin={origin.join(',')}
     data-active-frame-id={props.activeFrameId ?? props.frame?.id ?? ''}
     data-annotation-box-count={props.showBoxes === false ? 0 : props.annotations.boxes.length}
     data-annotation-vector-count={props.showVectors === false ? 0 : props.annotations.vectors.length}
     data-point-label-count={pointLabelCount}
-    style={{ position: 'relative', width: '100%', height: '100%', minHeight: 240, overflow: 'hidden', cursor: props.tool && props.tool !== 'select' ? 'crosshair' : 'grab' }}
+    data-calibration-point-count={props.calibrationPoints?.length ?? 0}
+    data-calibration-picking={props.calibrationPicking ? 'true' : 'false'}
+    style={{ position: 'relative', width: '100%', height: '100%', minHeight: 240, overflow: 'hidden', cursor: props.calibrationPicking || props.tool && props.tool !== 'select' ? 'crosshair' : 'grab' }}
     onPointerDown={(event) => { pointerStart.current = [event.clientX, event.clientY]; }}
     onClick={onClick}
     onPointerMove={(event) => {
@@ -521,7 +631,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     }}
     onPointerLeave={() => setCursor('')}
   >
-    {ready && runtime.current && props.editable !== false && props.showBoxes !== false &&
+    {ready && runtime.current && !props.calibrationPicking && props.editable !== false && props.showBoxes !== false &&
       (props.tool === 'select' || !props.tool) && props.onUpdateBox && props.annotations.boxes.find(box => box.id === props.selectedId) &&
       <BoxTransformGizmo key={`${props.selectedId}/${props.activeFrameId ?? props.frame?.id ?? ''}`}
         box={props.annotations.boxes.find(box => box.id === props.selectedId)!}

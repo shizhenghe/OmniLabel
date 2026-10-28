@@ -25,7 +25,7 @@ import numpy as np
 
 from .importer import MAX_EXPANDED, MAX_FILES, MAX_UPLOAD, parse_import
 from .models import Annotations, Clip, JobRequest, ProjectRequest
-from .storage import ConflictError, Store
+from .storage import ConflictError, Store, safe_id
 from .model_connections import ModelConnections, mount_model_routes
 
 LOGGER = logging.getLogger(__name__)
@@ -38,6 +38,9 @@ MODELS = [
     {"id": "sam2", "name": "SAM 2", "tasks": ["image-segmentation", "video-tracking"], "available": False,
      "description": "Integration reference only. Install a licensed checkpoint and GPU inference worker before use; this service does not run SAM 2.",
      "url": "https://github.com/facebookresearch/sam2"},
+    {"id": "latr", "name": "LATR (ONCE / OpenLane)", "tasks": ["3d-lane-detection"], "available": False,
+     "description": "Monocular 3D lane detector with selectable ONCE/OpenLane weights and a calibrated forward camera.",
+     "url": "https://github.com/JMoonr/LATR"},
     {"id": "grounding-dino", "name": "Grounding DINO", "tasks": ["image-detection"], "available": False,
      "description": "Open-vocabulary detector integration reference. Requires weights and inference service; no automatic pseudo-labels are fabricated.",
      "url": "https://github.com/IDEA-Research/GroundingDINO"},
@@ -54,11 +57,14 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     root = Path(data_dir or os.environ.get("OMNILABEL_DATA_DIR", REPOSITORY / "data"))
     store = Store(root)
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omnilabel-job")
+    from .automatic_calibration import AutomaticCalibrationManager, mount_automatic_calibration_routes
+    automatic_calibration = AutomaticCalibrationManager(store, executor)
 
     @asynccontextmanager
     async def lifespan(application):
         # This local store supports one service process (uvicorn --workers 1).
         store.recover_interrupted_jobs()
+        automatic_calibration.recover()
         if seed_demo:
             from .demo import build_demo
             # New fixture is additive: never replace an existing editable clip,
@@ -73,17 +79,24 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                 annotations = {f.id: Annotations.model_validate(initial_annotations.get(f.id, {})).validate_for_frame(f, clip.cameras)
                                for f in clip.frames}
                 store.add_clip(clip, annotations)
-        yield
-        executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            yield
+        finally:
+            automatic_calibration.shutdown()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(title="OmniLabel API", version="0.1.0", lifespan=lifespan)
     app.state.store = store
+    app.state.automatic_calibration = automatic_calibration
+    mount_automatic_calibration_routes(app, automatic_calibration)
     model_connections = ModelConnections(store)
     mount_model_routes(app, model_connections)
     from .scene_routes import mount_scene_routes
     mount_scene_routes(app, store, executor)
     from .calibration import mount_calibration_routes
     mount_calibration_routes(app, store)
+    from .projection_calibration import mount_projection_calibration_routes
+    mount_projection_calibration_routes(app, store)
 
     @app.exception_handler(ConflictError)
     async def handle_conflict(request, exc):
@@ -108,6 +121,24 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     @app.get("/api/clips")
     def list_clips():
         return store.summaries()
+
+    @app.get("/api/workspace")
+    def workspace_preferences():
+        """Optional local startup selection; never choose a missing clip."""
+        selected = os.environ.get("OMNILABEL_DEFAULT_CLIP", "")
+        path = store.root / "workspace.json"
+        if not selected and path.is_file():
+            try:
+                selected = json.loads(path.read_text(encoding="utf-8")).get("default_clip_id", "")
+            except (OSError, ValueError, AttributeError):
+                LOGGER.warning("Ignoring invalid workspace startup preferences")
+        try:
+            selected = safe_id(selected)
+            if not (store.root / "clips" / f"{selected}.json").is_file():
+                selected = None
+        except (TypeError, ValueError):
+            selected = None
+        return {"default_clip_id": selected}
 
     @app.post("/api/clips/import", response_model=Clip, status_code=201)
     async def import_clip(file: UploadFile = File(...)):
@@ -282,7 +313,6 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             clip_data = clip.model_dump()
             annotations = store.all_annotations(clip)
             source = get_frame(clip, request.frame_id or clip.frames[0].id)
-            source_with_points = store.materialize_frame(source)
             if request.kind == "map":
                 source_frames = {frame.id: frame for frame in clip.frames}
                 result = fuse_map(
@@ -292,7 +322,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                     point_loader=lambda value: store.frame_point_array(source_frames[value["id"]]),
                 )
             elif request.kind == "occupancy":
-                result = build_occupancy(source_with_points.model_dump(), annotations[source.id], request.voxel_size)
+                result = build_occupancy(store.materialize_frame(source).model_dump(), annotations[source.id], request.voxel_size)
             elif request.kind == "prelabel":
                 from .inference import infer_proposal
                 current_annotations = annotations[source.id]
@@ -304,7 +334,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                         current_annotations = evaluate_scene(store, clip, source.id, scene)
                         scene_revision = scene.revision
                 endpoint, _ = model_connections.endpoint(request.model_id)
-                result = infer_proposal(clip_data, source_with_points.model_dump(), current_annotations,
+                inference_source = source if request.model_id == "latr" else store.materialize_frame(source)
+                result = infer_proposal(clip_data, inference_source.model_dump(), current_annotations,
                                         request.model_id, request.prompt, assets_root=store.root / "assets",
                                         options=request.options.model_dump(exclude_none=True) if request.options else None,
                                         endpoint=endpoint, token=model_connections.token(request.model_id))
@@ -314,7 +345,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             else:
                 changes = {}
                 if request.kind == "ground-segmentation":
-                    changes[source.id] = segment_ground(source_with_points.model_dump(), annotations[source.id])
+                    changes[source.id] = segment_ground(store.materialize_frame(source).model_dump(), annotations[source.id])
                 else:
                     targets = [get_frame(clip, request.target_frame_id)] if request.target_frame_id else [f for f in clip.frames if f.id != source.id]
                     for target in targets:
@@ -346,6 +377,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             if not worker_configured(request.model_id, endpoint):
                 raise HTTPException(503, "所选模型未配置有效的推理地址，请在模型面板设置远程 GPU 服务。")
             source = get_frame(clip, request.frame_id or clip.frames[0].id)
+            if request.model_id == "latr" and (not request.options or not request.options.camera_id):
+                raise HTTPException(422, "LATR requires selecting one camera image")
             if request.options and request.options.camera_id:
                 camera = next((c for c in clip.cameras if c.id == request.options.camera_id), None)
                 if camera is None:
@@ -355,8 +388,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                     vertices += [(request.options.box[0], request.options.box[1]), (request.options.box[2], request.options.box[3])]
                 if any(not 0 <= x <= camera.width or not 0 <= y <= camera.height for x, y in vertices):
                     raise HTTPException(422, "SAM2 prompt lies outside the selected image")
-                if request.options.camera_id not in source.images and request.model_id == "sam2":
-                    raise HTTPException(422, "Selected camera has no image in this frame")
+                if request.options.camera_id not in source.images and request.model_id in ("sam2", "latr"):
+                    raise HTTPException(422, "Selected image model camera has no image in this frame")
         if request.frame_id:
             get_frame(clip, request.frame_id)
         if request.target_frame_id:
@@ -484,6 +517,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                 model = {**model, **status}
                 model["description"] = {
                     "sam2": "SAM2 提示分割：在左侧相机上添加正负点或框选区域，输出可审核的分割候选。",
+                    "latr": "LATR 单目三维车道线检测：可选 ONCE/OpenLane 权重，使用所选前视相机和当前帧标定输出 LiDAR 坐标折线候选。",
                     "mmdetection3d": "MMDetection3D 点云目标检测：按已部署配置和权重预测三维框；使用原始 LiDAR 坐标。",
                     "openoccupancy": "OpenOccupancy 学习型占用预测：调用已部署的 occupancy 模型，输出语义体素和候选结果。"
                 }[model["id"]]

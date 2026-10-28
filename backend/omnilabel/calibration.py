@@ -48,7 +48,10 @@ def calibration_document(store: Store, clip: Clip) -> dict:
 def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> dict:
     from .scene import _clip_fingerprint, get_scene_map, invalidate_scene_map, registered_poses, source_fingerprint
     with store.lock:
-        clip = store.clip(clip_id)
+        # Local projection documents are overlays, not source extrinsics.
+        # Rewriting an overlaid clip would bake those overrides into the
+        # manifest and prevent a changed base calibration from staling them.
+        clip = store.source_clip(clip_id)
         if value.revision != _revision(clip):
             raise ConflictError("Calibration revision conflict. Reload the extrinsics before saving.")
         if set(value.cameras) != {camera.id for camera in clip.cameras}:

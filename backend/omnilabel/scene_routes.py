@@ -74,9 +74,10 @@ def mount_scene_routes(app: FastAPI, store: Store, executor: ThreadPoolExecutor)
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/clips/{clip_id}/scene/map")
-    def cached_map(clip_id: str):
+    def cached_map(clip_id: str, include_points: bool = Query(default=True)):
         try:
-            return get_scene_map(store, clip_for(clip_id), max_points=SCENE_PREVIEW_POINTS)
+            return get_scene_map(store, clip_for(clip_id), max_points=SCENE_PREVIEW_POINTS,
+                                 include_points=include_points)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 

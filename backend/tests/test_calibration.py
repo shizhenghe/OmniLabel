@@ -9,6 +9,7 @@ import pytest
 from omnilabel.calibration import mount_calibration_routes
 from omnilabel.main import create_app
 from omnilabel.models import Annotations, Clip
+from omnilabel.projection_calibration import _base_fingerprint, document_for
 from omnilabel.scene import FUSION_VERSION, _clip_fingerprint, get_scene_map, registered_poses, source_fingerprint
 from omnilabel.storage import atomic_json
 
@@ -124,3 +125,31 @@ def test_noop_calibration_does_not_stale_existing_map(calibration_client):
     assert client.put("/api/clips/calibration/calibration", json=update_from(doc)).status_code == 200
     assert (store.root / "clips" / "calibration.json").read_bytes() == before
     assert get_scene_map(store, store.clip("calibration"))["point_count"] == 1
+
+
+@pytest.mark.parametrize("changed", ["camera", "lidar"])
+def test_base_calibration_change_never_bakes_local_projection_into_source(calibration_client, changed):
+    client, store, cloud = calibration_client
+    source = store.source_clip("calibration")
+    correction = np.eye(4); correction[0, 3] = .7
+    record_path = store.root / "projection_calibrations" / "calibration" / "f0" / "front.json"
+    atomic_json(record_path, {"schema_version": "1.0", "clip_id": "calibration", "frame_id": "f0",
+                            "camera_id": "front", "base_fingerprint": _base_fingerprint(source.frames[0], source.cameras[0]),
+                            "matrix": correction.tolist(), "method": "direct_nid", "correspondences": [],
+                            "sequence": 1})
+    before_record, before_scan = record_path.read_bytes(), cloud.read_bytes()
+    assert store.clip("calibration").frames[0].projection_camera_from_lidar["front"] == correction.tolist()
+    update = update_from(client.get("/api/clips/calibration/calibration").json())
+    if changed == "camera":
+        update["cameras"]["front"][0][3] = .25
+    else:
+        update["lidar_to_ego"]["f0"][1][3] = .3
+    response = client.put("/api/clips/calibration/calibration", json=update)
+    assert response.status_code == 200, response.text
+    assert not store.source_clip("calibration").frames[0].projection_camera_from_lidar
+    assert not store.clip("calibration").frames[0].projection_camera_from_lidar
+    document = document_for(store, "calibration", "f0", "front")
+    assert document["stale"] and document["saved_matrix"] is None
+    np.testing.assert_allclose(document["effective_matrix"],
+                               np.asarray(update["cameras"]["front"]) @ np.asarray(update["lidar_to_ego"]["f0"]))
+    assert record_path.read_bytes() == before_record and cloud.read_bytes() == before_scan

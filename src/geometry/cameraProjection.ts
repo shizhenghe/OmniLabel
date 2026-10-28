@@ -1,4 +1,5 @@
 import type { Annotations, Box, Camera, Frame, ImagePolygon, Vec3, Vector } from '../types';
+import {multiply} from '../scene';
 
 export type Pixel = [number, number];
 export type PixelDepth = [number, number, number];
@@ -11,10 +12,15 @@ export function transformPoint(matrix: number[][], point: number[]): Vec3 {
   return [0, 1, 2].map(row => matrix[row][0] * point[0] + matrix[row][1] * point[1] + matrix[row][2] * point[2] + matrix[row][3]) as Vec3;
 }
 
+/** Resolve the one authoritative projection transform for both source points and annotations. */
+export function cameraFromLidar(camera: Camera, frame: Frame): number[][] {
+  return frame.projection_camera_from_lidar?.[camera.id]
+    ?? frame.annotation_camera_from_lidar?.[camera.id]
+    ?? multiply(camera.camera_from_ego, frame.lidar_to_ego);
+}
+
 export function lidarToCamera(point: number[], camera: Camera, frame: Frame): Vec3 {
-  const annotationTransform = frame.annotation_camera_from_lidar?.[camera.id];
-  if (annotationTransform) return transformPoint(annotationTransform, point);
-  return transformPoint(camera.camera_from_ego, transformPoint(frame.lidar_to_ego, point));
+  return transformPoint(cameraFromLidar(camera, frame), point);
 }
 
 /** Optical +Z is forward. Inputs have already been transformed into camera space. */

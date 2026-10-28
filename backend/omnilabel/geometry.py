@@ -113,8 +113,10 @@ def project_points(
         raise ValueError("stride must be a positive integer")
     points = _points(frame)
     indices = np.arange(0, len(points), stride)
-    camera_from_lidar = _matrix(camera["camera_from_ego"], "camera_from_ego") @ _matrix(
-        frame["lidar_to_ego"], "lidar_to_ego"
+    direct = (frame.get("projection_camera_from_lidar", {}).get(camera["id"])
+              or frame.get("annotation_camera_from_lidar", {}).get(camera["id"]))
+    camera_from_lidar = _matrix(direct, "camera_from_lidar") if direct is not None else (
+        _matrix(camera["camera_from_ego"], "camera_from_ego") @ _matrix(frame["lidar_to_ego"], "lidar_to_ego")
     )
     xyz = _transform(points[indices, :3], camera_from_lidar)
     forward = xyz[:, 2] > 1e-6

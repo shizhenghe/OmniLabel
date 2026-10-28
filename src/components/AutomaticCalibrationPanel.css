@@ -1,0 +1,68 @@
+.automatic-calibration-backdrop {z-index:100;padding:28px}
+.automatic-calibration-panel {display:flex;flex-direction:column;width:min(900px,100%);max-height:calc(100dvh - 56px);border:1px solid #344c5c;border-radius:9px;background:#111d2b;box-shadow:0 28px 90px #0009;color:#acc2d0;overflow:hidden;outline:none;font-size:12px;line-height:1.7}
+.automatic-calibration-heading {display:flex;align-items:flex-start;gap:16px;padding:22px 25px 17px;border-bottom:1px solid #2b4051}
+.automatic-calibration-heading>div {flex:1;min-width:0}
+.automatic-calibration-heading h2 {margin:4px 0;color:#d1e6eb;font-size:21px}
+.automatic-calibration-heading p {margin:0;color:#829fb4;font-size:11px;overflow-wrap:anywhere}
+.automatic-calibration-heading>.icon-button {font-size:25px;flex-shrink:0}
+.automatic-calibration-body {min-height:0;overflow:auto;overscroll-behavior:contain;padding:19px 25px}
+.automatic-calibration-intro {margin:0 0 16px;font-size:12px;color:#a0bac9}
+.automatic-calibration-summary {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:19px}
+.automatic-calibration-summary>span {background:#0b1723;border:1px solid #2a4152;border-radius:5px;padding:10px 12px;font-size:10px;color:#83a1b5}
+.automatic-calibration-summary strong {display:block;margin-top:4px;color:#c5dfdf;font-size:15px;font-weight:500}
+.automatic-calibration-engines {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;border:0;padding:0;margin:0;min-width:0}
+.automatic-calibration-engines legend {padding:0 0 8px;font-weight:600;color:#b5d2de}
+.automatic-calibration-engine {border:1px solid #30495c;border-radius:5px;padding:12px;background:#101a28;cursor:pointer;min-width:0}
+.automatic-calibration-engine.selected {border-color:#548f81;background:#17312e}
+.automatic-calibration-engine.unavailable {cursor:default;background:#14202d}
+.automatic-calibration-engine>span {display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.automatic-calibration-engine input,.automatic-calibration-overwrite input {accent-color:#68c4ae;margin:0}
+.automatic-calibration-engine strong {font-size:12px;color:#c4dce3;font-weight:500}
+.automatic-calibration-engine em {font-size:9px;font-style:normal;margin-left:auto;padding:1px 6px;border:1px solid #3f615d;border-radius:3px;color:#9bc9ba}
+.automatic-calibration-engine.unavailable em {color:#c6b28f;border-color:#625342}
+.automatic-calibration-engine p {margin:8px 0 0;font-size:10px;color:#89a4b6;overflow-wrap:anywhere;line-height:1.8}
+.automatic-calibration-help {margin:8px 0 12px;color:#7f9daf;font-size:10px;line-height:1.8}
+.automatic-calibration-scope {display:grid;grid-template-columns:auto minmax(180px,320px);align-items:center;gap:5px 10px;margin:0 0 16px;color:#b5d2de;font-weight:600}
+.automatic-calibration-scope select {min-width:0;padding:7px 9px}
+.automatic-calibration-scope small {grid-column:2;color:#7f9daf;font-size:10px;font-weight:400}
+.automatic-calibration-warning {margin:12px 0 0;border-left:2px solid #b69158;padding:6px 9px;background:#2a251d;color:#d1b57e;font-size:10px}
+.automatic-calibration-overwrite {display:flex;align-items:center;gap:7px;margin:16px 0 0;font-size:11px}
+.automatic-calibration-actions {display:flex;flex-wrap:wrap;gap:9px;margin:15px 0 0}
+.automatic-calibration-panel .button {font-size:11px;min-height:32px;padding:7px 10px;white-space:normal}
+.automatic-calibration-job {margin-top:23px;border-top:1px solid #2b4252;padding-top:18px}
+.automatic-calibration-job-heading {display:flex;align-items:center;gap:12px;margin-bottom:9px;flex-wrap:wrap}
+.automatic-calibration-job-heading h3 {font-size:13px;color:#c3dedf;font-weight:500;margin:0}
+.automatic-calibration-job-heading>span {color:#88a6b7;font-size:10px}
+.automatic-calibration-job-heading>.button {margin-left:auto}
+.automatic-calibration-progress {height:6px;border-radius:3px;background:#0a1521;overflow:hidden}
+.automatic-calibration-progress>span {display:block;height:100%;background:#60baa4;border-radius:3px;transition:width .25s}
+.automatic-calibration-counts {display:flex;gap:16px;flex-wrap:wrap;padding:10px 0 13px;color:#89a4b5;font-size:10px}
+.automatic-calibration-counts strong {color:#c2dedf;font-weight:500;margin-left:3px;font-variant-numeric:tabular-nums}
+.automatic-calibration-results-heading {display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0 10px;color:#8eacbe;font-size:10px}
+.automatic-calibration-results-heading label {display:flex;align-items:center;gap:10px}
+.automatic-calibration-results-heading select {padding:5px 7px;font-size:10px;max-width:210px}
+.automatic-calibration-results {display:flex;flex-direction:column;gap:7px;list-style:none;padding:0;margin:0;max-height:310px;overflow:auto;overscroll-behavior:contain}
+.automatic-calibration-item {padding:9px 11px;background:#0d1825;border:1px solid #294151;border-radius:4px;min-width:0}
+.automatic-calibration-item>div {display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
+.automatic-calibration-item strong {font:10px/1.7 monospace;color:#aac8d5;overflow-wrap:anywhere}
+.automatic-calibration-item>div>span {font-size:10px;color:#7e9eb4;overflow-wrap:anywhere}
+.automatic-calibration-item em {font-size:9px;font-style:normal;color:#93acbd;margin-left:auto;flex-shrink:0}
+.automatic-calibration-item.accepted em,.automatic-calibration-item.saved em {color:#86cdb7}
+.automatic-calibration-item.rejected em,.automatic-calibration-item.conflict em,.automatic-calibration-item.skipped em {color:#d6b98a}
+.automatic-calibration-item.failed em {color:#eda6b3}
+.automatic-calibration-item.running {border-color:#4b8174}
+.automatic-calibration-item p {font-size:10px;color:#8ea9bb;margin:3px 0 0;overflow-wrap:anywhere}
+.automatic-calibration-item small {display:block;font:9px/1.8 monospace;color:#72a99c;margin-top:3px}
+.automatic-calibration-inspect {border:0;border-bottom:1px solid #355360;background:none;color:#88babd;padding:1px 0;margin-top:5px;font-size:9px}
+.automatic-calibration-pagination {display:flex;align-items:center;justify-content:center;gap:15px;margin-top:9px;font-size:10px;color:#7e9eaf}
+.automatic-calibration-save {display:flex;align-items:center;gap:14px;justify-content:space-between;border:1px solid #35564e;border-radius:5px;background:#142c29;padding:12px;margin-top:16px}
+.automatic-calibration-save>div {min-width:0}
+.automatic-calibration-save strong {font-size:11px;color:#adcebf;font-weight:500}
+.automatic-calibration-save p {font-size:10px;color:#819f9c;margin:3px 0 0}
+.automatic-calibration-save>.button {flex-shrink:0}
+.automatic-calibration-error {border:1px solid #693f4c;border-radius:4px;background:#30202a;padding:9px 11px;font-size:11px;color:#e4acba;margin-top:13px;overflow-wrap:anywhere}
+.automatic-calibration-error>.button {display:block;margin-top:5px}
+.automatic-calibration-status {color:#a0c8bc;font-size:11px;line-height:1.8;margin:12px 0 0;overflow-wrap:anywhere}
+.automatic-calibration-footer {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 25px;border-top:1px solid #2b4051;background:#0e1926}
+.automatic-calibration-footer>span {font-size:10px;color:#7f9bac}
+@media(max-width:650px) {.automatic-calibration-backdrop {padding:10px}.automatic-calibration-panel {max-height:calc(100dvh - 20px)}.automatic-calibration-heading {padding:17px 16px 13px}.automatic-calibration-heading h2 {font-size:18px}.automatic-calibration-body {padding:15px 16px}.automatic-calibration-footer {padding:12px 16px}.automatic-calibration-engines {grid-template-columns:1fr}.automatic-calibration-summary {gap:6px}.automatic-calibration-summary>span {padding:8px;font-size:9px}.automatic-calibration-summary strong {font-size:12px}.automatic-calibration-scope {grid-template-columns:1fr}.automatic-calibration-scope small {grid-column:1}.automatic-calibration-save {align-items:flex-start;flex-direction:column}.automatic-calibration-results-heading>span {display:none}.automatic-calibration-item>div {gap:7px}.automatic-calibration-counts {gap:11px}}

@@ -65,15 +65,28 @@ class Frame(Model):
     points: list[list[float]] = Field(default_factory=list)
     pointcloud_file: str | None = Field(default=None, max_length=240)
     point_count: int | None = Field(default=None, ge=0)
+    # Optional synchronized sensor scan used only for image/LiDAR calibration.
+    # The displayed/annotated cloud may instead be a fused world map.
+    calibration_pointcloud_file: str | None = Field(default=None, max_length=240)
+    calibration_point_count: int | None = Field(default=None, ge=0)
+    calibration_lidar_to_ego: list[list[float]] | None = None
+    calibration_timestamp: float | None = None
     images: dict[str, str] = Field(default_factory=dict)
-    # Optional direct annotation-coordinate -> camera transforms. These let an
-    # imported clip carry per-frame projection corrections without changing
-    # the calibration used to render the raw point cloud.
+    # Optional imported per-frame correction used by source points and labels
+    # when no explicit projection calibration has been published.
     annotation_camera_from_lidar: dict[Identifier, list[list[float]]] = Field(default_factory=dict)
+    # Physical per-frame projection: shared by raw points and annotations.
+    # Local calibration documents overlay this field without rewriting scans.
+    projection_camera_from_lidar: dict[Identifier, list[list[float]]] = Field(default_factory=dict)
 
     _transforms = field_validator("ego_to_world", "lidar_to_ego")(rigid_transform)
 
-    @field_validator("annotation_camera_from_lidar")
+    @field_validator("calibration_lidar_to_ego")
+    @classmethod
+    def validate_calibration_transform(cls, value):
+        return rigid_transform(value) if value is not None else None
+
+    @field_validator("annotation_camera_from_lidar", "projection_camera_from_lidar")
     @classmethod
     def validate_annotation_camera_transforms(cls, value):
         for transform in value.values():
@@ -101,6 +114,18 @@ class Frame(Model):
             self.point_count = len(self.points)
         elif self.point_count != len(self.points):
             raise ValueError("point_count must equal the number of inline points")
+        if self.calibration_pointcloud_file is not None:
+            path = PurePosixPath(self.calibration_pointcloud_file)
+            if (path.is_absolute() or ".." in path.parts or "\\" in self.calibration_pointcloud_file
+                    or path.suffix.lower() != ".npy"):
+                raise ValueError("calibration_pointcloud_file must be a relative .npy path without traversal")
+            if self.calibration_point_count is None or self.calibration_lidar_to_ego is None:
+                raise ValueError("calibration point count and lidar_to_ego are required with a calibration point cloud")
+            if self.calibration_timestamp is None or not np.isfinite(self.calibration_timestamp):
+                raise ValueError("a finite calibration timestamp is required with a calibration point cloud")
+        elif any(value is not None for value in (
+                self.calibration_point_count, self.calibration_lidar_to_ego, self.calibration_timestamp)):
+            raise ValueError("calibration point metadata requires calibration_pointcloud_file")
         return self
 
 
@@ -123,6 +148,8 @@ class Clip(Model):
             raise ValueError("frame images reference an unknown camera")
         if any(set(f.annotation_camera_from_lidar) - set(camera_ids) for f in self.frames):
             raise ValueError("frame annotation projection references an unknown camera")
+        if any(set(f.projection_camera_from_lidar) - set(camera_ids) for f in self.frames):
+            raise ValueError("frame physical projection references an unknown camera")
         if any(self.frames[i].timestamp >= self.frames[i + 1].timestamp for i in range(len(self.frames) - 1)):
             raise ValueError("frame timestamps must be strictly increasing")
         return self
@@ -211,6 +238,7 @@ class InferenceOptions(Model):
     box: tuple[float, float, float, float] | None = None
     score_threshold: float = Field(default=0.3, ge=0, le=1)
     max_masks: int = Field(default=64, ge=1, le=256)
+    weight_variant: Literal["once", "openlane"] | None = None
 
     @model_validator(mode="after")
     def validate_prompts(self):
