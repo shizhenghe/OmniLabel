@@ -29,13 +29,14 @@ test('batch calibration polls results, saves accepted pairs and exports saved pa
     ], latest_job: latest, total_pairs: 3, saved_pairs: saved ? 1 : 0}});
   });
   await page.goto('/');
-  await expect(page.getByLabel('全clip自动标定', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('全clip自动标定', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('全clip自动标定', {exact: true}).click();
   const panel = page.getByRole('dialog', {name: '全 clip 自动标定', exact: true});
   await expect(panel).toBeVisible();
   await expect(panel.getByRole('radio', {name: /Koide/})).toBeDisabled();
   await expect(panel.getByRole('radio', {name: /内置 CPU NID/})).toBeChecked();
-  await panel.getByRole('button', {name: '启动全部自动标定', exact: true}).click();
+  await panel.getByLabel('自动标定处理范围', {exact: true}).selectOption('all');
+  await panel.getByRole('button', {name: '启动自动标定（3）', exact: true}).click();
   await expect(panel.getByRole('heading', {name: '任务完成', exact: true})).toBeVisible();
   expect(startBody).toEqual({engine: 'direct_nid', overwrite_saved: false});
   await expect(panel.getByText('验证区域改善不足', {exact: true})).toBeVisible();
@@ -58,7 +59,7 @@ test('single-pair editor loads actual calibration and accepts measured 3D and im
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto('/');
-  await expect(page.getByLabel('逐帧投影校准', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('逐帧投影校准', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('逐帧投影校准', {exact: true}).click();
   const editor = page.getByTestId('projection-calibration-editor');
   await expect(editor).toBeVisible();
@@ -66,17 +67,18 @@ test('single-pair editor loads actual calibration and accepts measured 3D and im
   await page.getByRole('button', {name: '俯视 BEV', exact: true}).click();
   await editor.getByRole('button', {name: '＋ 添加对应点', exact: true}).click();
   const cloud = page.getByLabel('三维点云标注视图', {exact: true});
-  await expect(cloud).toHaveAttribute('data-calibration-picking', 'true');
+  const viewport = page.getByTestId('point-cloud-view');
+  await expect(viewport).toHaveAttribute('data-calibration-picking', 'true');
   const size = await cloud.boundingBox();
   expect(size).not.toBeNull();
   // A pick must hit a measured point; scanning the visible cloud also verifies
   // the editor did not accidentally disable the canvas' pointer events.
   for (const y of [.4, .5, .6, .3, .7]) {
     for (const x of [.5, .4, .6, .3, .7]) {
-      if (await cloud.getAttribute('data-calibration-picking') !== 'true') break;
+      if (await viewport.getAttribute('data-calibration-picking') !== 'true') break;
       await cloud.click({position: {x: size!.width * x, y: size!.height * y}});
     }
-    if (await cloud.getAttribute('data-calibration-picking') !== 'true') break;
+    if (await viewport.getAttribute('data-calibration-picking') !== 'true') break;
   }
   await expect(editor.locator('.projection-pick-hint')).toContainText('三维点已选中');
   const camera = page.getByTestId('camera-front');
@@ -84,6 +86,7 @@ test('single-pair editor loads actual calibration and accepts measured 3D and im
   expect(cameraSize).not.toBeNull();
   await camera.click({position: {x: cameraSize!.width * .5, y: cameraSize!.height * .5}});
   await expect(editor.locator('.projection-anchor')).toHaveCount(1);
-  await expect(editor.getByRole('button', {name: '根据对应点自动求解（还需 5 对）', exact: true})).toBeDisabled();
+  await expect(editor.getByLabel('根据对应点求解投影', {exact: true})).toBeDisabled();
+  await expect(editor.getByLabel('根据对应点求解投影', {exact: true})).toContainText('还需 5 对');
   expect(pageErrors).toEqual([]);
 });

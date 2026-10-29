@@ -1,4 +1,4 @@
-import type {Camera, Frame, ProjectionPoint} from '../types';
+import type {Camera, Frame, PointBuffer, ProjectionPoint} from '../types';
 import {multiply} from '../scene';
 import {cameraFromLidar, projectCameraPoint, transformPoint} from './cameraProjection';
 
@@ -24,7 +24,7 @@ export function projectFramePoints(frame: Frame, cameras: Camera[]): Record<stri
  * Sampling is explicit here because expanding millions of projected points into
  * browser objects would block calibration. Source indices remain unchanged.
  */
-export function projectMapPreview(frame: Frame, camera: Camera, points: Float32Array,
+export function projectMapPreview(frame: Frame, camera: Camera, points: PointBuffer,
   frameFromWorld: number[][], maxSamples = 60000): ProjectionPoint[] {
   const frameMatrix = cameraFromLidar(camera, frame);
   const matrix = multiply(frameMatrix, frameFromWorld);

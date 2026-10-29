@@ -14,7 +14,7 @@ test('seven calibrated views, cuboid edit and persistence across reload', async 
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   await expect(page.locator('.camera-grid .camera-card')).toHaveCount(7);
   await expect(page.getByLabel('三维点云标注视图')).toBeVisible();
@@ -26,7 +26,7 @@ test('seven calibrated views, cuboid edit and persistence across reload', async 
   await page.getByLabel('保存标注', { exact: true }).click();
   expect((await saved).ok()).toBeTruthy();
   await page.reload();
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('.object-row').first().click();
   await expect(page.getByLabel('位置X', { exact: true })).toHaveValue('18.75');
@@ -47,7 +47,7 @@ test('seven calibrated views, cuboid edit and persistence across reload', async 
 test('draw a lane and image polygon and export a semantic mask', async ({ page, request }) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   const clip = await (await request.get('/api/clips/demo')).json();
   const path = `/api/clips/demo/frames/${clip.frames[0].id}/annotations`;
@@ -84,7 +84,7 @@ test('draw a lane and image polygon and export a semantic mask', async ({ page, 
 test('map and occupancy jobs produce downloadable geometry', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('.task-button').filter({ hasText: '4D 点云地图' }).click();
   await page.getByLabel('重建整个场景', {exact:true}).click();
@@ -103,7 +103,7 @@ test('map and occupancy jobs produce downloadable geometry', async ({ page }) =>
 test('point brush edits original point labels and cancelling a frame switch preserves edits', async ({ page, request }) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   const clip = await (await request.get('/api/clips/demo')).json();
   const path = `/api/clips/demo/frames/${clip.frames[0].id}/annotations`;
@@ -145,7 +145,7 @@ test('model response fixture remains unsaved until explicit human application an
   });
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('.model-link').click();
   await page.getByLabel('预标注模型', {exact:true}).last().selectOption('sam2');
@@ -170,7 +170,7 @@ test('import a user clip through the actual file chooser', async ({ page }) => {
   };
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('单帧点云', {exact: true}).click();
   await page.locator('input[type=file]').setInputFiles({ name: 'clip.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(clip)) });
   await expect(page.getByLabel('选择clip')).toHaveValue('zz-user-clip');

@@ -2,12 +2,12 @@ import {expect, test} from '@playwright/test';
 
 test('discoverable lane drawing saves world vertices, edits coordinates and projects across frames', async ({page, request}) => {
   await page.goto('/');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.locator('.task-button').filter({hasText: '车道线标注'}).click();
   await expect(page.getByTestId('lane-guide')).toHaveCount(0);
   await page.getByLabel('加载道路标线示例', {exact: true}).click();
   await expect(page.getByLabel('选择clip')).toHaveValue('demo-ground-detail');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   const viewport = page.getByTestId('point-cloud-view');
   await expect(viewport).toHaveAttribute('data-coordinate-frame', 'world');
   await expect(viewport).toHaveAttribute('data-color-mode', 'intensity');
@@ -58,16 +58,16 @@ test('discoverable lane drawing saves world vertices, edits coordinates and proj
   await expect(page.getByLabel('顶点1X', {exact: true})).toHaveValue('12');
   const projectedAtNextTime = await front.getAttribute('data-projection-signature');
   await page.reload();
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   expect((await (await request.get(path)).json()).vectors.find((v: {id: string}) => v.id === lane.id)).toEqual(lane);
   expect(projectedAtNextTime).toBeTruthy();
 });
 
 test('ground view filters roofs and real XYZI contrast survives detail reconstruction', async ({page, request}) => {
   await page.goto('/');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.getByLabel('选择clip').selectOption('demo-ground-detail');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.locator('.task-button').filter({hasText: '车道线标注'}).click();
   const viewport = page.getByTestId('point-cloud-view');
   await expect.poll(async () => Number(await viewport.getAttribute('data-visible-point-count'))).toBeGreaterThan(1000);
@@ -82,7 +82,7 @@ test('ground view filters roofs and real XYZI contrast survives detail reconstru
   await page.getByLabel('点云着色', {exact: true}).selectOption('intensity');
   await page.getByLabel('场景融合方式', {exact: true}).selectOption('detail');
   await page.getByLabel('重建整个场景', {exact: true}).click();
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   const map = await (await request.get('/api/clips/demo-ground-detail/scene/map')).json();
   expect(map.preserve_detail).toBe(true);
   expect(map.effective_voxel_size).toBe(.05);

@@ -1,0 +1,19 @@
+.lane-merge-panel {padding:12px;margin:10px 0;border:1px solid #345148;border-radius:5px;background:#102725;color:#9dbeb9;font-size:10px;line-height:1.7}
+.lane-merge-heading {display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.lane-merge-heading h3 {flex:1;font-size:11px;color:#c1e2d7;margin:0}
+.lane-merge-heading>.icon-button {width:22px;height:22px;font-size:19px}
+.lane-merge-parameters {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.lane-merge-parameters>.field-label {margin:0}
+.lane-merge-parameters>.field-label:last-child {grid-column:1/-1}
+.lane-merge-parameters input {min-width:0}
+.lane-merge-actions {display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.lane-merge-actions>.button {font-size:9px;min-height:28px;padding:5px 8px}
+.lane-merge-result {border-top:1px solid #2a5148;margin-top:11px;padding-top:10px}
+.lane-merge-result>strong {font:11px/1.8 ui-monospace,monospace;color:#c0e7d7}
+.lane-merge-result>p {margin:5px 0 0;font-size:9px;color:#94bbaf}
+.lane-merge-result details {margin-top:8px;font-size:9px}
+.lane-merge-result summary {cursor:pointer;color:#a5cdc1}
+.lane-merge-result ul {padding-left:16px;max-height:150px;overflow:auto;margin:7px 0 0}
+.lane-merge-result li {padding:3px 0;overflow-wrap:anywhere}
+.lane-merge-result li>span {display:block;font-size:8px;color:#698d84}
+.lane-merge-error {margin:10px 0 0;padding:7px;border:1px solid #68444a;border-radius:3px;background:#302127;color:#e6aeb6;font-size:9px;overflow-wrap:anywhere}
