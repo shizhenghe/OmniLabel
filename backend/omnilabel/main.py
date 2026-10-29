@@ -65,6 +65,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
         # This local store supports one service process (uvicorn --workers 1).
         store.recover_interrupted_jobs()
         automatic_calibration.recover()
+        latr_batches.recover()
         if seed_demo:
             from .demo import build_demo
             # New fixture is additive: never replace an existing editable clip,
@@ -82,6 +83,7 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
         try:
             yield
         finally:
+            latr_batches.shutdown()
             automatic_calibration.shutdown()
             executor.shutdown(wait=True, cancel_futures=True)
 
@@ -91,6 +93,10 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     mount_automatic_calibration_routes(app, automatic_calibration)
     model_connections = ModelConnections(store)
     mount_model_routes(app, model_connections)
+    from .batch_prelabel import LatrBatchManager, mount_latr_batch_routes
+    latr_batches = LatrBatchManager(store, executor, model_connections)
+    app.state.latr_batches = latr_batches
+    mount_latr_batch_routes(app, latr_batches)
     from .scene_routes import mount_scene_routes
     mount_scene_routes(app, store, executor)
     from .calibration import mount_calibration_routes

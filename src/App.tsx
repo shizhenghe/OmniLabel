@@ -5,6 +5,7 @@ import {CalibrationEditor, type CalibrationDocument} from './components/Calibrat
 import {ProjectionCalibrationEditor, type ProjectionCalibrationDocument, type ProjectionCorrespondence, type ProjectionPickMode} from './components/ProjectionCalibrationEditor';
 import {AutomaticCalibrationPanel} from './components/AutomaticCalibrationPanel';
 import {LaneMergePanel, type LaneMergeResult} from './components/LaneMergePanel';
+import {LatrBatchPanel, type BatchProposal} from './components/LatrBatchPanel';
 import {applyCalibration, type Matrix4} from './geometry/calibration';
 import {projectFramePoints, projectMapPreview} from './geometry/liveProjection';
 import {Icon, type IconName} from './components/Icon';
@@ -146,6 +147,7 @@ export default function App() {
   proposalRef.current = proposal;
   const [proposalApplying, setProposalApplying] = useState(false);
   const [autoMergeLatr, setAutoMergeLatr] = useState(true);
+  const [latrBatchOpen, setLatrBatchOpen] = useState(false);
   const [laneMergeOpen, setLaneMergeOpen] = useState(false);
   const [lanePreview, setLanePreview] = useState<LanePreview | null>(null);
   const [laneMergeUndo, setLaneMergeUndo] = useState<LaneMergeUndo | null>(null);
@@ -169,7 +171,7 @@ export default function App() {
   const busy = loading || saving || reviewStarting || proposalApplying;
   const jobBusy = job?.status === 'running' || job?.status === 'queued';
   const reconstructing = reconstruction?.status === 'running' || reconstruction?.status === 'queued';
-  const editBlocked = reviewing || busy || jobBusy || projectionOpen || automaticCalibrationOpen || !clip || !frame || (sceneMode && !scene);
+  const editBlocked = reviewing || busy || jobBusy || projectionOpen || automaticCalibrationOpen || latrBatchOpen || !clip || !frame || (sceneMode && !scene);
   const currentKey = clip && frame ? `${clip.id}/${frame.id}` : '';
   const laneScopeKey = sceneMode ? `${clip?.id}/world` : currentKey;
   const laneVectors = sceneMode ? scene?.vectors ?? NO_VECTORS : annotations.vectors;
@@ -327,6 +329,7 @@ export default function App() {
     seekController.current?.abort(); setReviewing(false); setPreparedFrame(null); setBuffering(false); setPlaybackSession(value => value + 1);
     setCalibrationOpen(false); setCalibrationDirty(false); setCalibrationPreview(null); calibrationBase.current = null;
     setAutomaticCalibrationOpen(false);
+    setLatrBatchOpen(false);
     calibrationClipBase.current = null;
     setProjectionOpen(false); setProjectionDirty(false); setProjectionBusy(false); setProjectionPreview(null); setProjectionPickMode(null);
     setProjectionPickedPoint(null); setProjectionPickedPixel(null);
@@ -762,6 +765,38 @@ export default function App() {
     } catch (error) {flash(`候选未应用：${errorText(error)}。原标注和候选已保留，可重试。`, true);}
     finally {setProposalApplying(false);}
   };
+  const openLatrBatch = async () => {
+    if (!clip || !frame || reviewing || busy || jobBusy || reconstructing || projectionBusy) return;
+    if (calibrationDirty || projectionDirty || activeLanePreview) {flash('请先保存或还原标定、投影和融合预览，再开始批量预标注。', true); return;}
+    if (draftVector.length || draftPolygon.length) {flash('请先完成或取消正在绘制的标注，再开始批量预标注。', true); return;}
+    if (!(await save())) return;
+    setModal(null); setCalibrationOpen(false); setProjectionOpen(false); setAutomaticCalibrationOpen(false);
+    setTask('lane'); setSceneMode(true); setView('top'); setClassId('lane'); setTool('select');
+    setShowVectors(true); setAnnotationProjection(true); setPlaying(false); setSelectedId(null); setModelPromptMode(null);
+    setLaneMergeOpen(false); setLatrBatchOpen(true);
+  };
+  const applyLatrBatch = (value: BatchProposal): boolean => {
+    if (!clip || !scene || busy || jobBusy || reviewing || reconstructing || calibrationDirty || projectionDirty
+        || value.clip_id !== clip.id || value.coordinate_frame !== 'world' || value.scene_revision !== scene.revision
+        || dirty || draftVector.length || draftPolygon.length) {
+      flash('批量候选与当前场景版本不一致，或存在未保存修改。请检查任务状态后重新应用。', true); return false;
+    }
+    if (!value.vectors.length) {flash('此批次没有可应用的车道线候选。', true); return false;}
+    const used = new Set([...scene.vectors.map(vector => vector.id), ...scene.tracks.map(track => track.id)]);
+    if (value.vectors.some(vector => used.has(vector.id)) || new Set(value.vectors.map(vector => vector.id)).size !== value.vectors.length) {
+      flash('此批次候选已应用，或其 ID 与已有标注冲突；未重复追加。', true); return false;
+    }
+    if (scene.vectors.length + value.vectors.length > 5000) {flash('场景矢量超过当前格式的 5000 条限制，请先融合已有线，或减少本次批量帧数。', true); return false;}
+    // Batch candidates already use the registered world coordinate system.
+    // Keep every observation separate until the operator chooses to fuse it.
+    setScene(current => current ? {...current, vectors: [...current.vectors, ...value.vectors]} : current);
+    setSceneDirty(true); sceneDirtyRef.current = true; editGeneration.current++;
+    setLatrBatchOpen(false); setTask('lane'); setSceneMode(true); setTool('select'); setSelectedId(null);
+    setShowVectors(true); setAnnotationProjection(true); setPlaying(false); setProposal(null); setLaneMergeUndo(null);
+    setLaneMergeOpen(true);
+    flash(`已加入 ${value.source_frame_ids.length} 帧、${value.vectors.length} 条独立候选。请预览融合，再审核保存。`);
+    return true;
+  };
   const openModels = async () => {setModal('models'); try {await refreshModels();} catch (error) {flash(`模型状态读取失败：${errorText(error)}`, true);}};
   const saveConnection = async (modelId: string) => {
     setConnectionBusy(true);
@@ -873,8 +908,9 @@ export default function App() {
     <label className="field-label">预标注模型<select aria-label="预标注模型" value={workerModel} onChange={e => {setWorkerModel(e.target.value); setModelPromptMode(null); if (e.target.value === 'latr') setWorkerLabel('lane');}}>{Object.entries(modelNames).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select></label>
     <div className={`model-readiness ${selectedModel?.available ? 'ready' : ''}`}><span className="status-dot"/>{modelStatus(selectedModel)}</div>
     <label className="field-label">候选类别<input aria-label="候选类别" value={workerLabel} maxLength={80} onChange={e => setWorkerLabel(e.target.value)}/></label>
-    {workerModel === 'sam2' ? <><p className="micro-copy">在左侧所选相机添加正/负提示点或拖出提示框。无提示时执行自动掩码生成；类别名称不会触发文本识别。</p><div className="prompt-tools"><button className={`button subtle ${modelPromptMode === 'point' && !negativePrompt ? 'active' : ''}`} aria-label="SAM2正提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(false);}}>＋ 正点</button><button className={`button subtle ${modelPromptMode === 'point' && negativePrompt ? 'active' : ''}`} aria-label="SAM2负提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(true);}}>− 负点</button><button className={`button subtle ${modelPromptMode === 'box' ? 'active' : ''}`} aria-label="SAM2提示框" onClick={() => setModelPromptMode('box')}>提示框</button><button className="button ghost" onClick={() => {setModelPromptMode(null); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined);}}>清除</button></div><p className="micro-copy">{modelPoints.length} 个提示点 · {modelBox ? '已选提示框' : '未选提示框'} · {activeCamera}</p></> : <>{workerModel === 'latr' && <><p className="micro-copy">请选择当前帧的前视相机。LATR 使用图像与真实标定生成 LiDAR 坐标三维车道折线。</p><label className="closed-field"><input type="checkbox" aria-label="应用LATR时融合重复车道线" checked={autoMergeLatr} disabled={busy || jobBusy} onChange={e => setAutoMergeLatr(e.target.checked)}/>应用候选时融合重复车道线</label><label className="field-label">LATR 推理权重<select aria-label="LATR推理权重" value={latrWeight} onChange={e => setLatrWeight(e.target.value as 'once' | 'openlane')}><option value="once">ONCE · once.pth</option><option value="openlane">OpenLane · openlane.pth</option></select></label></>}<label className="field-label">置信度阈值<input type="number" aria-label="模型置信度阈值" min="0" max="1" step="0.05" value={scoreThreshold} onChange={e => {if (Number.isFinite(e.target.valueAsNumber)) setScoreThreshold(Math.min(1, Math.max(0, e.target.valueAsNumber)));}}/></label></>}
-    <button className="button primary full-width" aria-label="生成候选标注" disabled={!clip || busy || jobBusy || reconstructing || !workerLabel.trim() || !selectedModel?.available} onClick={() => void runJob('prelabel')}><Icon name="model" size={15}/>{jobBusy ? '模型推理中…' : '运行模型预标注'}</button>
+    {workerModel === 'sam2' ? <><p className="micro-copy">在左侧所选相机添加正/负提示点或拖出提示框。无提示时执行自动掩码生成；类别名称不会触发文本识别。</p><div className="prompt-tools"><button className={`button subtle ${modelPromptMode === 'point' && !negativePrompt ? 'active' : ''}`} aria-label="SAM2正提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(false);}}>＋ 正点</button><button className={`button subtle ${modelPromptMode === 'point' && negativePrompt ? 'active' : ''}`} aria-label="SAM2负提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(true);}}>− 负点</button><button className={`button subtle ${modelPromptMode === 'box' ? 'active' : ''}`} aria-label="SAM2提示框" onClick={() => setModelPromptMode('box')}>提示框</button><button className="button ghost" onClick={() => {setModelPromptMode(null); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined);}}>清除</button></div><p className="micro-copy">{modelPoints.length} 个提示点 · {modelBox ? '已选提示框' : '未选提示框'} · {activeCamera}</p></> : <>{workerModel === 'latr' && <><p className="micro-copy">请选择当前帧的前视相机。LATR 使用图像与真实标定生成 LiDAR 坐标三维车道折线。</p><label className="closed-field"><input type="checkbox" aria-label="应用LATR时融合重复车道线" checked={autoMergeLatr} disabled={busy || jobBusy} onChange={e => setAutoMergeLatr(e.target.checked)}/>单帧候选应用时融合重复车道线</label><label className="field-label">LATR 推理权重<select aria-label="LATR推理权重" value={latrWeight} onChange={e => setLatrWeight(e.target.value as 'once' | 'openlane')}><option value="once">ONCE · once.pth</option><option value="openlane">OpenLane · openlane.pth</option></select></label></>}<label className="field-label">置信度阈值<input type="number" aria-label="模型置信度阈值" min="0" max="1" step="0.05" value={scoreThreshold} onChange={e => {if (Number.isFinite(e.target.valueAsNumber)) setScoreThreshold(Math.min(1, Math.max(0, e.target.valueAsNumber)));}}/></label></>}
+    <button className="button primary full-width" aria-label="生成候选标注" disabled={!clip || busy || jobBusy || reconstructing || !workerLabel.trim() || !selectedModel?.available} onClick={() => void runJob('prelabel')}><Icon name="model" size={15}/>{jobBusy ? '模型推理中…' : workerModel === 'latr' ? '运行当前帧预标注' : '运行模型预标注'}</button>
+    {workerModel === 'latr' && <button className="button subtle full-width" aria-label="LATR批量预标注" disabled={!clip || !activeCamera || busy || jobBusy || reconstructing || reviewing} onClick={() => void openLatrBatch()}><Icon name="layers" size={15}/>当前相机 · 批量预标注</button>}
     <button className="button ghost full-width" onClick={() => void openModels()}>配置 / 检查模型服务</button>
   </>;
 
@@ -919,6 +955,7 @@ export default function App() {
       </div>
       <section className="timeline" aria-label="clip时间轴"><div className="timeline-top"><div className="playback-controls"><button className="icon-button" aria-label="上一帧" disabled={!clip || frameIndex === 0 || busy || jobBusy} onClick={() => void moveFrame(frameIndex - 1)}><Icon name="prev" size={16}/></button><button className={`play-button ${playing ? 'playing' : ''}`} aria-label={playing ? '暂停' : '播放'} disabled={!clip || (!playing && (busy || jobBusy || reviewStarting))} onClick={togglePlayback}><Icon name={playing ? 'pause' : 'play'} size={15}/></button><button className="icon-button" aria-label="下一帧" disabled={!clip || frameIndex >= clip.frames.length - 1 || busy || jobBusy} onClick={() => void moveFrame(frameIndex + 1)}><Icon name="next" size={16}/></button><span className="frame-position"><strong>{String(frameIndex + 1).padStart(4, '0')}</strong><span>/ {String(clip?.frames.length ?? 0).padStart(4, '0')}</span></span></div><span className="timeline-title">4D SCENE TIMELINE <span>● 关键帧 / 区间插值</span></span><span className="timestamp">t = {frame?.timestamp.toFixed(3) ?? '0.000'} s <span className="timebase">{reviewing ? `${playbackSpeed}×` : `${clip?.fps ?? 0} Hz`}</span></span></div><div className="timeline-track"><div className="timeline-ruler">{[0, 1, 2, 3, 4].map(i => <span key={i}>{((clip && clip.frames.length > 1 ? clip.frames.at(-1)!.timestamp - clip.frames[0].timestamp : 0) * i / 4).toFixed(1)}s</span>)}</div><div className="frame-cells">{clip?.frames.map((f, i) => <button key={f.id} className={`${frameIndex === i ? 'current' : ''} ${selectedTrack?.keyframes.some(k => k.frame_id === f.id) ? 'has-keyframe' : ''}`} aria-label={`跳转到第${i + 1}帧`} disabled={busy || jobBusy} title={`${f.id} · ${f.timestamp.toFixed(3)}s`} onClick={() => void moveFrame(i)}><i/>{selectedTrack?.keyframes.some(k => k.frame_id === f.id) ? <b>◆</b> : null}{frameIndex === i && <span>{String(i + 1).padStart(2, '0')}</span>}</button>)}</div></div></section>
     </main>
+    {latrBatchOpen && clip && <LatrBatchPanel key={clip.id} clip={clip} cameraId={activeCamera} label={workerLabel} scoreThreshold={scoreThreshold} weightVariant={latrWeight} disabled={busy || jobBusy || reconstructing || reviewing || calibrationDirty || projectionDirty} modelAvailable={Boolean(modelList?.find(model => model.id === 'latr')?.available)} onApply={applyLatrBatch} onClose={() => setLatrBatchOpen(false)} onError={message => flash(message, true)}/>}
     {automaticCalibrationOpen && clip && <AutomaticCalibrationPanel clip={clip} frameId={frame?.id} cameraId={activeCamera} disabled={busy || jobBusy || reconstructing} onSaved={automaticCalibrationSaved} onInspect={inspectAutomaticCalibration} onClose={() => setAutomaticCalibrationOpen(false)}/>}
     {notice && <div className={`toast ${notice.error ? 'error' : ''}`} role={notice.error ? 'alert' : 'status'}><Icon name={notice.error ? 'help' : 'check'} size={18}/><span>{notice.message}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice(null)}><Icon name="close" size={15}/></button></div>}
     {expandedCamera && <div className="modal-backdrop" onClick={() => setExpandedCamera(null)}><div className="expanded-camera" onClick={e => e.stopPropagation()}>{cameraCards(true)}{task === 'image' && <div className="image-draw-footer"><span>{draftPolygon.length} 个区域顶点</span><button className="button primary" disabled={draftPolygon.length < 3} onClick={finishPolygon}>完成多边形</button></div>}</div></div>}
