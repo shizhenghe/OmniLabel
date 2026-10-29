@@ -34,3 +34,8 @@ tests/*
 !tests/e2e/
 tests/e2e/*
 !tests/e2e/automatic-calibration.spec.ts
+!tests/e2e/lane-editing.spec.ts
+!tests/e2e/latr-fusion.spec.ts
+!tests/e2e/point-npy.spec.ts
+!backend/tests/test_lane_fusion.py
+!docs/lane-editing.md

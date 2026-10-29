@@ -1,4 +1,6 @@
 export type Vec3 = [number, number, number];
+/** Preserve Float64 map coordinates until the renderer subtracts its local origin. */
+export type PointBuffer = Float32Array | Float64Array;
 
 export interface Camera {
   id: string;
@@ -130,7 +132,7 @@ export interface SceneAnnotations { revision: number; coordinate_frame: 'world';
 export interface SceneMap {
   points: number[][];
   /** Full XYZI cloud loaded from NPY; avoids expanding millions of rows into JSON objects. */
-  point_buffer?: Float32Array;
+  point_buffer?: PointBuffer;
   point_labels: Record<string, string>;
   coordinate_frame: 'world';
   frame_count: number;

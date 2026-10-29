@@ -2,14 +2,15 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { BoxTransformGizmo, type BoxTransformMode } from './BoxTransformGizmo';
-import type { Annotations, Box, Frame, Vec3, Voxel } from '../types';
+import { VectorVertexGizmo } from './VectorVertexGizmo';
+import type { Annotations, Box, Frame, PointBuffer, Vec3, Voxel } from '../types';
 import { groundDrawingPoint, intensityBrightness, intensityRange, visiblePointIndices, type PointColorMode } from '../geometry/pointDisplay';
 import {renderOriginForPoints, toRenderPoint} from '../geometry/renderCoordinates';
 
 export interface PointCloudViewProps {
   frame: Frame | null;
   /** Flat XYZI rows loaded directly from NPY for very large clouds. */
-  binaryPoints?: Float32Array;
+  binaryPoints?: PointBuffer;
   cloudBounds?: {min: Vec3; max: Vec3};
   intensityRangeHint?: [number, number] | null;
   annotations: Annotations;
@@ -17,6 +18,9 @@ export interface PointCloudViewProps {
   onSelect?: (id: string | null) => void;
   onCreateBox?: (center: Vec3) => void;
   onAddVectorPoint?: (point: Vec3) => void;
+  onUpdateVectorPoint?: (id: string, index: number, point: Vec3) => void;
+  /** Independent from detection-box editing, disabled during review/calibration. */
+  vectorEditable?: boolean;
   calibrationPicking?: boolean;
   onCalibrationPoint?: (point: Vec3) => void;
   calibrationPoints?: {id: string; point: Vec3; label: string; selected?: boolean; enabled?: boolean}[];
@@ -31,7 +35,7 @@ export interface PointCloudViewProps {
   trajectory?: {frame_id: string; timestamp: number; position: Vec3}[];
   activeFrameId?: string;
   /** Stable raw source identity prevents refitting the camera on every live calibration step. */
-  autoFitReference?: number[][] | Float32Array;
+  autoFitReference?: number[][] | PointBuffer;
   /** Review can follow ego translation while preserving the chosen view direction and zoom. */
   followPosition?: Vec3;
   /** Increment to frame the currently selected box once; dragging never refits. */
@@ -331,14 +335,20 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.cloud = cloud;
   }, [ready, props.frame?.points, props.binaryPoints, props.intensityRangeHint, props.annotations.point_labels, colorMode, visibleIndices, visibleCount, pointCount, origin]);
 
-  const fittedScene = useRef<number[][] | Float32Array | null>(null);
+  const fittedScene = useRef<number[][] | PointBuffer | null>(null);
+  const fittedSpace = useRef<boolean | null>(null);
   useEffect(() => {
     const rt = runtime.current;
     const points = props.frame?.points ?? [];
     const binary = props.binaryPoints;
-    if (!props.sceneMode) { fittedScene.current = null; return; }
+    if (!rt || !pointCount) return;
+    const spaceChanged = fittedSpace.current !== Boolean(props.sceneMode);
+    // Recenter once when switching world/LiDAR coordinates; subsequent source
+    // frames keep the operator's view, just as live annotation edits do.
+    if (!props.sceneMode && !spaceChanged) { fittedScene.current = null; return; }
     const fitReference = props.autoFitReference ?? binary ?? points;
-    if (!rt || !pointCount || fittedScene.current === fitReference) return;
+    if (!spaceChanged && fittedScene.current === fitReference) return;
+    fittedSpace.current = Boolean(props.sceneMode);
     fittedScene.current = fitReference ?? points;
     const bounds = new THREE.Box3();
     if (binary && props.cloudBounds) {
@@ -360,7 +370,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.controls.update();
   }, [ready, props.sceneMode, props.frame?.points, props.binaryPoints, props.cloudBounds, props.autoFitReference, props.view, pointCount, origin]);
 
-  const followState = useRef<{reference: number[][] | Float32Array | undefined; position: THREE.Vector3} | null>(null);
+  const followState = useRef<{reference: number[][] | PointBuffer | undefined; position: THREE.Vector3} | null>(null);
   useEffect(() => {
     const rt = runtime.current;
     if (!rt || !props.followPosition) {followState.current = null; return;}
@@ -616,6 +626,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     data-active-frame-id={props.activeFrameId ?? props.frame?.id ?? ''}
     data-annotation-box-count={props.showBoxes === false ? 0 : props.annotations.boxes.length}
     data-annotation-vector-count={props.showVectors === false ? 0 : props.annotations.vectors.length}
+    data-vector-editable={props.vectorEditable ? 'true' : 'false'}
     data-point-label-count={pointLabelCount}
     data-calibration-point-count={props.calibrationPoints?.length ?? 0}
     data-calibration-picking={props.calibrationPicking ? 'true' : 'false'}
@@ -637,6 +648,12 @@ export function PointCloudView(props: PointCloudViewProps) {
         box={props.annotations.boxes.find(box => box.id === props.selectedId)!}
         renderOrigin={origin} mode={props.transformMode ?? 'scale'} camera={runtime.current.camera} canvas={runtime.current.renderer.domElement}
         controls={runtime.current.controls} onUpdate={props.onUpdateBox} onStart={props.onTransformStart} onEnd={props.onTransformEnd}/>}
+    {ready && runtime.current && !props.calibrationPicking && props.vectorEditable && props.showVectors !== false &&
+      (props.tool === 'select' || !props.tool) && props.onUpdateVectorPoint && props.annotations.vectors.find(vector => vector.id === props.selectedId) &&
+      <VectorVertexGizmo key={`${props.selectedId}/${props.activeFrameId ?? props.frame?.id ?? ''}`}
+        vector={props.annotations.vectors.find(vector => vector.id === props.selectedId)!} renderOrigin={origin}
+        camera={runtime.current.camera} canvas={runtime.current.renderer.domElement} controls={runtime.current.controls}
+        onUpdate={props.onUpdateVectorPoint} onStart={props.onTransformStart} onEnd={props.onTransformEnd}/>}
     {error && <div role="alert" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: '#f3c2b2', background: '#0b131f', textAlign: 'center' }}>{error}</div>}
     <div style={{ position: 'absolute', right: 14, bottom: 12, pointerEvents: 'none', color: '#8294a9', font: '10px ui-monospace, monospace', display: 'flex', gap: 16 }}>
       {cursor && <span>{cursor}</span>}<span>X 前 · Y 左 · Z 上</span>

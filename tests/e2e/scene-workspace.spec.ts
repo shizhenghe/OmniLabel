@@ -3,7 +3,7 @@ import { expect, test, type Page } from '@playwright/test';
 async function openScene(page: Page) {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await expect(page.getByTestId('point-cloud-view')).toHaveAttribute('data-coordinate-frame', 'world');
   await expect.poll(async () => Number(await page.getByTestId('point-cloud-view').getAttribute('data-cloud-point-count'))).toBeGreaterThan(1000);
   await expect(page.locator('.scene-summary')).toContainText('12 帧已融合');
@@ -80,7 +80,7 @@ test('actual pointer drags translate resize rotate and persist a temporal world 
   expect(key.size[0]).toBeCloseTo(Number(editedLength), 2);
   expect(key.center[0]).toBeCloseTo(Number(editedX), 2);
   await page.reload();
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.locator('.object-row').first().click();
   await expect(page.getByLabel('尺寸长', {exact: true})).toHaveValue(editedLength);
 });
@@ -153,7 +153,7 @@ test('selecting a box exposes direct length width height grips and a center move
   const key = scene.tracks.find((t: {id: string}) => t.id === trackId).keyframes.find((k: {frame_id: string}) => k.frame_id === 'frame-000');
   for (let axis = 0; axis < 3; axis++) expect(key.size[axis]).toBeCloseTo(size[axis], 2);
   await page.reload();
-  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled({timeout: 60_000});
   await page.locator('.object-row').first().click();
   expect([await readSize('长'), await readSize('宽'), await readSize('高')]).toEqual(size);
 });

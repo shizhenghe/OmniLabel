@@ -11,12 +11,13 @@ from fastapi.responses import FileResponse
 import numpy as np
 
 from .models import Clip
+from .lane_fusion import LaneMergePreview, LaneMergeRequest, merge_lanes
 from .scene import (
-    SCENE_PREVIEW_POINTS, frame_annotations, get_scene, get_scene_map, reconstruct_scene,
+    SCENE_PREVIEW_POINTS, _scene_path, frame_annotations, get_scene, get_scene_map, reconstruct_scene,
     registered_poses, save_reconstruction, save_scene, source_fingerprint, scene_map_page, scene_map_file,
 )
 from .scene_models import ReconstructionRequest, SceneAnnotations
-from .storage import Store
+from .storage import ConflictError, Store
 
 LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +32,21 @@ def mount_scene_routes(app: FastAPI, store: Store, executor: ThreadPoolExecutor)
     @app.get("/api/clips/{clip_id}/scene/annotations", response_model=SceneAnnotations)
     def read_scene(clip_id: str):
         return get_scene(store, clip_for(clip_id))
+
+    @app.post("/api/clips/{clip_id}/lanes/merge-preview", response_model=LaneMergePreview)
+    def preview_lane_merge(clip_id: str, request: LaneMergeRequest):
+        clip = clip_for(clip_id)
+        # This endpoint computes a proposal only. It must not save/revise the
+        # scene or change per-frame labels; callers retain normal undo/save.
+        if request.scene_revision is not None:
+            # get_scene initializes a migrated scene on its first read. A
+            # preview must remain read-only even before that initialization.
+            with store.lock:
+                path = _scene_path(store, clip.id)
+                revision = SceneAnnotations.model_validate_json(path.read_text()).revision if path.exists() else 0
+            if revision != request.scene_revision:
+                raise ConflictError("Scene annotations changed. Reload before merging lanes.")
+        return merge_lanes(request)
 
     @app.put("/api/clips/{clip_id}/scene/annotations", response_model=SceneAnnotations)
     def write_scene(clip_id: str, value: SceneAnnotations):
