@@ -39,3 +39,5 @@ tests/e2e/*
 !tests/e2e/point-npy.spec.ts
 !backend/tests/test_lane_fusion.py
 !docs/lane-editing.md
+!backend/tests/test_batch_prelabel.py
+!tests/e2e/latr-batch.spec.ts
