@@ -141,6 +141,7 @@ export interface SceneMap {
   trajectory: {frame_id: string; timestamp: number; position: Vec3}[];
   bounds: {min: Vec3; max: Vec3};
   method: string;
+  source_map?: string;
   voxel_size: number;
   scene_revision?: number;
   preserve_detail?: boolean;

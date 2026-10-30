@@ -50,6 +50,10 @@ export interface ProjectionCalibrationDocument {
   projection_matrix?: Matrix4 | null;
   stale?: boolean;
   status_reason?: string;
+  scope?: 'frame' | 'clip' | 'source';
+  clip_scope_active?: boolean;
+  clip_anchor_frame_id?: string | null;
+  clip_matrix?: Matrix4 | null;
   [key: string]: unknown;
 }
 export interface ProjectionCalibrationSolveResult extends ProjectionCalibrationDocument {
@@ -63,13 +67,15 @@ export interface ProjectionCalibrationEditorProps {
   cameras: Camera[];
   cameraId: string;
   disabled?: boolean;
+  /** Supplied world maps normally need a fixed camera correction across a clip. */
+  defaultClipScope?: boolean;
   pickedPoint?: Vec3 | null;
   pickedPixel?: [number, number] | null;
   onCameraChange: (cameraId: string) => void;
   onPickModeChange: (mode: ProjectionPickMode) => void;
   onConsumedPick: () => void;
   onPreview: (matrix: Matrix4 | null) => void;
-  onSaved: (document: ProjectionCalibrationDocument) => void;
+  onSaved: (document: ProjectionCalibrationDocument) => Promise<void> | void;
   onClose: () => void;
   onDirtyChange?: (dirty: boolean) => void;
   onBusyChange?: (busy: boolean) => void;
@@ -86,7 +92,7 @@ const percentage = (value?: number) => typeof value === 'number' && Number.isFin
 const validMatrix = (matrix: Matrix4 | null | undefined): matrix is Matrix4 => Boolean(matrix && matrix.length === 4 && matrix.every(row => row.length === 4 && row.every(Number.isFinite)));
 const sameAnchors = (a: ProjectionCorrespondence[], b: ProjectionCorrespondence[]) => JSON.stringify(a) === JSON.stringify(b);
 
-/** Per-frame camera registration. Three-dimensional picks are in the frame's LiDAR coordinates. */
+/** Camera registration anchored in this frame's original point coordinates. */
 export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorProps) {
   const [baseline, setBaseline] = useState<ProjectionCalibrationDocument | null>(null);
   const [anchors, setAnchors] = useState<ProjectionCorrespondence[]>([]);
@@ -104,6 +110,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
   const [reload, setReload] = useState(0);
+  const [saveScope, setSaveScope] = useState<'frame' | 'clip'>(props.defaultClipScope ? 'clip' : 'frame');
   const sequence = useRef(0);
   const anchorNumber = useRef(1);
   const latest = useRef(props);
@@ -124,6 +131,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     setLoading(true); setBaseline(null); setAnchors([]); setCandidate(null); setMetrics(null);
     setPendingPoint(null); setPickMode(null); setPickingId(null); setSelectedId(null);
     setShowCandidate(false); setError(''); setStatus(''); setOperation(null);
+    setSaveScope(latest.current.defaultClipScope ? 'clip' : 'frame');
     latest.current.onPreview(null); latest.current.onPickModeChange(null); latest.current.onConsumedPick();
     request<ProjectionCalibrationDocument>(endpoint).then(value => {
       if (!active || !unchangedScope(token, scope)) return;
@@ -234,20 +242,26 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     setMetricsKind('saved');
     props.onPreview(null); setError(''); setStatus('已丢弃候选修正，对应点保留。');
   };
-  const save = async (reset = false) => {
-    if (!baseline || locked || (!reset && !candidate)) return;
+  const save = async (reset = false, promoteSaved = false) => {
+    if (!baseline || locked || (!reset && !candidate && !(promoteSaved && baseline.saved_matrix))) return;
+    const targetScope = promoteSaved ? 'clip' : saveScope;
     const token = sequence.current, startScope = scope;
     setOperation(reset ? 'reset' : 'save'); setError(''); changePickMode(null);
     try {
       const value = await jsonRequest<ProjectionCalibrationDocument>(endpoint, {
-        revision: baseline.revision, matrix: reset ? null : candidate,
-        correspondences: anchors, method: reset ? 'reset' : candidateMethod, ...(!reset ? {metrics} : {}),
+        revision: baseline.revision, scope: targetScope,
+        matrix: reset ? null : promoteSaved ? baseline.saved_matrix : candidate,
+        correspondences: promoteSaved ? baseline.correspondences : anchors,
+        method: reset ? 'reset' : promoteSaved ? baseline.method ?? 'correspondences' : candidateMethod,
+        ...(!reset ? {metrics: promoteSaved ? baseline.metrics : metrics} : {}),
       }, 'PUT');
       if (!unchangedScope(token, startScope)) return;
       setBaseline(value); setAnchors(clone(value.correspondences ?? [])); setMetrics(value.metrics ?? null); setMetricsKind('saved');
+      setSaveScope(targetScope);
       setCandidate(null); setShowCandidate(false); setPendingPoint(null); setPickingId(null);
-      props.onSaved(value); props.onPreview(null);
-      setStatus(reset ? '已清除本帧本相机的已保存修正，恢复原始投影。' : '已保存，仅应用于当前帧和当前相机。');
+      await props.onSaved(value); props.onPreview(null);
+      setStatus(reset ? targetScope === 'clip' ? '已清除当前相机的整个 clip 修正；独立逐帧修正保留。' : '已清除当前帧的独立修正，恢复当前有效投影。'
+        : targetScope === 'clip' ? '已应用于整个 clip 的当前相机，切帧时按对应帧位姿投影；已有独立逐帧修正保留。' : '已保存，仅应用于当前帧和当前相机。');
     } catch (cause) {if (unchangedScope(token, startScope)) reportFailure(cause, reset ? '清除修正失败' : '保存修正失败');}
     finally {if (unchangedScope(token, startScope)) setOperation(null);}
   };
@@ -269,7 +283,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const errors = new Map((metrics?.point_errors ?? []).map(value => [value.id, value]));
 
   return <div className="projection-calibration-editor" role="dialog" aria-modal="false" aria-label="逐帧投影校正" data-testid="projection-calibration-editor">
-    <div className="projection-calibration-heading"><div><h2>逐帧投影校正</h2><p>当前帧与当前相机独立求解，三维标注坐标保持不变。</p></div>
+    <div className="projection-calibration-heading"><div><h2>投影校正</h2><p>以当前帧求解，可将相机修正按每帧位姿应用于整个 clip，三维标注坐标保持不变。</p></div>
       <button className="icon-button" aria-label="关闭投影校正" disabled={Boolean(operation)} onClick={close}>×</button></div>
     <div className="projection-calibration-scope"><span>帧 <strong title={props.frameId}>{props.frameId}</strong></span>{baseline?.saved_matrix && <span className="projection-saved-tag">{baseline.stale ? '修正待重算' : '已有修正'}</span>}</div>
     {baseline?.status_reason && <p className="projection-calibration-notice" role="status">{baseline.status_reason}</p>}
@@ -277,6 +291,12 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
       {props.cameras.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}
     </select></label>
     {loading ? <p className="projection-progress" role="status">正在读取当前帧投影…</p> : baseline && <>
+      <label className="field-label">应用范围<select aria-label="投影修正应用范围" value={saveScope} disabled={locked} onChange={event => setSaveScope(event.target.value as 'frame' | 'clip')}>
+        <option value="clip">整个 clip · 当前相机</option><option value="frame">仅当前帧 · 当前相机</option>
+      </select></label>
+      {saveScope === 'clip' && <p className="projection-help">整个 clip 共享相机修正，各帧仍按自己的位姿投影，已有独立逐帧修正保留。</p>}
+      {baseline.clip_scope_active && <p className="projection-help" role="status">当前相机已有整个 clip 修正，参考帧 {baseline.clip_anchor_frame_id ?? '—'}{baseline.scope === 'frame' ? '；当前帧使用独立修正。' : '。'}</p>}
+      {baseline.saved_matrix && baseline.scope !== 'clip' && !candidate && <button className="button subtle full-width" aria-label="将当前修正应用整个clip" disabled={locked || dirty} onClick={() => void save(false, true)}>将当前修正应用整个 clip</button>}
       <section className="projection-calibration-section"><h3>图像与点云自动配准</h3>
         <p>利用当前图像与静态点云直接估计候选修正，无需手工对应点。</p>
         <button className="button subtle full-width" aria-label="自动配准当前帧" disabled={locked || baseline.automatic_available === false} onClick={() => void solve(true)}>{operation === 'auto' ? '正在配准，请稍候…' : '自动配准当前帧'}</button>
@@ -309,9 +329,9 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
       </section>}
       {candidate && <section className="projection-calibration-section"><h3>预览与保存</h3><div className="projection-preview-toggle" role="group" aria-label="修正前后预览"><button className={!showCandidate ? 'active' : ''} aria-pressed={!showCandidate} disabled={locked} onClick={() => preview(false)}>修正前</button><button className={showCandidate ? 'active' : ''} aria-pressed={showCandidate} disabled={locked} onClick={() => preview(true)}>候选修正</button></div>
         <p className="projection-help">修正前为当前已保存的投影。保存后同时应用于点云与三维标注的图像投影。</p>
-        <div className="projection-calibration-actions"><button className="button primary full-width" aria-label="保存本帧本相机投影修正" disabled={locked} onClick={() => void save()}>{operation === 'save' ? '正在保存…' : '保存本帧本相机'}</button><button className="button ghost" disabled={locked} onClick={discardCandidate}>丢弃候选</button></div>
+        <div className="projection-calibration-actions"><button className="button primary full-width" aria-label={saveScope === 'clip' ? '保存整个clip当前相机投影修正' : '保存本帧本相机投影修正'} disabled={locked} onClick={() => void save()}>{operation === 'save' ? '正在保存…' : saveScope === 'clip' ? '保存整个 clip · 当前相机' : '保存本帧本相机'}</button><button className="button ghost" disabled={locked} onClick={discardCandidate}>丢弃候选</button></div>
       </section>}
-      <div className="projection-calibration-actions"><button className="button subtle" disabled={locked} onClick={exportDocument}>导出校正 JSON</button><button className="button ghost" disabled={locked || !baseline.saved_matrix || Boolean(candidate) || Boolean(pendingPoint)} onClick={() => void save(true)}>{operation === 'reset' ? '正在清除…' : '清除已保存修正'}</button></div>
+      <div className="projection-calibration-actions"><button className="button subtle" disabled={locked} onClick={exportDocument}>导出校正 JSON</button><button className="button ghost" aria-label={saveScope === 'clip' ? '清除整个clip投影修正' : '清除当前帧投影修正'} disabled={locked || !(saveScope === 'clip' ? baseline.clip_scope_active : baseline.saved_matrix) || Boolean(candidate) || Boolean(pendingPoint)} onClick={() => void save(true)}>{operation === 'reset' ? '正在清除…' : saveScope === 'clip' ? '清除整个 clip 修正' : '清除已保存修正'}</button></div>
     </>}
     {operation === 'auto' && <p className="projection-progress" role="status">正在比较图像与点云结构，通常需要数十秒。完成后仍需检查候选投影。</p>}
     {error && <div className="projection-calibration-error" role="alert"><p>{error}</p>{!locked && <button className="button ghost" onClick={() => {if (!dirty || window.confirm('重新读取会丢弃未保存的对应点和候选修正，确定继续？')) setReload(value => value + 1);}}>重新读取</button>}</div>}

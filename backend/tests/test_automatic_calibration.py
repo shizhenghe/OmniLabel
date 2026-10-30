@@ -320,6 +320,30 @@ def test_apply_is_idempotent_and_preserves_saved_pairs_by_default(calibration_ap
     assert [path.read_bytes() for path in paths] == saved_bytes
 
 
+def test_inherited_clip_projection_is_preserved_unless_overwrite_is_requested(calibration_api):
+    client, store, _ = calibration_api
+    current = document_for(store, "batch", "f0", "front")
+    matrix = np.eye(4)
+    matrix[0, 3] = .05
+    save_projection_calibration(store, "batch", "f0", "front", ProjectionUpdate(
+        revision=current["revision"], matrix=matrix.tolist(), method="koide", scope="clip"))
+    inherited = document_for(store, "batch", "f1", "front")
+    assert inherited["saved_matrix"] is None and inherited["scope"] == "clip"
+    exported = client.get(ROUTE + "/export").json()["frames"][1]["cameras"]["front"]
+    assert exported["saved"] and exported["scope"] == "clip"
+    assert exported["clip_anchor_frame_id"] == "f0" and not exported["clip_stale"]
+    np.testing.assert_allclose(exported["camera_from_lidar"], inherited["effective_matrix"])
+    record = store.root / "clip_projection_calibrations" / "batch" / "front.json"
+    before = record.read_bytes()
+    protected = finished(client, start(client, frame_ids=["f1"], camera_ids=["front"])["id"])
+    assert protected["skipped"] == 1 and protected["accepted"] == 0
+    assert "已保存" in protected["items"][0]["reason"]
+    overwrite = finished(client, start(client, frame_ids=["f1"], camera_ids=["front"], overwrite_saved=True)["id"])
+    assert overwrite["accepted"] == 1 and overwrite["skipped"] == 0
+    assert record.read_bytes() == before
+    assert not (store.root / "projection_calibrations" / "batch" / "f1" / "front.json").exists()
+
+
 def test_apply_revalidates_engine_quality(calibration_api, monkeypatch):
     client, store, _ = calibration_api
     job = finished(client, start(client)["id"])

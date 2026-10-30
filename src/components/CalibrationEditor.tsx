@@ -32,6 +32,7 @@ export function CalibrationEditor(props: CalibrationEditorProps) {
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
   const targetBase = useRef<Record<string, Matrix4>>({});
+  const originalClip = useRef(props.clip);
   const latest = useRef(props);
   latest.current = props;
   const lidarTarget = target === '__lidar__';
@@ -46,6 +47,7 @@ export function CalibrationEditor(props: CalibrationEditorProps) {
     setLoading(true);
     request<CalibrationDocument>(`/clips/${encodeURIComponent(props.clip.id)}/calibration`).then(value => {
       if (!active) return;
+      originalClip.current = latest.current.clip;
       setBaseline(value); setDraft(copy(value));
       setTarget(latest.current.clip.cameras[0]?.id ?? '');
       targetBase.current = copy(value.cameras);
@@ -66,7 +68,8 @@ export function CalibrationEditor(props: CalibrationEditorProps) {
     if (!baseline) return;
     const next = {...value, world_from_lidar: calibrationWorldPoses(baseline, value)};
     setDraft(next); setError(''); setStatus('');
-    props.onPreview(applyCalibration(latest.current.clip, next), next);
+    if (sameCalibration(baseline, next)) props.onPreview(null);
+    else props.onPreview(applyCalibration(originalClip.current, next, baseline), next);
   };
   const chooseTarget = (next: string) => {
     if (!draft) return;
@@ -123,9 +126,10 @@ export function CalibrationEditor(props: CalibrationEditorProps) {
     try {
       const value = await jsonRequest<CalibrationDocument>(`/clips/${encodeURIComponent(props.clip.id)}/calibration`,
         {revision: baseline.revision, cameras: draft.cameras, lidar_to_ego: draft.lidar_to_ego}, 'PUT');
+      originalClip.current = applyCalibration(originalClip.current, value, value);
       setBaseline(value); setDraft(copy(value)); setCorrection(copy(ZERO_CORRECTION));
       targetBase.current = copy(lidarTarget ? value.lidar_to_ego : value.cameras);
-      setStatus(value.lidar_changed ? '外参已保存；请重建场景地图并复核世界坐标标注。' : '相机外参已保存。');
+      setStatus(value.map_rebuild_required ? '外参已保存；请重建场景地图并复核世界坐标标注。' : '外参已保存，所有帧投影已更新。');
       props.onSaved(value, {lidarChanged: value.lidar_changed ?? false});
     } catch (cause) {setError(`保存外参失败：${message(cause)}`); props.onError?.(message(cause));}
     finally {setSaving(false);}
@@ -148,7 +152,9 @@ export function CalibrationEditor(props: CalibrationEditorProps) {
             <input type="number" aria-label={`外参${name}`} step={kind === 'translation' ? .005 : .05} value={value} onChange={event => update(kind, axis, event.target.valueAsNumber)}/></div>;})}
       </fieldset>)}</div>
       {currentMatrix && <div className="calibration-matrix"><strong>当前 4×4 外参矩阵</strong><pre data-testid="calibration-matrix">{currentMatrix.map(row => row.map(value => value.toFixed(6).padStart(11)).join(' ')).join('\n')}</pre></div>}
-      {lidarTarget && <p className="micro-copy">LiDAR 外参改动会改变场景点位置，保存后需重建地图；已有世界坐标标注保留并需复核。</p>}
+      {lidarTarget && <p className="micro-copy">{props.clip.source === '4d-clip-import'
+        ? '预建地图保留世界坐标，外参调整更新各帧投影；已有标注保留并需复核。'
+        : 'LiDAR 外参改动会改变场景点位置，保存后需重建地图；已有世界坐标标注保留并需复核。'}</p>}
       <div className="calibration-actions"><button className="button primary" disabled={locked || !dirty} aria-label="保存外参" onClick={() => void save()}>{saving ? '保存中…' : '保存外参'}</button>
         <button className="button subtle" disabled={locked || !draft} aria-label="导出外参" onClick={() => draft && download(`${props.clip.id}-calibration${dirty ? '-draft' : ''}.json`, JSON.stringify({...draft, draft: dirty}, null, 2))}>导出外参</button>
         <button className="button ghost" disabled={locked || !dirty} onClick={resetTarget}>还原当前</button>
