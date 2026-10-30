@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -64,6 +64,7 @@ class ProjectionUpdate(Model):
     matrix: list[list[float]] | None
     correspondences: list[Correspondence] = Field(default_factory=list, max_length=MAX_CORRESPONDENCES)
     method: str = Field(default="correspondences", min_length=1, max_length=80)
+    scope: Literal["frame", "clip"] = "frame"
     # Accepted for API compatibility. Quality is recomputed by the server.
     metrics: dict[str, Any] | None = None
 
@@ -416,6 +417,10 @@ def _path(store: Store, clip_id: str, frame_id: str, camera_id: str) -> Path:
     return store.root / "projection_calibrations" / safe_id(clip_id) / safe_id(frame_id) / f"{safe_id(camera_id)}.json"
 
 
+def _clip_path(store: Store, clip_id: str, camera_id: str) -> Path:
+    return store.root / "clip_projection_calibrations" / safe_id(clip_id) / f"{safe_id(camera_id)}.json"
+
+
 def _base_matrix(frame: Frame, camera: Camera) -> list[list[float]]:
     source_override = getattr(frame, "projection_camera_from_lidar", {}).get(camera.id)
     if source_override is not None:
@@ -481,29 +486,90 @@ def _read_record(store: Store, clip_id: str, frame_id: str, camera_id: str) -> d
     return value
 
 
+def _read_clip_record(store: Store, clip_id: str, camera_id: str) -> dict | None:
+    path = _clip_path(store, clip_id, camera_id)
+    if not path.is_file():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("camera_delta") is not None:
+        rigid_transform(value["camera_delta"])
+    return value
+
+
+def _clip_base_fingerprint(clip: Clip, camera: Camera) -> str:
+    return _fingerprint({"camera": camera.model_dump(), "frames": [
+        {"id": frame.id, "ego_to_world": frame.ego_to_world, "lidar_to_ego": frame.lidar_to_ego,
+         "base_matrix": _base_matrix(frame, camera)} for frame in clip.frames]})
+
+
+def _clip_record_active(store: Store, clip: Clip, camera: Camera, record: dict | None) -> bool:
+    if not record or record.get("camera_delta") is None:
+        return False
+    anchor = next((frame for frame in clip.frames if frame.id == record.get("anchor_frame_id")), None)
+    return bool(anchor is not None
+                and record.get("clip_base_fingerprint") == _clip_base_fingerprint(clip, camera)
+                and record.get("anchor_source_fingerprint") == _source_fingerprint(store, anchor, camera))
+
+
+def _resolved_projection(store: Store, clip: Clip, frame: Frame, camera: Camera,
+                         record: dict | None, clip_record: dict | None,
+                         clip_active: bool) -> tuple[list[list[float]], str, list[list[float]] | None]:
+    base = _base_matrix(frame, camera)
+    own_active = bool(record and record.get("matrix") is not None
+                      and record.get("base_fingerprint") == _base_fingerprint(frame, camera)
+                      and _record_matches_source(store, record, frame, camera))
+    inherited = ((np.asarray(clip_record["camera_delta"]) @ np.asarray(base)).tolist()
+                 if clip_active and clip_record else None)
+    # Publishing a new whole-clip candidate supersedes the anchor's older
+    # local value without rewriting its document. A subsequent explicit
+    # frame-only save remains authoritative, as do reviewed other frames.
+    anchor_replaced = bool(clip_active and clip_record and frame.id == clip_record.get("anchor_frame_id")
+                           and int((record or {}).get("sequence", 0)) <= int(clip_record.get("anchor_local_sequence", 0)))
+    if own_active and not anchor_replaced:
+        return record["matrix"], "frame", inherited
+    if inherited is not None:
+        return inherited, "clip", inherited
+    return base, "source", None
+
+
 def overlay_projection_calibrations(store: Store, clip: Clip) -> Clip:
     """Called by Store.clip; source manifests remain byte-for-byte untouched."""
     cameras = {camera.id: camera for camera in clip.cameras}
+    clip_records = {camera.id: _read_clip_record(store, clip.id, camera.id) for camera in clip.cameras}
+    clip_active = {camera.id: _clip_record_active(store, clip, camera, clip_records[camera.id])
+                   for camera in clip.cameras}
     frames = []
     changed = False
     for frame in clip.frames:
         matrices = dict(getattr(frame, "projection_camera_from_lidar", {}))
-        directory = store.root / "projection_calibrations" / safe_id(clip.id) / safe_id(frame.id)
-        if directory.is_dir():
-            for path in directory.glob("*.json"):
-                camera = cameras.get(path.stem)
-                if camera is None:
-                    continue
-                record = _read_record(store, clip.id, frame.id, camera.id)
-                if (record and record.get("matrix") is not None
-                        and record.get("base_fingerprint") == _base_fingerprint(frame, camera)
-                        and _record_matches_source(store, record, frame, camera)):
-                    matrices[camera.id] = record["matrix"]
+        for camera in cameras.values():
+            record = _read_record(store, clip.id, frame.id, camera.id)
+            effective, scope, _ = _resolved_projection(
+                store, clip, frame, camera, record, clip_records[camera.id], clip_active[camera.id])
+            if scope != "source":
+                matrices[camera.id] = effective
         if matrices != getattr(frame, "projection_camera_from_lidar", {}):
             frame = frame.model_copy(update={"projection_camera_from_lidar": matrices})
             changed = True
         frames.append(frame)
     return clip.model_copy(update={"frames": frames}) if changed else clip
+
+
+def projection_calibration_scopes(store: Store, clip: Clip) -> dict[str, dict[str, str]]:
+    """Resolve overlay provenance once for a physical-calibration preview.
+
+    The caller supplies the source clip, not an already overlaid snapshot.
+    Cache the camera-level validation across frames, as the normal overlay
+    reader does, without loading solve status or recomputing whole-clip tokens
+    for every frame/camera pair.
+    """
+    clip_records = {camera.id: _read_clip_record(store, clip.id, camera.id) for camera in clip.cameras}
+    active = {camera.id: _clip_record_active(store, clip, camera, clip_records[camera.id])
+              for camera in clip.cameras}
+    return {frame.id: {camera.id: _resolved_projection(
+        store, clip, frame, camera, _read_record(store, clip.id, frame.id, camera.id),
+        clip_records[camera.id], active[camera.id])[1] for camera in clip.cameras}
+        for frame in clip.frames}
 
 
 def _source_context(store: Store, clip_id: str, frame_id: str, camera_id: str):
@@ -521,13 +587,18 @@ def _source_context(store: Store, clip_id: str, frame_id: str, camera_id: str):
 
 
 def document_for(store: Store, clip_id: str, frame_id: str, camera_id: str, *, context=None) -> dict:
-    _, frame, camera = context or _source_context(store, clip_id, frame_id, camera_id)
+    clip, frame, camera = context or _source_context(store, clip_id, frame_id, camera_id)
     record = _read_record(store, clip_id, frame_id, camera_id)
+    clip_record = _read_clip_record(store, clip_id, camera_id)
+    clip_active = _clip_record_active(store, clip, camera, clip_record)
     base = _base_matrix(frame, camera)
     fingerprint = _base_fingerprint(frame, camera)
     active = bool(record and record.get("base_fingerprint") == fingerprint
                   and _record_matches_source(store, record, frame, camera))
     saved = record.get("matrix") if active else None
+    effective, scope, clip_matrix = _resolved_projection(store, clip, frame, camera, record, clip_record, clip_active)
+    selected_record = clip_record if scope == "clip" else record
+    inherited = scope == "clip" and frame_id != clip_record.get("anchor_frame_id")
     try:
         from .automatic_projection import automatic_status
         status = automatic_status()
@@ -536,13 +607,20 @@ def document_for(store: Store, clip_id: str, frame_id: str, camera_id: str, *, c
     has_image = camera_id in frame.images
     has_points = bool(frame.calibration_point_count or frame.point_count or frame.points)
     return {"schema_version": "1.0", "clip_id": clip_id, "frame_id": frame_id, "camera_id": camera_id,
-            "revision": _fingerprint({"base_fingerprint": fingerprint, "record": record}),
-            "base_matrix": base, "effective_matrix": saved if saved is not None else base,
+            "revision": _fingerprint({"base_fingerprint": fingerprint, "record": record,
+                                      "clip_record": clip_record,
+                                      "clip_base_fingerprint": _clip_base_fingerprint(clip, camera) if clip_record else None}),
+            "base_matrix": base, "effective_matrix": effective,
             "saved_matrix": saved,
-            "projection_matrix": saved if saved is not None else getattr(frame, "projection_camera_from_lidar", {}).get(camera_id),
-            "correspondences": record.get("correspondences", []) if record else [],
-            "method": record.get("method") if active else None, "metrics": record.get("metrics") if active else None,
-            "updated_at": record.get("updated_at") if record else None,
+            "projection_matrix": effective if scope != "source" else getattr(frame, "projection_camera_from_lidar", {}).get(camera_id),
+            "scope": scope, "clip_scope_active": clip_active,
+            "clip_anchor_frame_id": clip_record.get("anchor_frame_id") if clip_record else None,
+            "clip_stale": bool(clip_record and clip_record.get("camera_delta") is not None and not clip_active),
+            "clip_matrix": clip_matrix, "inherited": inherited,
+            "correspondences": selected_record.get("correspondences", []) if selected_record and not inherited else [],
+            "method": selected_record.get("method") if scope != "source" and selected_record else None,
+            "metrics": selected_record.get("metrics") if scope != "source" and selected_record and not inherited else None,
+            "updated_at": selected_record.get("updated_at") if selected_record else None,
             "stale": bool(record and record.get("matrix") is not None and not active),
             "stale_detail": "基础标定或源图像、点云已变化，旧修正已停用，请重新求解。" if record and not active else None,
             "status_reason": "基础标定或源图像、点云已变化，旧修正已停用，请重新求解。" if record and not active else None,
@@ -603,20 +681,36 @@ def save_projection_calibration(store: Store, clip_id: str, frame_id: str, camer
             if not assessment["usable"]:
                 raise ValueError("当前候选未通过质量检查，不能保存：" + "；".join(assessment["rejection_reasons"]))
             metrics = assessment["metrics"]
+        previous = (_read_clip_record(store, clip_id, camera_id) if value.scope == "clip"
+                    else _read_record(store, clip_id, frame_id, camera_id))
         record = {"schema_version": "1.0", "clip_id": clip_id, "frame_id": frame_id, "camera_id": camera_id,
                   "base_fingerprint": _base_fingerprint(frame, camera),
                   "source_fingerprint": _source_fingerprint(store, frame, camera), "matrix": matrix,
                   "correspondences": [pair.model_dump() for pair in value.correspondences],
                   "method": value.method if matrix is not None else "reset", "metrics": metrics,
-                  "sequence": int((_read_record(store, clip_id, frame_id, camera_id) or {}).get("sequence", 0)) + 1,
+                  "sequence": int((previous or {}).get("sequence", 0)) + 1,
                   "updated_at": datetime.now(timezone.utc).isoformat()}
+        if value.scope == "clip":
+            record.update(
+                scope="clip", anchor_frame_id=frame_id,
+                anchor_local_sequence=int((_read_record(store, clip_id, frame_id, camera_id) or {}).get("sequence", 0)),
+                clip_base_fingerprint=_clip_base_fingerprint(clip, camera),
+                anchor_source_fingerprint=_source_fingerprint(store, frame, camera),
+                # Transfer a fixed optical-camera correction, not the
+                # anchor's absolute world-to-camera matrix. Each target keeps
+                # its own vehicle pose and imported source correction.
+                camera_delta=(np.asarray(matrix) @ np.linalg.inv(np.asarray(_base_matrix(frame, camera)))).tolist()
+                if matrix is not None else None,
+            )
         if source_job_id is not None:
             record.update(source_job_id=source_job_id, source_input_fingerprint=source_input_fingerprint)
-        previous = _read_record(store, clip_id, frame_id, camera_id)
         if previous:
-            history = store.root / "projection_calibration_history" / safe_id(clip_id) / safe_id(frame_id) / safe_id(camera_id)
+            history = (store.root / "clip_projection_calibration_history" / safe_id(clip_id) / safe_id(camera_id)
+                       if value.scope == "clip" else store.root / "projection_calibration_history" / safe_id(clip_id) / safe_id(frame_id) / safe_id(camera_id))
             atomic_json(history / f"{previous.get('sequence', 0)}-{_fingerprint(previous)[:16]}.json", previous)
-        atomic_json(_path(store, clip_id, frame_id, camera_id), record)
+        destination = (_clip_path(store, clip_id, camera_id) if value.scope == "clip"
+                       else _path(store, clip_id, frame_id, camera_id))
+        atomic_json(destination, record)
         return document_for(store, clip_id, frame_id, camera_id, context=(clip, frame, camera))
 
 

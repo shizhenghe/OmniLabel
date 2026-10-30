@@ -259,7 +259,8 @@ class AutomaticCalibrationManager:
                             item.update(status="skipped", reason="此帧没有点云。")
                             self._save(job)
                             continue
-                        if document["saved_matrix"] is not None and not job["overwrite_saved"]:
+                        if ((document["saved_matrix"] is not None or document.get("scope") == "clip")
+                                and not job["overwrite_saved"]):
                             item.update(status="skipped", reason="保留此帧相机已保存的校准参数。")
                             self._save(job)
                             continue
@@ -377,7 +378,10 @@ class AutomaticCalibrationManager:
                 for camera in clip.cameras:
                     document = document_for(self.store, clip_id, frame.id, camera.id, context=(clip, frame, camera))
                     cameras[camera.id] = {"camera_from_lidar": document["effective_matrix"],
-                                          "saved": document["saved_matrix"] is not None,
+                                          "saved": document["saved_matrix"] is not None or document.get("scope") == "clip",
+                                          "scope": document.get("scope", "source"),
+                                          "clip_anchor_frame_id": document.get("clip_anchor_frame_id"),
+                                          "clip_stale": document.get("clip_stale", False),
                                           "has_image": camera.id in frame.images,
                                           "method": document["method"], "metrics": document["metrics"],
                                           "updated_at": document["updated_at"], "stale": document["stale"]}

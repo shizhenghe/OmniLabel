@@ -192,10 +192,14 @@ export default function App() {
     ? {...scene, vectors: activeLanePreview.result.vectors} : scene, frame, clip), [scene, frame, clip, activeLanePreview, sceneMode]);
   const frameAnnotations = useMemo(() => activeLanePreview && !sceneMode
     ? {...annotations, vectors: activeLanePreview.result.vectors} : annotations, [annotations, activeLanePreview, sceneMode]);
-  const coordinateMap = useMemo(() => calibrationPreview ? {world_from_lidar: calibrationPreview.world_from_lidar} : sceneMap ?? {world_from_lidar: registeredMatrices}, [calibrationPreview, sceneMap, registeredMatrices]);
+  // Registration belongs to the current clip, while map metadata can predate a
+  // calibration change. Never let a cached map replace newer per-frame poses.
+  const coordinateMap = useMemo(() => ({world_from_lidar: calibrationPreview?.world_from_lidar
+    ?? {...sceneMap?.world_from_lidar, ...registeredMatrices}}), [calibrationPreview, sceneMap, registeredMatrices]);
+  const suppliedMap = sceneMap?.source_map === 'supplied' || sceneMap?.method === 'supplied reconstructed local-world map';
   const calibrationLidarPreview = Boolean(calibrationPreview && calibrationBase.current &&
     JSON.stringify(calibrationPreview.lidar_to_ego) !== JSON.stringify(calibrationBase.current.lidar_to_ego));
-  const usingSceneMap = Boolean(sceneMap && !calibrationLidarPreview && (!reviewing || playbackCloud === 'scene'));
+  const usingSceneMap = Boolean(sceneMap && (!calibrationLidarPreview || suppliedMap) && (!reviewing || playbackCloud === 'scene'));
   const reviewAnnotations = useMemo(() => reviewing && frame ? reviewWorldAnnotations(worldAnnotations, annotations, frame, coordinateMap) : worldAnnotations,
     [reviewing, worldAnnotations, annotations, frame, coordinateMap]);
   const projections = useMemo(() => {
@@ -272,7 +276,7 @@ export default function App() {
   const changeProjectionAnchors = useCallback((anchors: ProjectionCorrespondence[], pending: Vec3 | null, selected: string | null) => {
     setProjectionAnchors({anchors, pending, selected});
   }, []);
-  const savedProjection = useCallback((document: ProjectionCalibrationDocument) => {
+  const savedProjection = useCallback(async (document: ProjectionCalibrationDocument) => {
     setClip(current => current?.id === document.clip_id ? {...current, frames: current.frames.map(item => {
       if (item.id !== document.frame_id) return item;
       const matrices = {...item.projection_camera_from_lidar};
@@ -282,7 +286,9 @@ export default function App() {
       return {...item, projection_camera_from_lidar: matrices};
     })} : current);
     setProjectionDirty(false);
-    flash('当前帧相机投影已保存，点云与三维标注共用该修正。');
+    await refreshProjectionParameters(document.clip_id);
+    flash(document.clip_scope_active ? '当前相机的整段 clip 投影已更新，已有逐帧精调保留。'
+      : '当前帧相机投影已保存，点云与三维标注共用该修正。');
   }, [flash]);
   useEffect(() => {if (!notice) return; const timer = setTimeout(() => setNotice(null), notice.error ? 10000 : 5000); return () => clearTimeout(timer);}, [notice]);
   const refreshModels = useCallback(async () => {
@@ -313,6 +319,7 @@ export default function App() {
       if (generation !== clipGeneration.current) return;
       if (!rebuiltMap) throw new Error('重建已完成，但场景地图文件不存在');
       setSceneMap(rebuiltMap);
+      setRegisteredMatrices(rebuiltMap.world_from_lidar);
       setPreserveDetail(detail); setDetailVoxelSize(detailSize); setVoxelSize(size);
       setFusionMode(fusion);
       if (!sceneDirtyRef.current) setScene(updated);
@@ -826,12 +833,16 @@ export default function App() {
     setRawProjection(true); setAnnotationProjection(true);
   };
   const refreshProjectionParameters = async (clipId: string) => {
-    const updated = await request<Clip>(`/clips/${encodeURIComponent(clipId)}`);
+    const [updated, registration] = await Promise.all([
+      request<Clip>(`/clips/${encodeURIComponent(clipId)}`),
+      request<{world_from_lidar: Record<string, Matrix4>}>(`/clips/${encodeURIComponent(clipId)}/scene/registration`),
+    ]);
     const frames = new Map(updated.frames.map(item => [item.id, item]));
     // Preserve loaded point buffers and current labels while refreshing projection parameters.
-    setClip(current => current?.id === clipId ? {...current, frames: current.frames.map(item => ({...item,
-      projection_camera_from_lidar: frames.get(item.id)?.projection_camera_from_lidar,
-    }))} : current);
+    if (clipContext.current !== clipId) return;
+    setClip(current => current?.id === clipId ? {...current, cameras: updated.cameras,
+      frames: current.frames.map(item => ({...item, ...frames.get(item.id), points: item.points}))} : current);
+    setRegisteredMatrices(registration.world_from_lidar);
   };
   const automaticCalibrationSaved = async () => {
     if (!clip) return;
@@ -873,18 +884,19 @@ export default function App() {
       lidar_to_ego: Object.fromEntries(clip.frames.map(item => [item.id, item.lidar_to_ego])),
       world_from_lidar: Object.fromEntries(clip.frames.map(item => [item.id, worldFromLidar(item, coordinateMap)])),
     };}
-    setClip(current => current?.id === document.clip_id ? applyCalibration(current, document) : current);
+    setClip(current => current?.id === document.clip_id ? draft : current);
     setCalibrationPreview(document); setPlaying(false);
   };
   const calibrationSaved = async (document: CalibrationDocument, options: {lidarChanged: boolean}) => {
     if (document.clip_id !== clip?.id) return;
-    setClip(current => current?.id === document.clip_id ? applyCalibration(current, document) : current);
+    setClip(current => current?.id === document.clip_id ? applyCalibration(current, document, document) : current);
     setRegisteredMatrices(document.world_from_lidar);
-    if (options.lidarChanged) {setSceneMap(null); setReconstruction(null);}
+    const rebuild = document.map_rebuild_required ?? options.lidarChanged;
+    if (rebuild) {setSceneMap(null); setReconstruction(null);}
     calibrationBase.current = null;
     calibrationClipBase.current = null;
     setCalibrationPreview(null); setCalibrationDirty(false);
-    flash(options.lidarChanged ? '外参已保存并保留原始标定备份。请重建完整场景，复核世界坐标标注。' : '相机外参已保存，投影已更新，可导出标定。');
+    flash(rebuild ? '外参已保存并保留原始标定备份。请重建完整场景，复核世界坐标标注。' : '外参已保存，整段 clip 的投影已更新，可导出标定。');
     try {await refreshProjectionParameters(document.clip_id);}
     catch (error) {flash(`外参已保存，但最新投影参数刷新失败：${errorText(error)}。请重新加载场景。`, true);}
   };
@@ -942,7 +954,7 @@ export default function App() {
           <div className="scene-summary"><span><Icon name="layers" size={14}/>{sceneMap ? `${sceneMap.frame_count} 帧已融合 · ${sceneMap.point_count.toLocaleString()} 个静态地图点` : sceneMode && frame ? (reconstructing ? '后台重建中 · 当前扫描已转为世界坐标，可继续标注' : '当前扫描 · 世界坐标') : '等待场景重建'}</span><span>{scene?.tracks.length ?? 0} 条轨迹 · {scene?.vectors.length ?? 0} 个全局矢量</span>{sceneDirty && <b>场景修改保留中，切帧不会丢失</b>}</div>
           {proposal && <div className="inline-proposal"><Icon name="model" size={18}/><div><strong>{modelNames[proposal.model] ?? proposal.model}{proposal.weightVariant ? ` · ${proposal.weightVariant.toUpperCase()}` : ''} 候选已生成</strong><p>{proposal.annotations.boxes.length} 个框 / {proposal.annotations.vectors.length} 条三维矢量 / {proposal.annotations.image_polygons.length} 个图像区域，需人工审核</p></div><button className="button primary" disabled={busy || jobBusy} onClick={() => void applyProposal()}>应用候选标注</button><button className="button ghost" disabled={busy || jobBusy} onClick={() => setProposal(null)}>丢弃</button></div>}
         </section>
-        <aside className={`inspector ${calibrationOpen || projectionOpen ? 'calibration-active' : ''}`}>{projectionOpen && clip && frame && <ProjectionCalibrationEditor clipId={clip.id} frameId={frame.id} cameras={clip.cameras} cameraId={activeCamera} disabled={busy || jobBusy || reconstructing} pickedPoint={projectionPickedPoint} pickedPixel={projectionPickedPixel} onCameraChange={id => {setActiveCamera(id); setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();}} onPickModeChange={setProjectionPickMode} onConsumedPick={consumeProjectionPick} onPreview={previewProjection} onSaved={savedProjection} onClose={closeProjectionCalibration} onDirtyChange={setProjectionDirty} onBusyChange={setProjectionBusy} onError={message => flash(message, true)} onAnchorsChange={changeProjectionAnchors}/>} {calibrationOpen && clip && frame && <CalibrationEditor clip={clip} frameId={frame.id} disabled={busy || jobBusy || reconstructing} onPreview={previewCalibration} onSaved={calibrationSaved} onClose={() => setCalibrationOpen(false)} onError={message => flash(message, true)} onDirtyChange={setCalibrationDirty}/>}<div className="inspector-heading"><h2>{reviewing ? '标注结果' : '标注属性'}</h2><span className="count-badge">{renderedAnnotations.boxes.length + renderedAnnotations.vectors.length + annotations.image_polygons.length}</span><button className="icon-button" aria-label="标注帮助" onClick={() => setModal('help')}><Icon name="settings" size={15}/></button></div><div className="inspector-body">
+        <aside className={`inspector ${calibrationOpen || projectionOpen ? 'calibration-active' : ''}`}>{projectionOpen && clip && frame && <ProjectionCalibrationEditor defaultClipScope={sceneMode && suppliedMap} clipId={clip.id} frameId={frame.id} cameras={clip.cameras} cameraId={activeCamera} disabled={busy || jobBusy || reconstructing} pickedPoint={projectionPickedPoint} pickedPixel={projectionPickedPixel} onCameraChange={id => {setActiveCamera(id); setProjectionPreview(null); setProjectionPickMode(null); consumeProjectionPick();}} onPickModeChange={setProjectionPickMode} onConsumedPick={consumeProjectionPick} onPreview={previewProjection} onSaved={savedProjection} onClose={closeProjectionCalibration} onDirtyChange={setProjectionDirty} onBusyChange={setProjectionBusy} onError={message => flash(message, true)} onAnchorsChange={changeProjectionAnchors}/>} {calibrationOpen && clip && frame && <CalibrationEditor clip={clip} frameId={frame.id} disabled={busy || jobBusy || reconstructing} onPreview={previewCalibration} onSaved={calibrationSaved} onClose={() => setCalibrationOpen(false)} onError={message => flash(message, true)} onDirtyChange={setCalibrationDirty}/>}<div className="inspector-heading"><h2>{reviewing ? '标注结果' : '标注属性'}</h2><span className="count-badge">{renderedAnnotations.boxes.length + renderedAnnotations.vectors.length + annotations.image_polygons.length}</span><button className="icon-button" aria-label="标注帮助" onClick={() => setModal('help')}><Icon name="settings" size={15}/></button></div><div className="inspector-body">
           {vectorTask && !reviewing && <section className="inspector-section"><div className="mini-heading"><span>车道线融合</span><small>{sceneMode ? '整个场景' : '当前帧'}</small></div>{laneMergeOpen && clip ? <LaneMergePanel clipId={clip.id} scopeKey={laneScopeKey} vectors={laneVectors} sceneRevision={sceneMode ? scene?.revision : undefined} disabled={editBlocked || calibrationOpen} onPreview={previewLanes} onApply={applyLaneMerge} onClose={() => {setLaneMergeOpen(false); setLanePreview(null);}} onError={message => flash(message, true)}/> : <button className="button subtle full-width" aria-label="融合重复车道线" disabled={editBlocked || calibrationOpen || laneVectors.length < 2} onClick={() => {if (draftVector.length || draftPolygon.length) {flash('请先完成或取消绘制，再融合车道线', true); return;} setLaneMergeOpen(true); setTool('select'); setPlaying(false);}}>融合重复车道线</button>}{laneMergeUndo?.scopeKey === laneScopeKey && laneMergeUndo.after === laneVectors && <button className="button ghost full-width" aria-label="撤销本次融合" disabled={geometryEditBlocked} onClick={undoLaneMerge}>撤销本次融合</button>}</section>}
           <section className="inspector-section"><div className="mini-heading"><span>类别标签</span><small>{sceneMode ? 'WORLD SCENE' : 'FRAME LABEL'}</small></div><div className="class-list">{classes.map(c => <button key={c.id} className={`class-option ${classId === c.id ? 'selected' : ''}`} onClick={() => {setClassId(c.id); if (selectedBox && task === 'detection') updateBox({label: c.id});}}><i style={{background: c.color}}/><span>{c.name}</span><small>{c.id}</small>{classId === c.id && <Icon name="check" size={13}/>}</button>)}</div></section>
           {selectedBox ? <section className="inspector-section"><div className="mini-heading"><span>{sceneMode ? '4D 轨迹 / 当前状态' : '目标属性'}</span><span className="text-cyan">{sceneMode ? 'WORLD' : 'LiDAR'}</span></div><label className="field-label">轨迹 ID<input aria-label="轨迹ID" value={selectedBox.track_id} disabled={geometryEditBlocked} onChange={e => updateBox({track_id: e.target.value})}/></label>{selectedTrack && <><label className="field-label">时序模式<select aria-label="轨迹时序模式" value={selectedTrack.mode} disabled={geometryEditBlocked} onChange={e => {const mode = e.target.value as SceneTrack['mode']; editScene(s => ({...s, tracks: s.tracks.map(t => t.id === selectedId ? {...t, mode, keyframes: mode === 'static' && frame ? [{frame_id: frame.id, center: selectedBox.center, size: selectedBox.size, yaw: selectedBox.yaw}] : t.keyframes} : t)}));}}><option value="dynamic">动态轨迹 · 关键帧插值</option><option value="static">静态目标 · 全场景共享</option></select></label><div className="keyframe-actions"><span>{selectedTrack.keyframes.length} 个关键帧 · {currentIsKeyframe ? '当前已设关键帧' : '当前为插值状态'}</span><button className="button subtle" aria-label="添加当前关键帧" disabled={geometryEditBlocked} onClick={() => updateBox({})}>设为关键帧</button><button className="button ghost" disabled={geometryEditBlocked || !currentIsKeyframe || selectedTrack.keyframes.length < 2} onClick={() => editScene(s => ({...s, tracks: s.tracks.map(t => t.id === selectedId ? {...t, keyframes: t.keyframes.filter(k => k.frame_id !== frame?.id)} : t)}))}>删除本关键帧</button></div></>}

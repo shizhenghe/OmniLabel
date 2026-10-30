@@ -417,6 +417,11 @@ def _stored_map_points(store: Store, value: dict, *, check_values: bool = True) 
     return points
 
 
+def is_supplied_scene_map(value: dict) -> bool:
+    return (value.get("source_map") == "supplied" or
+            value.get("method") == "supplied reconstructed local-world map")
+
+
 def get_scene_map(store: Store, clip: Clip, *, max_points: int | None = None,
                   include_points: bool = True) -> dict:
     path = _map_path(store, clip.id)
@@ -426,8 +431,17 @@ def get_scene_map(store: Store, clip: Clip, *, max_points: int | None = None,
         value = json.loads(path.read_text())
         if value.get("fusion_version") != FUSION_VERSION:
             raise KeyError("Scene fusion profile changed; reconstruct the scene map to retain measured surface detail")
-        supplied_map = (value.get("source_map") == "supplied" or
-                        value.get("method") == "supplied reconstructed local-world map")
+        # A supplied world map survives annotation/mount edits. Legacy
+        # calibration saves wrote a stale source token even though that
+        # immutable world geometry remained valid. A separate explicit
+        # geometry invalidation still prevents serving genuinely stale points.
+        if value.get("geometry_invalidated") is True:
+            raise KeyError("Scene map was explicitly invalidated; reconstruct or restore the scene map")
+        supplied_map = is_supplied_scene_map(value)
+        if supplied_map:
+            # Cached pose metadata is not the scene coordinate authority:
+            # calibration can change it without changing any world-map point.
+            value["world_from_lidar"] = {fid: pose.tolist() for fid, pose in registered_poses(store, clip).items()}
         if not supplied_map:
             saved_token = value.get("source_fingerprint")
             current_token = source_fingerprint(store, clip)
@@ -542,6 +556,7 @@ def invalidate_scene_map(store: Store, clip_id: str):
         if path.exists():
             value = json.loads(path.read_text())
             value["source_fingerprint"] = "stale"
+            value["geometry_invalidated"] = True
             atomic_json(path, value)
 
 

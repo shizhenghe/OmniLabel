@@ -37,16 +37,27 @@ def _revision(clip: Clip) -> str:
 
 
 def calibration_document(store: Store, clip: Clip) -> dict:
+    from .projection_calibration import projection_calibration_scopes
     from .scene import registered_poses
+    # The editor receives an overlaid clip elsewhere in the API. A physical
+    # mount preview must instead start from source projections, just like the
+    # save path, since local projection records become stale after that edit.
+    source = store.source_clip(clip.id)
     return {"schema_version": "1.0", "clip_id": clip.id, "revision": _revision(clip),
             "units": {"translation": "metres", "rotation": "matrix"},
             "convention": "column vectors; camera_from_ego maps ego to optical camera; lidar_to_ego maps LiDAR to ego",
             **_extrinsics(clip),
+            "frame_projection_overrides": {frame.id: {
+                "annotation_camera_from_lidar": frame.annotation_camera_from_lidar,
+                "projection_camera_from_lidar": frame.projection_camera_from_lidar,
+            } for frame in source.frames},
+            "frame_projection_scopes": projection_calibration_scopes(store, source),
             "world_from_lidar": {fid: pose.tolist() for fid, pose in registered_poses(store, clip).items()}}
 
 
 def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> dict:
-    from .scene import _clip_fingerprint, get_scene_map, invalidate_scene_map, registered_poses, source_fingerprint
+    from .scene import (_clip_fingerprint, get_scene_map, invalidate_scene_map,
+                        is_supplied_scene_map, registered_poses, source_fingerprint)
     with store.lock:
         # Local projection documents are overlays, not source extrinsics.
         # Rewriting an overlaid clip would bake those overrides into the
@@ -60,9 +71,11 @@ def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> di
             raise ValueError("Calibration must contain exactly the clip's frame IDs")
         before = calibration_document(store, clip)
         old_poses = registered_poses(store, clip)
+        supplied_map = False
         try:
-            get_scene_map(store, clip, include_points=False)
+            map_metadata = get_scene_map(store, clip, include_points=False)
             valid_map = True
+            supplied_map = is_supplied_scene_map(map_metadata)
         except KeyError:
             valid_map = False
         changed_camera = value.cameras != before["cameras"]
@@ -70,9 +83,27 @@ def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> di
         if not changed_camera and not changed_lidar:
             return {**before, "lidar_changed": False, "map_rebuild_required": False}
         raw = clip.model_dump()
+        old_cameras = {camera.id: camera for camera in clip.cameras}
+        old_frames = {frame.id: frame for frame in clip.frames}
         for camera in raw["cameras"]:
             camera["camera_from_ego"] = value.cameras[camera["id"]]
         for frame in raw["frames"]:
+            original = old_frames[frame["id"]]
+            new_lidar = value.lidar_to_ego[frame["id"]]
+            for field in ("annotation_camera_from_lidar", "projection_camera_from_lidar"):
+                for camera_id, matrix in frame[field].items():
+                    old_camera = old_cameras[camera_id].camera_from_ego
+                    new_camera = value.cameras[camera_id]
+                    if old_camera == new_camera and original.lidar_to_ego == new_lidar:
+                        continue
+                    # Imported per-frame corrections are relative to the
+                    # source mounts. Transport them through the edited mounts
+                    # instead of letting an old direct matrix mask the edit.
+                    # Local calibration documents remain separate overlays
+                    # and become stale through their base fingerprint.
+                    frame[field][camera_id] = (np.asarray(new_camera) @ np.linalg.inv(np.asarray(old_camera))
+                        @ np.asarray(matrix) @ np.linalg.inv(np.asarray(original.lidar_to_ego))
+                        @ np.asarray(new_lidar)).tolist()
             frame["lidar_to_ego"] = value.lidar_to_ego[frame["id"]]
         updated = Clip.model_validate(raw)
         poses = {frame.id: old_poses[frame.id] if frame.lidar_to_ego == value.lidar_to_ego[frame.id] else
@@ -91,17 +122,19 @@ def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> di
         atomic_json(store.root / "scene_poses" / f"{safe_id(clip.id)}.json",
                     {"clip_fingerprint": _clip_fingerprint(store, updated),
                      "world_from_lidar": {fid: pose.tolist() for fid, pose in poses.items()}})
-        if changed_lidar:
+        rebuild_required = changed_lidar and not supplied_map
+        if rebuild_required:
             invalidate_scene_map(store, clip.id)
         elif valid_map:
-            # Camera-only corrections do not change fused geometry. Refresh its
-            # source token rather than needlessly dropping an expensive map.
+            # Camera edits and supplied world-map mount edits leave the map
+            # geometry fixed. Refresh its source token and pose metadata.
             path = store.root / "scene_maps" / f"{safe_id(clip.id)}.json"
             cached = json.loads(path.read_text())
             cached["source_fingerprint"] = source_fingerprint(store, updated)
+            cached["world_from_lidar"] = {fid: pose.tolist() for fid, pose in poses.items()}
             atomic_json(path, cached)
         return {**calibration_document(store, updated), "lidar_changed": changed_lidar,
-                "map_rebuild_required": changed_lidar}
+                "map_rebuild_required": rebuild_required}
 
 
 def mount_calibration_routes(app: FastAPI, store: Store):
