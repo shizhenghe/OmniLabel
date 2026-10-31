@@ -98,7 +98,7 @@ test('saved frame correction can be promoted to clip and follows each frame pose
   await expect(rear).toHaveAttribute('data-projection-signature', signature(0));
   await page.getByLabel('逐帧投影校准', {exact: true}).click();
   const editor = page.getByTestId('projection-calibration-editor');
-  await expect(editor.getByLabel('投影修正应用范围')).toHaveValue('clip');
+  await expect(editor.getByLabel('投影修正应用范围')).toHaveValue('frame');
   await expect(editor.getByLabel('将当前修正应用整个clip')).toBeEnabled();
   const promoting = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith(base));
   await editor.getByLabel('将当前修正应用整个clip').click();
@@ -115,6 +115,7 @@ test('saved frame correction can be promoted to clip and follows each frame pose
   // Clearing only the clip scope returns this inherited frame to its source
   // projection while retaining the explicitly saved reference-frame result.
   await page.getByLabel('逐帧投影校准', {exact: true}).click();
+  await editor.getByLabel('投影修正应用范围').selectOption('clip');
   await expect(editor.getByLabel('清除整个clip投影修正')).toBeEnabled();
   await editor.getByLabel('清除整个clip投影修正').click();
   await expect(editor.getByText('已清除当前相机的整个 clip 修正；独立逐帧修正保留。')).toBeVisible();

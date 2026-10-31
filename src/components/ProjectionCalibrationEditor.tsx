@@ -1,6 +1,6 @@
 import {useEffect, useRef, useState} from 'react';
 import {download, jsonRequest, request} from '../api';
-import type {Matrix4} from '../geometry/calibration';
+import {correctExtrinsic, type Matrix4} from '../geometry/calibration';
 import type {Camera, Vec3} from '../types';
 import './ProjectionCalibrationEditor.css';
 
@@ -67,8 +67,6 @@ export interface ProjectionCalibrationEditorProps {
   cameras: Camera[];
   cameraId: string;
   disabled?: boolean;
-  /** Supplied world maps normally need a fixed camera correction across a clip. */
-  defaultClipScope?: boolean;
   pickedPoint?: Vec3 | null;
   pickedPixel?: [number, number] | null;
   onCameraChange: (cameraId: string) => void;
@@ -110,7 +108,9 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
   const [reload, setReload] = useState(0);
-  const [saveScope, setSaveScope] = useState<'frame' | 'clip'>(props.defaultClipScope ? 'clip' : 'frame');
+  const [saveScope, setSaveScope] = useState<'frame' | 'clip'>('frame');
+  const [translationStep, setTranslationStep] = useState(.01);
+  const [rotationStep, setRotationStep] = useState(.1);
   const sequence = useRef(0);
   const anchorNumber = useRef(1);
   const latest = useRef(props);
@@ -131,7 +131,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     setLoading(true); setBaseline(null); setAnchors([]); setCandidate(null); setMetrics(null);
     setPendingPoint(null); setPickMode(null); setPickingId(null); setSelectedId(null);
     setShowCandidate(false); setError(''); setStatus(''); setOperation(null);
-    setSaveScope(latest.current.defaultClipScope ? 'clip' : 'frame');
+    setSaveScope('frame');
     latest.current.onPreview(null); latest.current.onPickModeChange(null); latest.current.onConsumedPick();
     request<ProjectionCalibrationDocument>(endpoint).then(value => {
       if (!active || !unchangedScope(token, scope)) return;
@@ -237,6 +237,16 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const preview = (next: boolean) => {
     setShowCandidate(next); props.onPreview(next ? candidate : null);
   };
+  const nudge = (kind: 'translation' | 'rotation', axis: number, direction: number) => {
+    if (!baseline || locked) return;
+    const translation: Vec3 = [0, 0, 0], rotation: Vec3 = [0, 0, 0];
+    (kind === 'translation' ? translation : rotation)[axis] = direction * (kind === 'translation' ? translationStep : rotationStep);
+    const matrix = correctExtrinsic(candidate ?? baseline.effective_matrix, {translation, rotation});
+    setCandidate(matrix); setCandidateMethod('manual'); setShowCandidate(true); setSaveScope('frame');
+    setMetrics(null); setMetricsKind('candidate'); setError('');
+    changePickMode(null); props.onPreview(matrix);
+    setStatus('正在手动微调当前帧相机外参。请检查近远处投影，确认后保存；未进行自动质量验证。');
+  };
   const discardCandidate = () => {
     setCandidate(null); setShowCandidate(false); setMetrics(sameAnchors(anchors, baseline?.correspondences ?? []) ? baseline?.metrics ?? null : null);
     setMetricsKind('saved');
@@ -283,7 +293,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const errors = new Map((metrics?.point_errors ?? []).map(value => [value.id, value]));
 
   return <div className="projection-calibration-editor" role="dialog" aria-modal="false" aria-label="逐帧投影校正" data-testid="projection-calibration-editor">
-    <div className="projection-calibration-heading"><div><h2>投影校正</h2><p>以当前帧求解，可将相机修正按每帧位姿应用于整个 clip，三维标注坐标保持不变。</p></div>
+    <div className="projection-calibration-heading"><div><h2>投影校正</h2><p>每帧、每路相机独立保存外参，以修正震动造成的投影偏差；三维标注坐标保持不变。</p></div>
       <button className="icon-button" aria-label="关闭投影校正" disabled={Boolean(operation)} onClick={close}>×</button></div>
     <div className="projection-calibration-scope"><span>帧 <strong title={props.frameId}>{props.frameId}</strong></span>{baseline?.saved_matrix && <span className="projection-saved-tag">{baseline.stale ? '修正待重算' : '已有修正'}</span>}</div>
     {baseline?.status_reason && <p className="projection-calibration-notice" role="status">{baseline.status_reason}</p>}
@@ -292,11 +302,17 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     </select></label>
     {loading ? <p className="projection-progress" role="status">正在读取当前帧投影…</p> : baseline && <>
       <label className="field-label">应用范围<select aria-label="投影修正应用范围" value={saveScope} disabled={locked} onChange={event => setSaveScope(event.target.value as 'frame' | 'clip')}>
-        <option value="clip">整个 clip · 当前相机</option><option value="frame">仅当前帧 · 当前相机</option>
+        <option value="frame">仅当前帧 · 当前相机（震动数据推荐）</option><option value="clip" disabled={candidateMethod === 'manual' && Boolean(candidate)}>整个 clip · 当前相机</option>
       </select></label>
       {saveScope === 'clip' && <p className="projection-help">整个 clip 共享相机修正，各帧仍按自己的位姿投影，已有独立逐帧修正保留。</p>}
       {baseline.clip_scope_active && <p className="projection-help" role="status">当前相机已有整个 clip 修正，参考帧 {baseline.clip_anchor_frame_id ?? '—'}{baseline.scope === 'frame' ? '；当前帧使用独立修正。' : '。'}</p>}
-      {baseline.saved_matrix && baseline.scope !== 'clip' && !candidate && <button className="button subtle full-width" aria-label="将当前修正应用整个clip" disabled={locked || dirty} onClick={() => void save(false, true)}>将当前修正应用整个 clip</button>}
+      {baseline.saved_matrix && baseline.scope !== 'clip' && !candidate && <button className="button subtle full-width" aria-label="将当前修正应用整个clip" disabled={locked || dirty || baseline.method === 'manual'} onClick={() => void save(false, true)}>将当前修正应用整个 clip</button>}
+      <section className="projection-calibration-section"><h3>当前帧外参手动微调</h3>
+        <p className="projection-help">沿相机光学坐标调整：X 向右、Y 向下、Z 向前。修改仅在保存后生效，不影响其他帧或相机。</p>
+        <label className="field-label">平移步长（米）<select aria-label="逐帧平移步长" value={translationStep} disabled={locked} onChange={event => setTranslationStep(Number(event.target.value))}>{[.001, .01, .05, .1].map(step => <option key={step} value={step}>{step}</option>)}</select></label>
+        <label className="field-label">旋转步长（度）<select aria-label="逐帧旋转步长" value={rotationStep} disabled={locked} onChange={event => setRotationStep(Number(event.target.value))}>{[.01, .1, .5, 1].map(step => <option key={step} value={step}>{step}</option>)}</select></label>
+        {(['translation', 'rotation'] as const).map(kind => <div key={kind} className="projection-pick-actions">{['X', 'Y', 'Z'].map((axis, index) => <span key={axis}>{[-1, 1].map(direction => <button key={direction} className="button subtle" aria-label={`本帧${kind === 'translation' ? '平移' : '旋转'}${axis}${direction < 0 ? '减' : '加'}`} disabled={locked} onClick={() => nudge(kind, index, direction)}>{kind === 'translation' ? '平移' : '旋转'} {axis}{direction < 0 ? '−' : '+'}</button>)}</span>)}</div>)}
+      </section>
       <section className="projection-calibration-section"><h3>图像与点云自动配准</h3>
         <p>利用当前图像与静态点云直接估计候选修正，无需手工对应点。</p>
         <button className="button subtle full-width" aria-label="自动配准当前帧" disabled={locked || baseline.automatic_available === false} onClick={() => void solve(true)}>{operation === 'auto' ? '正在配准，请稍候…' : '自动配准当前帧'}</button>
@@ -320,7 +336,8 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
         {!anchors.length && <p className="projection-empty">还没有对应点。添加后，点的编号会显示在点云与图像上。</p>}
         <button className="button subtle full-width" aria-label="根据对应点求解投影" disabled={locked || enabledCount < 6 || Boolean(pickMode)} onClick={() => void solve(false)}>{operation === 'solve' ? '正在求解…' : `根据对应点自动求解${enabledCount < 6 ? `（还需 ${6 - enabledCount} 对）` : ''}`}</button>
       </section>
-      {metrics && <section className="projection-calibration-section"><h3>{metricsKind === 'candidate' ? '候选修正质量' : metricsKind === 'rejected' ? '未通过质量检查' : '已保存修正质量'}</h3>
+      {metrics?.validation === 'manual_review' && <p className="projection-help" role="status">已保存人工微调外参；未执行自动质量验证，请复核当前帧投影。</p>}
+      {metrics && metrics.validation !== 'manual_review' && <section className="projection-calibration-section"><h3>{metricsKind === 'candidate' ? '候选修正质量' : metricsKind === 'rejected' ? '未通过质量检查' : '已保存修正质量'}</h3>
         {metrics.score_name === 'normalized_information_distance' && <><dl className="projection-metrics"><div><dt>修正前 NID</dt><dd>{score(metrics.holdout_before?.nid)}</dd></div><div><dt>修正后 NID</dt><dd>{score(metrics.holdout_after?.nid)}</dd></div><div><dt>验证覆盖率</dt><dd>{percentage(metrics.holdout_after?.overlap)}</dd></div><div><dt>NID 改善</dt><dd>{score(metrics.holdout_improvement)}</dd></div></dl><p className="projection-help">NID 衡量图像与点云的纹理一致性，越低越好；此指标不代表像素误差。</p></>}
         {(metrics.score_name !== 'normalized_information_distance' || typeof metrics.rmse_px === 'number') && <dl className="projection-metrics"><div><dt>修正前 RMSE</dt><dd>{pixels(metrics.baseline_rmse_px)}</dd></div><div><dt>修正后 RMSE</dt><dd>{pixels(metrics.rmse_px)}</dd></div>
           <div><dt>内点 / 参与点</dt><dd>{typeof metrics.inlier_count === 'number' ? `${metrics.inlier_count} / ${metrics.total_count ?? enabledCount}` : '—'}</dd></div><div><dt>内点 RMSE</dt><dd>{pixels(metrics.inlier_rmse_px)}</dd></div></dl>

@@ -74,6 +74,87 @@ def calibration_api(tmp_path, monkeypatch):
         yield client, store, app.state.automatic_calibration
 
 
+def test_manual_calibration_is_independent_and_survives_reload(calibration_api):
+    client, store, _ = calibration_api
+    source = store.source_clip("batch").model_dump()
+    route = "/api/clips/batch/frames/{}/projection-calibration/{}"
+    for frame_id, shift in [("f0", .12), ("f1", -.08)]:
+        path = route.format(frame_id, "front")
+        document = client.get(path).json()
+        matrix = np.asarray(document["effective_matrix"])
+        matrix[0, 3] = shift
+        result = client.put(path, json={"revision": document["revision"], "matrix": matrix.tolist(),
+                                      "method": "manual", "scope": "frame"})
+        assert result.status_code == 200, result.text
+        assert result.json()["metrics"]["validation"] == "manual_review"
+        assert client.put(path, json={"revision": document["revision"], "matrix": matrix.tolist(),
+                                     "method": "manual"}).status_code == 409
+    effective = Store(store.root).clip("batch")
+    assert effective.frames[0].projection_camera_from_lidar["front"][0][3] == .12
+    assert effective.frames[1].projection_camera_from_lidar["front"][0][3] == -.08
+    assert "side" not in effective.frames[0].projection_camera_from_lidar
+    assert store.source_clip("batch").model_dump() == source
+    document = client.get(route.format("f0", "front")).json()
+    denied = client.put(route.format("f0", "front"), json={"revision": document["revision"],
+        "matrix": document["saved_matrix"], "method": "manual", "scope": "clip"})
+    assert denied.status_code == 422
+    forged = client.put(route.format("f0", "front"), json={"revision": document["revision"],
+        "matrix": document["saved_matrix"], "method": "pjlab",
+        "metrics": {"line_overlap_before": .1, "line_overlap_after": 1}})
+    assert forged.status_code == 422
+
+
+def test_pjlab_mask_is_bound_to_pair_and_original_image(calibration_api, monkeypatch):
+    from io import BytesIO
+    client, store, manager = calibration_api
+    pixels = np.zeros((100, 100, 3), dtype=np.uint8)
+    pixels[20:25, 10:90] = 255
+    buffer = BytesIO(); Image.fromarray(pixels).save(buffer, format="PNG")
+    path = ROUTE + "/masks/f0/front"
+    assert client.put(path, content=b"invalid").status_code == 422
+    assert client.put(path, content=buffer.getvalue()).status_code == 200
+    clip = store.source_clip("batch")
+    token = manager._pair_fingerprint("batch", clip.frames[0], clip.cameras[0], "pjlab")
+    assert token
+    with pytest.raises(ValueError, match="先上传"):
+        manager._pair_fingerprint("batch", clip.frames[0], clip.cameras[1], "pjlab")
+    image = store.root / "assets/batch/f0-front.png"
+    image.write_bytes(image.read_bytes())
+    with pytest.raises(ValueError, match="原始图像已变化"):
+        manager._pair_fingerprint("batch", clip.frames[0], clip.cameras[0], "pjlab")
+    assert client.put(path, content=buffer.getvalue()).status_code == 200
+    assert manager._pair_fingerprint("batch", clip.frames[0], clip.cameras[0], "pjlab") != token
+    manager._active.add("running")
+    assert client.put(path, content=buffer.getvalue()).status_code == 409
+    manager._active.clear()
+
+
+def test_pjlab_batch_keeps_distinct_frame_results(calibration_api, monkeypatch):
+    from io import BytesIO
+    client, store, _ = calibration_api
+    pixels = np.zeros((100, 100, 3), dtype=np.uint8); pixels[20:25, 10:90] = 255
+    buffer = BytesIO(); Image.fromarray(pixels).save(buffer, format="PNG")
+    for frame_id in ["f0", "f1"]:
+        assert client.put(ROUTE + f"/masks/{frame_id}/front", content=buffer.getvalue()).status_code == 200
+    monkeypatch.setattr(batch, "engines", lambda: [{"id": "pjlab", "available": True, "detail": "CLI fixture"}])
+    def solve(engine, points, image, camera, initial, work_dir, *, mask_path):
+        assert engine == "pjlab" and mask_path.is_file()
+        result = accepted(initial)
+        result["matrix"][0][3] = .1 if mask_path.parent.name == "f0" else -.2
+        result["metrics"].update(line_overlap_before=.6, line_overlap_after=.8)
+        return result
+    monkeypatch.setattr(batch, "solve_pair", solve)
+    response = client.post(ROUTE + "/jobs", json={"engine": "pjlab", "frame_ids": ["f0", "f1"], "camera_ids": ["front"]})
+    assert response.status_code == 202, response.text
+    job = finished(client, response.json()["id"])
+    assert job["accepted"] == 2
+    saved = client.post(ROUTE + f'/jobs/{job["id"]}/apply')
+    assert saved.status_code == 200 and saved.json()["saved"] == 2
+    clip = store.clip("batch")
+    assert clip.frames[0].projection_camera_from_lidar["front"][0][3] == .1
+    assert clip.frames[1].projection_camera_from_lidar["front"][0][3] == -.2
+
+
 def start(client, **options):
     response = client.post(ROUTE + "/jobs", json={"engine": "koide", **options})
     assert response.status_code == 202, response.text

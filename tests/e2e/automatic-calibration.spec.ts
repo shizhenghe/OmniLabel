@@ -55,6 +55,39 @@ test('batch calibration polls results, saves accepted pairs and exports saved pa
   await expect(page.getByText('已保存并用于投影。', {exact: true})).toBeVisible();
 });
 
+test('manual frame extrinsics save independently and survive reload', async ({page, request}) => {
+  const clip = await (await request.get('/api/clips/demo')).json();
+  const current = clip.frames[0].id, next = clip.frames[1].id;
+  const path = (frame: string) => `/api/clips/demo/frames/${frame}/projection-calibration/front`;
+  const otherBefore = await (await request.get(path(next))).json();
+  await page.goto('/?clip=demo');
+  await expect(page.getByLabel('逐帧投影校准', {exact: true})).toBeEnabled({timeout: 60_000});
+  await page.getByLabel('逐帧投影校准', {exact: true}).click();
+  const editor = page.getByTestId('projection-calibration-editor');
+  await editor.getByLabel('投影校正相机').selectOption('front');
+  await expect(editor.getByLabel('本帧平移X加')).toBeEnabled();
+  await expect(editor.getByLabel('投影修正应用范围')).toHaveValue('frame');
+  const before = await (await request.get(path(current))).json();
+  const front = page.getByTestId('camera-front');
+  const signature = await front.getAttribute('data-projection-signature');
+  await editor.getByLabel('本帧平移X加').click();
+  await editor.getByLabel('本帧旋转Z加').click();
+  await expect(front).not.toHaveAttribute('data-projection-signature', signature!);
+  await expect(editor.getByText('正在手动微调当前帧相机外参。请检查近远处投影，确认后保存；未进行自动质量验证。')).toBeVisible();
+  await editor.getByLabel('保存本帧本相机投影修正').click();
+  await expect(editor.getByText('已保存，仅应用于当前帧和当前相机。')).toBeVisible();
+  const saved = await (await request.get(path(current))).json();
+  expect(saved.method).toBe('manual');
+  expect(saved.saved_matrix[0][3]).toBeCloseTo(before.effective_matrix[0][3] + .01, 8);
+  expect(saved.saved_matrix).not.toEqual(before.effective_matrix);
+  expect(saved.metrics.validation).toBe('manual_review');
+  expect((await (await request.get(path(next))).json()).effective_matrix).toEqual(otherBefore.effective_matrix);
+  await page.reload();
+  expect((await (await request.get(path(current))).json()).saved_matrix).toEqual(saved.saved_matrix);
+  // Restore this shared demo fixture for the following correspondence test.
+  expect((await request.put(path(current), {data: {revision: saved.revision, matrix: null, method: 'reset'}})).ok()).toBe(true);
+});
+
 test('single-pair editor loads actual calibration and accepts measured 3D and image picks', async ({page}) => {
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
