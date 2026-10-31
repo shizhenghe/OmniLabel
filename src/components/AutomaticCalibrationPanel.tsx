@@ -3,7 +3,7 @@ import {download, jsonRequest, request} from '../api';
 import type {Clip} from '../types';
 import './AutomaticCalibrationPanel.css';
 
-type EngineId = 'koide' | 'direct_nid';
+type EngineId = 'koide' | 'direct_nid' | 'pjlab';
 type JobStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed';
 type ItemStatus = 'pending' | 'running' | 'accepted' | 'rejected' | 'failed' | 'skipped' | 'saved' | 'conflict';
 interface CalibrationEngine {id: EngineId; name: string; available: boolean; detail: string;}
@@ -53,10 +53,12 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const jobLabels: Record<JobStatus, string> = {queued: '等待执行', running: '正在配准', completed: '任务完成', cancelled: '已取消', failed: '任务失败'};
 const itemLabels: Record<ItemStatus, string> = {pending: '等待', running: '配准中', accepted: '通过待保存', rejected: '未通过', failed: '失败', skipped: '已跳过', saved: '已保存', conflict: '版本冲突'};
 const isRunning = (job: CalibrationJob | null) => job?.status === 'queued' || job?.status === 'running';
-const engineName = (id: EngineId) => id === 'koide' ? 'Koide' : '内置 CPU NID';
+const engineName = (id: EngineId) => id === 'koide' ? 'Koide' : id === 'pjlab' ? 'PJLab CRLF' : '内置 CPU NID';
 const metricValue = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(4) : null;
 function itemMetric(item: CalibrationItem): string {
   const source = item.metrics?.input_source === 'synchronized_sensor_scan' ? '同步单帧点云' : '';
+  const lineBefore = metricValue(item.metrics?.line_overlap_before), lineAfter = metricValue(item.metrics?.line_overlap_after);
+  if (lineBefore !== null && lineAfter !== null) return `${source ? source + ' · ' : ''}线特征匹配 ${lineBefore} → ${lineAfter}（需人工复核）`;
   const before = item.metrics?.holdout_before as {nid?: number} | undefined;
   const after = item.metrics?.holdout_after as {nid?: number} | undefined;
   const first = metricValue(before?.nid), last = metricValue(after?.nid);
@@ -74,7 +76,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
   const [calibrationScope, setCalibrationScope] = useState<'pair' | 'camera' | 'all'>('pair');
   const [overwrite, setOverwrite] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [operation, setOperation] = useState<'start' | 'cancel' | 'save' | 'export' | 'inspect' | null>(null);
+  const [operation, setOperation] = useState<'start' | 'cancel' | 'save' | 'export' | 'inspect' | 'mask' | null>(null);
   const [error, setError] = useState('');
   const [pollError, setPollError] = useState('');
   const [status, setStatus] = useState('');
@@ -219,6 +221,19 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
     finally {if (scope.current === startScope) setOperation(null);}
   };
   const close = () => {if (!operation) onClose();};
+  const uploadMask = async (file: File) => {
+    if (!frameId || !cameraId || locked || running) return;
+    if (file.size > 16 * 1024 * 1024) {setError('掩码文件不能超过 16 MiB。'); return;}
+    const startScope = clip.id;
+    setOperation('mask'); setError(''); setStatus('');
+    try {
+      await request(`${endpoint}/masks/${encodeURIComponent(frameId)}/${encodeURIComponent(cameraId)}`, {
+        method: 'PUT', headers: {'Content-Type': 'image/png'}, body: file,
+      });
+      if (scope.current === startScope) setStatus(`已保存 ${frameId} / ${cameraId} 的 PJLab 线特征掩码。未配置自动提取时，其他帧需分别上传对应掩码。`);
+    } catch (cause) {if (scope.current === startScope) setError(`上传掩码失败：${errorText(cause)}`);}
+    finally {if (scope.current === startScope) setOperation(null);}
+  };
   const inspect = async (item: CalibrationItem) => {
     if (!onInspect || locked || running) return;
     setOperation('inspect'); setError('');
@@ -234,7 +249,10 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
         <button ref={closeButton} className="icon-button" aria-label="关闭自动标定" disabled={Boolean(operation)} onClick={close}>×</button>
       </div>
       <div className="automatic-calibration-body">
-        <p className="automatic-calibration-intro">逐帧校准图像与对应点云的外参，保存后同步用于点云和三维标注投影。若数据同时包含融合地图和同步单帧扫描，求解器优先使用同步单帧，结果再转换回地图坐标。自动结果需通过质量检查；请在保存后复核不同距离的静态物体与道路标线。</p>
+        <p className="automatic-calibration-intro">逐帧、逐相机独立求解并保存外参，适用于震动引起的逐帧偏差，不会用一组结果覆盖整个 clip。保存后同步用于点云和三维标注投影。若数据包含同步单帧扫描，求解器优先使用它。自动结果需通过质量检查；请复核不同距离的静态物体与道路标线。</p>
+        {engine === 'pjlab' && <section className="automatic-calibration-help"><p>PJLab CRLF 需要道路标线/杆体的线特征掩码（原图尺寸 PNG、黑色背景），不可上传原图代替。可配置自动线特征提取，或选中对应帧相机后上传；批量任务会逐项检查掩码。</p>
+          <label>当前帧 {frameId} · 相机 {cameraId} 的线特征掩码<input type="file" accept="image/png" aria-label="上传当前帧PJLab线特征掩码" disabled={locked || running || !frameId || !cameraId} onChange={event => {const file = event.target.files?.[0]; event.target.value = ''; if (file) void uploadMask(file);}}/></label>
+        </section>}
         {loading ? <p className="automatic-calibration-status" role="status">正在检查配准引擎与已有参数…</p> : overview && <>
           <div className="automatic-calibration-summary"><span>图像 / 点云组合<strong>{overview.total_pairs.toLocaleString()}</strong></span><span>已有参数<strong>{overview.saved_pairs.toLocaleString()}</strong></span><span>本次处理<strong>{selectionCount.toLocaleString()} 组</strong></span></div>
           <label className="automatic-calibration-scope">处理范围<select aria-label="自动标定处理范围" value={calibrationScope} disabled={locked || running} onChange={event => setCalibrationScope(event.target.value as typeof calibrationScope)}><option value="pair" disabled={!frameId || !cameraId}>当前帧 + 当前相机（推荐）</option><option value="camera" disabled={!cameraId}>全部帧 + 当前相机</option><option value="all">全部帧 + 全部相机</option></select><small>{selectionLabel}{cameraId ? ` · ${selectedCamera?.name ?? cameraId}` : ''}{frameId && calibrationScope === 'pair' ? ` · ${frameId}` : ''}</small></label>
@@ -242,7 +260,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
             <span><input type="radio" name={titleId + '-engine'} value={value.id} checked={engine === value.id} disabled={!value.available} onChange={() => setEngine(value.id)}/><strong>{value.id === 'direct_nid' ? '内置 CPU NID' : value.name || 'Koide'}</strong><em>{value.available ? '可用' : '未就绪'}</em></span>
             <p>{value.detail || (value.id === 'direct_nid' ? '使用点云反射强度与图像灰度进行局部外参优化。' : '连接 Koide 的实际标定运行环境后可用。')}</p>
           </label>)}</fieldset>
-          <p className="automatic-calibration-help">内置 CPU NID 是独立的局部优化器；Koide 通过实际部署的运行环境执行。评分通过不代表已测得像素级误差。</p>
+          <p className="automatic-calibration-help">PJLab 使用线特征掩码进行原生标定；Koide 需单独部署，CPU NID 可直接运行。评分通过不代表已测得像素级误差。</p>
           <label className="automatic-calibration-overwrite"><input type="checkbox" checked={overwrite} disabled={locked || running} onChange={event => setOverwrite(event.target.checked)}/>重新计算已有保存参数的组合</label>
           <p className="automatic-calibration-help">{overwrite ? '重新计算只生成候选；点击保存后才替换已保存参数。' : '默认跳过已有保存参数的组合，保留之前的校准。'}</p>
           {calibrationScope === 'all' && engine === 'koide' && <p className="automatic-calibration-warning">Koide 全量任务会逐组运行，当前片段共有 {overview.total_pairs.toLocaleString()} 组；建议先用当前帧和当前相机验证。</p>}

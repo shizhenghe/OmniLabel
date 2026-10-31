@@ -15,7 +15,7 @@ import threading
 from typing import Literal
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 import numpy as np
 
@@ -36,7 +36,7 @@ def _now() -> str:
 
 
 class AutomaticCalibrationRequest(Model):
-    engine: Literal["koide", "direct_nid"] = "koide"
+    engine: Literal["koide", "direct_nid", "pjlab"] = "koide"
     overwrite_saved: bool = False
     frame_ids: list[Identifier] | None = None
     camera_ids: list[Identifier] | None = None
@@ -45,7 +45,9 @@ class AutomaticCalibrationRequest(Model):
 def engines() -> list[dict]:
     from .automatic_projection import automatic_status
     from .koide_runtime import koide_status
+    from .pjlab_runtime import pjlab_status
     return [{"id": "koide", "name": "Koide 精准配准", **koide_status()},
+            {"id": "pjlab", "name": "PJLab 线特征标定", **pjlab_status()},
             {"id": "direct_nid", "name": "内置 CPU 局部配准", **automatic_status()}]
 
 
@@ -69,10 +71,14 @@ def input_fingerprint(store: Store, frame, camera) -> str:
 
 
 def solve_pair(engine: str, points: np.ndarray, image_path: Path, camera,
-               initial: np.ndarray, work_dir: Path) -> dict:
+               initial: np.ndarray, work_dir: Path, *, mask_path: Path | None = None) -> dict:
     from .automatic_projection import automatic_refine, evaluate_automatic_candidate
     if engine == "direct_nid":
         return automatic_refine(points, image_path, camera, initial)
+    if engine == "pjlab":
+        from .pjlab_runtime import run_pjlab_calibration
+        return run_pjlab_calibration(points=points, image_path=image_path, camera=camera,
+                                     initial=initial, mask_path=mask_path, work_dir=work_dir)
     from .automatic_projection import _options, _prepare, _quality
     from .koide_runtime import run_koide_calibration
     # Exclude a fixed spatial subset of points from Koide's training cloud.
@@ -122,6 +128,45 @@ class AutomaticCalibrationManager:
 
     def _path(self, job_id: str) -> Path:
         return self.directory / f"{safe_id(job_id)}.json"
+
+    def _mask_path(self, clip_id: str, frame_id: str, camera_id: str) -> Path:
+        return self.store.root / "pjlab_masks" / safe_id(clip_id) / safe_id(frame_id) / f"{safe_id(camera_id)}.png"
+
+    def _pair_fingerprint(self, clip_id, frame, camera, engine):
+        token = input_fingerprint(self.store, frame, camera)
+        if engine != "pjlab":
+            return token
+        mask = self._mask_path(clip_id, frame.id, camera.id)
+        if not mask.is_file():
+            from .pjlab_runtime import mask_command
+            command = mask_command()
+            if command is None:
+                raise ValueError("PJLab 需要该帧相机的线特征掩码，请先上传或配置自动掩码命令。")
+            return _fingerprint({"input": token, "mask_command": command})
+        metadata = json.loads(mask.with_suffix(".json").read_text())
+        if metadata["image"] != _stat(_image_path(self.store, frame, camera.id)):
+            raise ValueError("原始图像已变化，请重新上传该帧的 PJLab 掩码。")
+        return _fingerprint({"input": token, "mask": _stat(mask)})
+
+    def upload_mask(self, clip_id: str, frame_id: str, camera_id: str, content: bytes):
+        from .pjlab_runtime import validate_mask
+        with self.store.lock:
+            if self._active or self._applying:
+                raise ConflictError("标定任务运行或保存期间不能替换掩码。")
+            clip = self.store.source_clip(clip_id)
+            frame = next((f for f in clip.frames if f.id == frame_id), None)
+            camera = next((c for c in clip.cameras if c.id == camera_id), None)
+            if frame is None or camera is None:
+                raise KeyError("未找到帧或相机。")
+            mask = validate_mask(content, camera)
+            image = _stat(_image_path(self.store, frame, camera.id))
+            path = self._mask_path(clip_id, frame_id, camera_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            mask.save(temporary, format="PNG")
+            temporary.replace(path)
+            atomic_json(path.with_suffix(".json"), {"image": image})
+            return {"frame_id": frame_id, "camera_id": camera_id, "status": "saved"}
 
     def _save(self, job: dict):
         items = job["items"]
@@ -265,14 +310,16 @@ class AutomaticCalibrationManager:
                             self._save(job)
                             continue
                         image_path = _image_path(self.store, frame, camera.id)
-                        token = input_fingerprint(self.store, frame, camera)
+                        token = self._pair_fingerprint(clip_id, frame, camera, job["engine"])
                         registration = calibration_input(
                             self.store, frame, np.asarray(document["effective_matrix"], dtype=float))
                         item.update(status="running", revision=document["revision"], input_fingerprint=token)
                         self._save(job)
                     work_dir = self.store.root / "automatic_calibration_artifacts" / job_id / frame.id / camera.id
                     result = solve_pair(job["engine"], registration.points, image_path, camera,
-                                        registration.initial_camera_from_input, work_dir)
+                                        registration.initial_camera_from_input, work_dir,
+                                        **({"mask_path": self._mask_path(clip_id, frame.id, camera.id)}
+                                           if job["engine"] == "pjlab" else {}))
                     result["matrix"] = registration.camera_from_primary(
                         np.asarray(result["matrix"], dtype=float)).tolist()
                     result.setdefault("metrics", {}).update(input_source=registration.source,
@@ -284,7 +331,7 @@ class AutomaticCalibrationManager:
                         current = document_for(self.store, clip_id, frame.id, camera.id,
                                                context=(updated_clip, updated_frame, updated_camera))
                         _check_revision(current, document["revision"])
-                        if input_fingerprint(self.store, updated_frame, updated_camera) != token:
+                        if self._pair_fingerprint(clip_id, updated_frame, updated_camera, job["engine"]) != token:
                             raise ConflictError("求解期间源图像或点云已变化，请重新运行。")
                         item.update(status="accepted" if result["usable"] else "rejected",
                                     matrix=result["matrix"], metrics=result.get("metrics"),
@@ -342,7 +389,7 @@ class AutomaticCalibrationManager:
                         clip = self._source(clip_id)
                         frame = next(frame for frame in clip.frames if frame.id == item["frame_id"])
                         camera = next(camera for camera in clip.cameras if camera.id == item["camera_id"])
-                        if input_fingerprint(self.store, frame, camera) != item["input_fingerprint"]:
+                        if self._pair_fingerprint(clip_id, frame, camera, job["engine"]) != item["input_fingerprint"]:
                             raise ConflictError("源图像或点云已变化，请重新运行。")
                         context = (clip, frame, camera)
                         current = document_for(self.store, clip_id, frame.id, camera.id, context=context)
@@ -414,6 +461,15 @@ def mount_automatic_calibration_routes(app: FastAPI, manager: AutomaticCalibrati
     @app.post(route + "/jobs", status_code=202)
     def start_job(clip_id: str, value: AutomaticCalibrationRequest):
         return respond(manager.start, clip_id, value)
+
+    @app.put(route + "/masks/{frame_id}/{camera_id}")
+    async def upload_pjlab_mask(clip_id: str, frame_id: str, camera_id: str, request: Request):
+        content = bytearray()
+        async for chunk in request.stream():
+            content.extend(chunk)
+            if len(content) > 16 * 1024 * 1024:
+                raise HTTPException(413, "掩码文件不能超过 16 MiB。")
+        return respond(manager.upload_mask, clip_id, frame_id, camera_id, bytes(content))
 
     @app.get(route + "/jobs/{job_id}")
     def read_job(clip_id: str, job_id: str):

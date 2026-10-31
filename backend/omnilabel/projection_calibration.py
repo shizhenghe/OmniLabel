@@ -664,7 +664,27 @@ def save_projection_calibration(store: Store, clip_id: str, frame_id: str, camer
         matrix = value.matrix
         metrics = None
         if matrix is not None:
-            if value.method in {"direct_nid", "koide"}:
+            if value.method == "pjlab":
+                # Native line-feature scores are produced by the trusted job,
+                # never accepted from request metrics. The manager checks the
+                # scan/image/mask fingerprint before reaching this publication.
+                from .pjlab_runtime import assess_candidate
+                if source_job_id is None or source_input_fingerprint is None:
+                    raise ValueError("请通过自动标定任务保存 PJLab 候选。")
+                job = json.loads((store.root / "automatic_calibration_jobs" / f"{safe_id(source_job_id)}.json").read_text())
+                item = next((item for item in job["items"] if item["frame_id"] == frame_id and item["camera_id"] == camera_id), None)
+                if (job["engine"] != "pjlab" or job["clip_id"] != clip_id or job["status"] not in {"completed", "cancelled", "failed"}
+                        or item is None or item["status"] != "accepted" or item["matrix"] != matrix
+                        or item["input_fingerprint"] != source_input_fingerprint):
+                    raise ValueError("PJLab 候选与服务端任务不匹配，请重新运行。")
+                native_metrics = item.get("metrics") or {}
+                registration = calibration_input(store, frame, np.asarray(current["effective_matrix"]))
+                assessment = assess_candidate(registration.initial_camera_from_input,
+                    registration.camera_from_input(np.asarray(matrix)),
+                    native_metrics.get("line_overlap_before", float("nan")),
+                    native_metrics.get("line_overlap_after", float("nan")))
+                assessment["metrics"].update(input_source=registration.source, input_point_count=len(registration.points))
+            elif value.method in {"direct_nid", "koide"}:
                 from .automatic_projection import evaluate_automatic_candidate
                 registration = calibration_input(store, frame, np.asarray(current["effective_matrix"]))
                 assessment = evaluate_automatic_candidate(
@@ -676,6 +696,10 @@ def save_projection_calibration(store: Store, clip_id: str, frame_id: str, camer
                                              input_point_count=len(registration.points))
             elif value.method == "correspondences":
                 assessment = evaluate_correspondences(camera, value.correspondences, matrix, current["effective_matrix"])
+            elif value.method == "manual":
+                if value.scope != "frame":
+                    raise ValueError("手动微调仅保存当前帧和当前相机，避免覆盖震动引起的逐帧差异。")
+                assessment = {"usable": True, "metrics": {"validation": "manual_review", "requires_visual_review": True}}
             else:
                 raise ValueError("未知的投影修正方式，请重新求解后保存。")
             if not assessment["usable"]:
