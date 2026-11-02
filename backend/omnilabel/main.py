@@ -59,12 +59,15 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="omnilabel-job")
     from .automatic_calibration import AutomaticCalibrationManager, mount_automatic_calibration_routes
     automatic_calibration = AutomaticCalibrationManager(store, executor)
+    from .lane_calibration import LaneCalibrationManager, mount_lane_calibration_routes
+    lane_calibration = LaneCalibrationManager(store, executor)
 
     @asynccontextmanager
     async def lifespan(application):
         # This local store supports one service process (uvicorn --workers 1).
         store.recover_interrupted_jobs()
         automatic_calibration.recover()
+        lane_calibration.recover()
         latr_batches.recover()
         if seed_demo:
             from .demo import build_demo
@@ -85,12 +88,15 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
         finally:
             latr_batches.shutdown()
             automatic_calibration.shutdown()
+            lane_calibration.shutdown()
             executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(title="OmniLabel API", version="0.1.0", lifespan=lifespan)
     app.state.store = store
     app.state.automatic_calibration = automatic_calibration
     mount_automatic_calibration_routes(app, automatic_calibration)
+    app.state.lane_calibration = lane_calibration
+    mount_lane_calibration_routes(app, lane_calibration)
     model_connections = ModelConnections(store)
     mount_model_routes(app, model_connections)
     from .batch_prelabel import LatrBatchManager, mount_latr_batch_routes

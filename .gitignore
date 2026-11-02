@@ -45,3 +45,7 @@ tests/e2e/*
 !tests/e2e/projection-clip-scope.spec.ts
 !backend/tests/test_cross_frame_projection.py
 !backend/tests/test_clip_projection_calibration.py
+!docs/lane-calibration.md
+!backend/tests/test_lane_optimizer.py
+!backend/tests/test_lane_calibration_api.py
+!tests/e2e/lane-calibration.spec.ts

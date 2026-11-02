@@ -153,6 +153,7 @@ interface Runtime {
   calibrationGroup: THREE.Group;
   cloud: THREE.Points | null;
   grid: THREE.GridHelper;
+  needsRender: boolean;
 }
 
 export function PointCloudView(props: PointCloudViewProps) {
@@ -231,13 +232,15 @@ export function PointCloudView(props: PointCloudViewProps) {
     const trajectoryGroup = new THREE.Group();
     const calibrationGroup = new THREE.Group();
     scene.add(pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup);
-    runtime.current = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup, cloud: null, grid };
+    const rt: Runtime = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup, cloud: null, grid, needsRender: true };
+    runtime.current = rt;
     const resize = () => {
       const { width, height } = host.getBoundingClientRect();
       if (width <= 0 || height <= 0) return;
       renderer.setSize(width, height, false);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
+      rt.needsRender = true;
     };
     const observer = new ResizeObserver(resize);
     observer.observe(host);
@@ -245,8 +248,13 @@ export function PointCloudView(props: PointCloudViewProps) {
     let animation = 0;
     const render = () => {
       animation = requestAnimationFrame(render);
-      controls.update();
-      renderer.render(scene, camera);
+      const cameraChanged = controls.update();
+      // A supplied map can contain millions of points. Repeatedly drawing an
+      // unchanged view saturates software GPUs and stalls image-pairing input.
+      if (cameraChanged || rt.needsRender) {
+        rt.needsRender = false;
+        renderer.render(scene, camera);
+      }
     };
     render();
     setReady(true);
@@ -261,6 +269,10 @@ export function PointCloudView(props: PointCloudViewProps) {
       runtime.current = null;
     };
   }, []);
+
+  // Geometry effects below complete before the next animation frame. This also
+  // invalidates selection, draft, playback and display changes from React.
+  useEffect(() => {if (runtime.current) runtime.current.needsRender = true;});
 
   useEffect(() => {
     const rt = runtime.current;

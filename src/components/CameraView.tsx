@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Annotations, Camera, Frame, ProjectionPoint } from '../types';
 import { labelColor } from './PointCloudView';
 import { projectAnnotationResults, projectLidarPoint, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
+import type {LaneCalibrationOverlay} from './LaneCalibrationPanel';
 
 export { projectLidarPoint } from '../geometry/cameraProjection';
 
@@ -34,6 +35,8 @@ export interface CameraViewProps {
   calibrationPicking?: boolean;
   onCalibrationPixel?: (pixel: Pixel) => void;
   calibrationAnchors?: {id: string; point: number[]; pixel: Pixel; label: string; selected?: boolean; enabled?: boolean}[];
+  laneCalibrationLines?: LaneCalibrationOverlay[];
+  labelDraftPoints?: boolean;
 }
 
 export function CameraView(props: CameraViewProps) {
@@ -183,6 +186,19 @@ export function CameraView(props: CameraViewProps) {
       ctx.strokeStyle = polygon.id === props.selectedId ? '#ffffff' : labelColor(polygon.label);
       ctx.stroke();
     });
+    for (const line of props.laneCalibrationLines ?? []) {
+      ctx.strokeStyle = line.color; ctx.lineWidth = 2.2; ctx.beginPath();
+      let connected = false;
+      for (const point of line.points) {
+        if (!point) {connected = false; continue;}
+        const pixel = xy(point) as Pixel;
+        if (connected) ctx.lineTo(...pixel); else ctx.moveTo(...pixel);
+        connected = true;
+      }
+      ctx.stroke();
+      const anchor = line.points.find(point => point !== null);
+      if (anchor) {ctx.fillStyle = line.color; ctx.font = '10px sans-serif'; ctx.fillText(line.label, anchor[0] * scale + 4, anchor[1] * scale - 4);}
+    }
     if (props.draftPolygon?.length) {
       ctx.strokeStyle = '#f7d778';
       ctx.fillStyle = '#f7d778';
@@ -193,9 +209,10 @@ export function CameraView(props: CameraViewProps) {
         if (!index) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       });
       ctx.stroke();
-      props.draftPolygon.forEach((point) => {
+      props.draftPolygon.forEach((point, index) => {
         const [x, y] = xy(point);
         ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+        if (props.labelDraftPoints) {ctx.font = '11px sans-serif'; ctx.fillText(String(index + 1), x + 4, y - 4);}
       });
     }
     const promptBox = draftModelBox ?? props.modelBox;
@@ -259,6 +276,8 @@ export function CameraView(props: CameraViewProps) {
     data-model-box={props.modelBox?.join(',') ?? ''}
     data-calibration-anchor-count={props.calibrationAnchors?.length ?? 0}
     data-calibration-picking={props.calibrationPicking ? 'true' : 'false'}
+    data-lane-calibration-overlay-count={props.laneCalibrationLines?.length ?? 0}
+    data-lane-calibration-draft-count={props.labelDraftPoints ? props.draftPolygon?.length ?? 0 : 0}
     style={{ position: 'relative', width: '100%', height: '100%', minHeight: 92, overflow: 'hidden', background: '#0b1420', outline: props.selected ? '1px solid #60dbc3' : undefined, outlineOffset: -1, cursor: props.calibrationPicking || props.tool === 'polygon' || props.modelPromptMode ? 'crosshair' : props.onSelect ? 'pointer' : 'default' }}
     onPointerDown={event => {
       if (props.modelPromptMode !== 'box' || event.button !== 0 || imageState !== 'ready') return;

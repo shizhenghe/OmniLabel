@@ -1,0 +1,5 @@
+# Optional CPU runtime for differentiable multi-frame lane calibration.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+PyYAML==6.0.3
+matplotlib==3.10.7

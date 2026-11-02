@@ -60,6 +60,9 @@ class Frame(Model):
     timestamp: float
     ego_to_world: list[list[float]]
     lidar_to_ego: list[list[float]]
+    # Physical LiDAR mount when the primary point source is a fused world map.
+    # Unlike calibration_lidar_to_ego this does not require a raw sensor scan.
+    sensor_lidar_to_ego: list[list[float]] | None = None
     # Point count is determined by the source data, not an interactive quota.
     # Large binary scans use pointcloud_file so the manifest stays compact.
     points: list[list[float]] = Field(default_factory=list)
@@ -81,7 +84,7 @@ class Frame(Model):
 
     _transforms = field_validator("ego_to_world", "lidar_to_ego")(rigid_transform)
 
-    @field_validator("calibration_lidar_to_ego")
+    @field_validator("calibration_lidar_to_ego", "sensor_lidar_to_ego")
     @classmethod
     def validate_calibration_transform(cls, value):
         return rigid_transform(value) if value is not None else None

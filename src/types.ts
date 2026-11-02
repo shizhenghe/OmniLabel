@@ -17,6 +17,7 @@ export interface Frame {
   timestamp: number;
   ego_to_world: number[][];
   lidar_to_ego: number[][];
+  sensor_lidar_to_ego?: number[][] | null;
   points: number[][];
   point_count: number;
   calibration_pointcloud_file?: string | null;
