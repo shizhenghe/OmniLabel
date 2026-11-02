@@ -78,7 +78,10 @@ test('manual frame extrinsics save independently and survive reload', async ({pa
   await expect(editor.getByText('已保存，仅应用于当前帧和当前相机。')).toBeVisible();
   const saved = await (await request.get(path(current))).json();
   expect(saved.method).toBe('manual');
-  expect(saved.saved_matrix[0][3]).toBeCloseTo(before.effective_matrix[0][3] + .01, 8);
+  const angle = .1 * Math.PI / 180;
+  const [x, y] = [before.effective_matrix[0][3] + .01, before.effective_matrix[1][3]];
+  expect(saved.saved_matrix[0][3]).toBeCloseTo(Math.cos(angle) * x - Math.sin(angle) * y, 8);
+  expect(saved.saved_matrix[1][3]).toBeCloseTo(Math.sin(angle) * x + Math.cos(angle) * y, 8);
   expect(saved.saved_matrix).not.toEqual(before.effective_matrix);
   expect(saved.metrics.validation).toBe('manual_review');
   expect((await (await request.get(path(next))).json()).effective_matrix).toEqual(otherBefore.effective_matrix);

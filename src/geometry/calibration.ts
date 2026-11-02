@@ -31,6 +31,15 @@ export function correctExtrinsic(base: Matrix4, correction: ExtrinsicCorrection)
     base[i][3] + correction.translation[i]]), [0, 0, 0, 1]];
 }
 
+/** Apply a local optical-camera correction to a frame projection. Rotate the
+ * translation column too: primary points can be in distant world coordinates,
+ * and a camera rotation must preserve its position in that coordinate frame.
+ */
+export function correctFrameCameraExtrinsic(base: Matrix4, correction: ExtrinsicCorrection): Matrix4 {
+  const identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+  return multiplyExtrinsics(correctExtrinsic(identity, correction), base);
+}
+
 export function applyCalibration(clip: Clip, calibration: Pick<CalibrationDocument, 'cameras' | 'lidar_to_ego'>,
   baseline?: CalibrationDocument): Clip {
   const cameras = new Map(clip.cameras.map(camera => [camera.id, camera]));
