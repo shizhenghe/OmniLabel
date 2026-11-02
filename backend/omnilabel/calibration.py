@@ -55,7 +55,8 @@ def calibration_document(store: Store, clip: Clip) -> dict:
             "world_from_lidar": {fid: pose.tolist() for fid, pose in registered_poses(store, clip).items()}}
 
 
-def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> dict:
+def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate, *,
+                     reset_projection_cameras: set[str] | None = None) -> dict:
     from .scene import (_clip_fingerprint, get_scene_map, invalidate_scene_map,
                         is_supplied_scene_map, registered_poses, source_fingerprint)
     with store.lock:
@@ -63,6 +64,9 @@ def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> di
         # Rewriting an overlaid clip would bake those overrides into the
         # manifest and prevent a changed base calibration from staling them.
         clip = store.source_clip(clip_id)
+        reset_projection_cameras = reset_projection_cameras or set()
+        if reset_projection_cameras - {camera.id for camera in clip.cameras}:
+            raise ValueError("Unknown camera in projection reset")
         if value.revision != _revision(clip):
             raise ConflictError("Calibration revision conflict. Reload the extrinsics before saving.")
         if set(value.cameras) != {camera.id for camera in clip.cameras}:
@@ -80,7 +84,9 @@ def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> di
             valid_map = False
         changed_camera = value.cameras != before["cameras"]
         changed_lidar = value.lidar_to_ego != before["lidar_to_ego"]
-        if not changed_camera and not changed_lidar:
+        changed_projection = any(camera_id in frame.annotation_camera_from_lidar or camera_id in frame.projection_camera_from_lidar
+                                 for frame in clip.frames for camera_id in reset_projection_cameras)
+        if not changed_camera and not changed_lidar and not changed_projection:
             return {**before, "lidar_changed": False, "map_rebuild_required": False}
         raw = clip.model_dump()
         old_cameras = {camera.id: camera for camera in clip.cameras}
@@ -91,6 +97,11 @@ def save_calibration(store: Store, clip_id: str, value: CalibrationUpdate) -> di
             original = old_frames[frame["id"]]
             new_lidar = value.lidar_to_ego[frame["id"]]
             for field in ("annotation_camera_from_lidar", "projection_camera_from_lidar"):
+                # A jointly fitted shared candidate must not have old imported
+                # per-frame corrections applied a second time. The before
+                # document below preserves those matrices in calibration history.
+                for camera_id in reset_projection_cameras:
+                    frame[field].pop(camera_id, None)
                 for camera_id, matrix in frame[field].items():
                     old_camera = old_cameras[camera_id].camera_from_ego
                     new_camera = value.cameras[camera_id]

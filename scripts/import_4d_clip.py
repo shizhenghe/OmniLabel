@@ -409,6 +409,8 @@ def build_scene(source: Path, clip_id: str, data_root: Path, max_points: int | N
                 "ego_to_world": matrix_list(pose),
                 # The supplied map and labels already use local-world axes.
                 "lidar_to_ego": matrix_list(np.linalg.inv(pose)),
+                "sensor_lidar_to_ego": matrix_list(quaternion_transform(
+                    item["lidar_calib"]["rotation"], item["lidar_calib"]["translation"])),
                 "points": [],
                 "pointcloud_file": f"{clip_id}/{point_name}",
                 "point_count": cloud["point_count"],
