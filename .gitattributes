@@ -1,0 +1,7 @@
+example/**/*.pcd filter=lfs diff=lfs merge=lfs -text
+example/**/*.bin filter=lfs diff=lfs merge=lfs -text
+example/**/*.ply filter=lfs diff=lfs merge=lfs -text
+example/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+example/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
+example/**/*.png filter=lfs diff=lfs merge=lfs -text
+example/**/*.tif filter=lfs diff=lfs merge=lfs -text
