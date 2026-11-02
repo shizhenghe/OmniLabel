@@ -1,6 +1,6 @@
 import {useEffect, useRef, useState} from 'react';
 import {download, jsonRequest, request} from '../api';
-import {correctExtrinsic, type Matrix4} from '../geometry/calibration';
+import {correctFrameCameraExtrinsic, type Matrix4} from '../geometry/calibration';
 import type {Camera, Vec3} from '../types';
 import './ProjectionCalibrationEditor.css';
 
@@ -241,7 +241,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     if (!baseline || locked) return;
     const translation: Vec3 = [0, 0, 0], rotation: Vec3 = [0, 0, 0];
     (kind === 'translation' ? translation : rotation)[axis] = direction * (kind === 'translation' ? translationStep : rotationStep);
-    const matrix = correctExtrinsic(candidate ?? baseline.effective_matrix, {translation, rotation});
+    const matrix = correctFrameCameraExtrinsic(candidate ?? baseline.effective_matrix, {translation, rotation});
     setCandidate(matrix); setCandidateMethod('manual'); setShowCandidate(true); setSaveScope('frame');
     setMetrics(null); setMetricsKind('candidate'); setError('');
     changePickMode(null); props.onPreview(matrix);

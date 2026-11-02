@@ -1,14 +1,21 @@
 import {expect, test} from '@playwright/test';
 import {readFile} from 'node:fs/promises';
 
-test('camera extrinsics preview immediately, export draft, save and survive reload', async ({page, request}) => {
+test('original camera editor defaults to an independent frame calibration', async ({page, request}) => {
   await page.goto('/');
   await expect(page.getByLabel('选择clip')).toHaveValue('demo');
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
   const original = await (await request.get('/api/clips/demo/calibration')).json();
+  const route = '/api/clips/demo/frames/frame-000/projection-calibration/front';
+  const nextRoute = '/api/clips/demo/frames/frame-001/projection-calibration/front';
+  const otherRoute = '/api/clips/demo/frames/frame-000/projection-calibration/rear_right';
+  const before = await (await request.get(route)).json();
+  const nextBefore = await (await request.get(nextRoute)).json();
+  const otherBefore = await (await request.get(otherRoute)).json();
   await page.getByLabel('编辑标定外参', {exact: true}).click();
   const editor = page.getByTestId('calibration-editor');
   await expect(editor).toBeVisible();
+  await expect(editor.getByLabel('相机外参应用全帧')).not.toBeChecked();
   await expect(page.getByLabel('外参X', {exact: true})).toBeEnabled();
   const front = page.getByTestId('camera-front');
   await expect.poll(async () => Number(await front.getAttribute('data-projected-point-count'))).toBeGreaterThan(0);
@@ -23,11 +30,37 @@ test('camera extrinsics preview immediately, export draft, save and survive relo
   const draftFile = await pending;
   const draft = JSON.parse(await readFile((await draftFile.path())!, 'utf8'));
   expect(draft.draft).toBe(true);
-  expect(draft.cameras.front[0][3]).toBeCloseTo(original.cameras.front[0][3] + .2, 8);
-  const saving = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/calibration'));
+  expect(draft.frame_id).toBe('frame-000');
+  expect(draft.camera_id).toBe('front'); expect(draft.scope).toBe('frame');
+  expect(draft.candidate_matrix[0][3]).toBeCloseTo(before.effective_matrix[0][3] + .2, 8);
+  let releaseSave!: () => void;
+  const paused = new Promise<void>(resolve => {releaseSave = resolve;});
+  await page.route(`**${route}`, async intercepted => {
+    if (intercepted.request().method() === 'PUT') await paused;
+    await intercepted.continue();
+  });
+  const started = page.waitForRequest(r => r.method() === 'PUT' && r.url().endsWith(route));
+  const saving = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith(route));
   await page.getByLabel('保存外参', {exact: true}).click();
+  await started;
+  try {await expect(page.getByLabel('下一帧', {exact: true})).toBeDisabled();}
+  finally {releaseSave();}
   expect((await saving).ok()).toBe(true);
   await expect(page.getByLabel('保存外参', {exact: true})).toBeDisabled();
+  const savedA = await (await request.get(route)).json();
+  expect(savedA.scope).toBe('frame'); expect(savedA.method).toBe('manual');
+  expect(savedA.saved_matrix[0][3]).toBeCloseTo(before.effective_matrix[0][3] + .2, 8);
+  expect((await (await request.get(nextRoute)).json()).effective_matrix).toEqual(nextBefore.effective_matrix);
+  expect((await (await request.get(otherRoute)).json()).effective_matrix).toEqual(otherBefore.effective_matrix);
+  await page.getByLabel('下一帧', {exact: true}).click();
+  await expect(editor).toContainText('仅帧 frame-001 · 相机 front');
+  await expect(page.getByLabel('外参X', {exact: true})).toHaveValue('0');
+  await page.getByLabel('外参X', {exact: true}).fill('-0.1');
+  await page.getByLabel('保存外参', {exact: true}).click();
+  await expect(page.getByLabel('保存外参', {exact: true})).toBeDisabled();
+  const savedB = await (await request.get(nextRoute)).json();
+  expect(savedB.saved_matrix[0][3]).toBeCloseTo(nextBefore.effective_matrix[0][3] - .1, 8);
+  expect((await (await request.get(route)).json()).saved_matrix).toEqual(savedA.saved_matrix);
   await page.getByLabel('关闭外参编辑', {exact: true}).click();
   await expect(editor).toHaveCount(0);
   await page.reload();
@@ -35,10 +68,72 @@ test('camera extrinsics preview immediately, export draft, save and survive relo
   await page.getByLabel('编辑标定外参', {exact: true}).click();
   await expect(page.getByLabel('外参X', {exact: true})).toBeEnabled();
   const saved = await (await request.get('/api/clips/demo/calibration')).json();
-  expect(saved.cameras.front[0][3]).toBeCloseTo(original.cameras.front[0][3] + .2, 8);
-  expect(saved.revision).not.toBe(original.revision);
+  expect(saved.cameras).toEqual(original.cameras);
+  expect(saved.revision).toBe(original.revision);
+  expect((await (await request.get(route)).json()).saved_matrix).toEqual(savedA.saved_matrix);
+  const values = (await editor.getByTestId('calibration-matrix').innerText()).trim().split(/\s+/).map(Number);
+  expect(values).toEqual(savedA.saved_matrix.flat().map((v: number) => Number(v.toFixed(6))));
   // Reloaded controls are incremental corrections to the new saved matrix.
   await expect(page.getByLabel('外参X', {exact: true})).toHaveValue('0');
+});
+
+test('original extrinsics editor guards unsaved edits when changing frames or cameras', async ({page, request}) => {
+  const route = '/api/clips/demo/frames/frame-000/projection-calibration/front';
+  const nextRoute = '/api/clips/demo/frames/frame-001/projection-calibration/front';
+  const before = await (await request.get(route)).json();
+  const nextBefore = await (await request.get(nextRoute)).json();
+  await page.goto('/?clip=demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('编辑标定外参', {exact: true}).click();
+  const editor = page.getByTestId('calibration-editor');
+  await editor.getByLabel('外参X', {exact: true}).fill('0.4');
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.getByLabel('下一帧', {exact: true}).click();
+  await expect(editor).toContainText('仅帧 frame-000 · 相机 front');
+  await expect(editor.getByLabel('外参X', {exact: true})).toHaveValue('0.4');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByLabel('下一帧', {exact: true}).click();
+  await expect(editor).toContainText('仅帧 frame-001 · 相机 front');
+  await expect(editor.getByLabel('外参X', {exact: true})).toHaveValue('0');
+  const values = (await editor.getByTestId('calibration-matrix').innerText()).trim().split(/\s+/).map(Number);
+  expect(values).toEqual(nextBefore.effective_matrix.flat().map((v: number) => Number(v.toFixed(6))));
+  expect((await (await request.get(route)).json()).revision).toBe(before.revision);
+  await editor.getByLabel('外参X', {exact: true}).fill('0.5');
+  page.once('dialog', dialog => dialog.dismiss());
+  await editor.getByLabel('外参目标', {exact: true}).selectOption('rear_right');
+  await expect(editor.getByLabel('外参目标', {exact: true})).toHaveValue('front');
+  await expect(editor.getByLabel('外参X', {exact: true})).toHaveValue('0.5');
+  page.once('dialog', dialog => dialog.accept());
+  await editor.getByLabel('外参目标', {exact: true}).selectOption('rear_right');
+  await expect(editor.getByLabel('外参X', {exact: true})).toHaveValue('0');
+  await expect(editor.getByLabel('相机外参应用全帧')).not.toBeChecked();
+  const rear = await (await request.get('/api/clips/demo/frames/frame-001/projection-calibration/rear_right')).json();
+  await expect.poll(async () => (await editor.getByTestId('calibration-matrix').innerText()).trim().split(/\s+/).map(Number))
+    .toEqual(rear.effective_matrix.flat().map((v: number) => Number(v.toFixed(6))));
+  expect((await (await request.get(nextRoute)).json()).revision).toBe(nextBefore.revision);
+});
+
+test('whole-clip camera extrinsic edits require an explicit scope selection', async ({page, request}) => {
+  const before = await (await request.get('/api/clips/demo/calibration')).json();
+  await page.goto('/?clip=demo');
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('编辑标定外参', {exact: true}).click();
+  const editor = page.getByTestId('calibration-editor');
+  await expect(editor.getByLabel('相机外参应用全帧')).toBeEnabled();
+  await expect(editor.getByLabel('相机外参应用全帧')).not.toBeChecked();
+  await editor.getByLabel('相机外参应用全帧').check();
+  await expect(editor).toContainText('当前范围：整个 clip');
+  await editor.getByLabel('外参X', {exact: true}).fill('0.15');
+  const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith('/clips/demo/calibration'));
+  await editor.getByLabel('保存外参', {exact: true}).click();
+  expect((await saved).ok()).toBe(true);
+  await expect(editor.getByLabel('保存外参', {exact: true})).toBeDisabled();
+  const after = await (await request.get('/api/clips/demo/calibration')).json();
+  expect(after.cameras.front[0][3]).toBeCloseTo(before.cameras.front[0][3] + .15, 8);
+  expect(after.cameras.rear_right).toEqual(before.cameras.rear_right);
+  await page.getByLabel('关闭外参编辑', {exact: true}).click();
+  await page.getByLabel('编辑标定外参', {exact: true}).click();
+  await expect(editor.getByLabel('相机外参应用全帧')).not.toBeChecked();
 });
 
 test('LiDAR extrinsics update current scan preview, reset and persist with a stale map', async ({page, request}) => {
