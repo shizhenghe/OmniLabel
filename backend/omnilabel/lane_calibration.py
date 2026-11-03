@@ -234,8 +234,8 @@ def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, req
     if len(frames) != len({p.frame_id for p in pairs}): raise ValueError("配对引用了不存在的帧。")
     lanes = {v.id: v for v in scene.vectors if not v.closed}
     train = {p.frame_id for p in pairs if p.split == "train"}; validation = {p.frame_id for p in pairs if p.split == "validation"}
-    if validate_split and request.mode == "multi" and (len(train) < 2 or not validation):
-        raise ValueError("多帧正式标定至少需要两个训练帧和一个独立验证帧。")
+    if validate_split and not train:
+        raise ValueError("至少需要一组训练配对；当前配对全部标记为验证，请将至少一帧的用途改为训练。")
     if validate_split and request.mode == "single" and len(train) != 1: raise ValueError("单帧调试必须只选择一个训练帧。")
     poses, initial, mount = resolve_geometry(store, clip, camera, frames, request)
     observations, image_tokens = [], []

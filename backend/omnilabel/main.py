@@ -15,6 +15,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from PIL import Image, ImageDraw
@@ -92,6 +95,20 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(title="OmniLabel API", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_invalid_request(request, exc):
+        # Record field errors, never the request body (which can be a large
+        # annotation document or contain model connection credentials).
+        errors = [{key: error[key] for key in ("loc", "msg", "type")} for error in exc.errors()]
+        LOGGER.warning("Request validation failed: %s %r %s", request.method, request.url.path, errors)
+        return JSONResponse(status_code=422, content={"detail": errors})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(request, exc):
+        if exc.status_code == 422:
+            LOGGER.warning("Request rejected: %s %r %s", request.method, request.url.path, str(exc.detail)[:2000])
+        return await http_exception_handler(request, exc)
     app.state.store = store
     app.state.automatic_calibration = automatic_calibration
     mount_automatic_calibration_routes(app, automatic_calibration)

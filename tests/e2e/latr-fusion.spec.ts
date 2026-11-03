@@ -217,3 +217,33 @@ test('undoing automatic LATR fusion retains every new prediction as a separate e
   expect(overlap.points.at(-1)![0]).toBeCloseTo(130, 8);
   expect(await (await request.get(framePath)).json()).toEqual(originalFrame);
 });
+
+
+test('422 during automatic fusion keeps candidates and permits explicit apply without fusion', async ({page, request}) => {
+  const {id, scenePath, framePath} = await prepareLatrFixture(request, '422');
+  await openWithBrowserWorker(page, request, id);
+  const original = await (await request.get(scenePath)).json();
+  const originalFrame = await (await request.get(framePath)).json();
+  let fusionRequests = 0;
+  await page.route(`**/api/clips/${id}/lanes/merge-preview`, route => {
+    fusionRequests++;
+    return route.fulfill({status: 422, json: {detail: [{loc: ['body', 'vectors', 0, 'points'], msg: 'fusion constraint failed'}]}});
+  });
+  await generateProposal(page);
+  await page.getByRole('button', {name: '应用候选标注', exact: true}).click();
+  await expect(page.getByRole('alert')).toContainText('422 · POST');
+  await expect(page.getByRole('alert')).toContainText('vectors.0.points');
+  await expect(page.locator('.inline-proposal')).toBeVisible();
+  expect(await (await request.get(scenePath)).json()).toEqual(original);
+  await expect(page.getByLabel('保存标注', {exact: true})).toBeDisabled();
+  await page.getByLabel('仅应用LATR候选不融合', {exact: true}).click();
+  await expect(page.locator('.inline-proposal')).toHaveCount(0);
+  expect(fusionRequests).toBe(1);
+  await expect(page.getByTestId('point-cloud-view')).toHaveAttribute('data-annotation-vector-count', '4');
+  await saveScene(page, scenePath);
+  const saved = await (await request.get(scenePath)).json();
+  expect(saved.vectors).toHaveLength(4);
+  for (const vector of original.vectors) expect(saved.vectors).toContainEqual(vector);
+  expect(saved.tracks).toEqual(original.tracks);
+  expect(await (await request.get(framePath)).json()).toEqual(originalFrame);
+});

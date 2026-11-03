@@ -254,3 +254,19 @@ def test_store_inspection_preserves_live_jobs_but_service_start_recovers(tmp_pat
     with TestClient(application) as client:
         recovered = client.get("/api/jobs/running-job").json()
         assert recovered["status"] == "failed" and "restarted" in recovered["error"]
+
+
+def test_validation_errors_identify_fields_without_logging_annotation_payload(client, caplog):
+    assert import_json(client, manifest()).status_code == 201
+    path = '/api/clips/test-clip/frames/frame-0/annotations'
+    marker = 'private-annotation-value-' * 5
+    invalid = {'vectors': [{'id': 'lane', 'label': marker, 'points': [[1, 2, 3], [2, 3, 4]], 'closed': False}]}
+    with caplog.at_level('WARNING', logger='omnilabel.main'):
+        response = client.put(path, json=invalid)
+    assert response.status_code == 422
+    assert response.json()['detail'][0]['loc'] == ['body', 'vectors', 0, 'label']
+    assert set(response.json()['detail'][0]) == {'loc', 'msg', 'type'}
+    assert path in caplog.text and 'label' in caplog.text
+    assert marker not in caplog.text and marker not in response.text
+    invalid['vectors'][0]['label'] = 'lane'
+    assert client.put(path, json=invalid).status_code == 200
