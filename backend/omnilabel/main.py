@@ -77,7 +77,8 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
             # New fixture is additive: never replace an existing editable clip,
             # its source scans, or a user's saved frame/scene annotations.
             for clip_id in ("demo", "demo-ground-detail"):
-                if (store.root / "clips" / f"{clip_id}.json").exists():
+                if ((store.root / "clips" / f"{clip_id}.json").exists()
+                        or (store.root / "deleted_clips" / f"{clip_id}.json").exists()):
                     continue
                 demo_assets = store.root / "assets" / clip_id
                 demo_assets.mkdir(parents=True, exist_ok=True)
@@ -217,6 +218,13 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                 shutil.rmtree(destination, ignore_errors=True)
             if point_destination and not published:
                 shutil.rmtree(point_destination, ignore_errors=True)
+
+    @app.delete("/api/clips/{clip_id}")
+    def delete_clip(clip_id: str):
+        get_clip(clip_id)
+        with store.lock:
+            store.delete_clip(clip_id)
+        return {"id": clip_id, "deleted": True}
 
     @app.get("/api/clips/{clip_id}")
     def read_clip(clip_id: str):

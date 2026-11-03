@@ -166,13 +166,27 @@ class Store:
     def add_clip(self, clip: Clip, annotations: dict[str, Annotations] | None = None):
         with self.lock:
             destination = self.root / "clips" / f"{safe_id(clip.id)}.json"
-            if destination.exists():
+            if destination.exists() or (self.root / "deleted_clips" / destination.name).exists():
                 raise ConflictError("A clip with this ID already exists. Give the imported clip a unique ID.")
             # Publish the clip last so list/read never sees incomplete initial labels.
             for frame_id, value in (annotations or {}).items():
                 path = self.root / "annotations" / clip.id / f"{safe_id(frame_id)}.json"
                 atomic_json(path, value.model_dump())
             atomic_json(destination, clip.model_dump())
+
+    def delete_clip(self, clip_id: str):
+        """Archive the manifest; shared scans, images and labels remain recoverable."""
+        with self.lock:
+            self.source_clip(clip_id)
+            for folder in ("jobs", "automatic_calibration_jobs", "latr_batches"):
+                for path in (self.root / folder).glob("*.json"):
+                    job = json.loads(path.read_text())
+                    if job.get("clip_id") == clip_id and job.get("status") in {"queued", "running", "cancelling"}:
+                        raise ConflictError("该 CLIP 仍有后台任务，请等待完成或取消后再删除。")
+            destination = self.root / "deleted_clips" / f"{safe_id(clip_id)}.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            (self.root / "clips" / f"{clip_id}.json").replace(destination)
+            (self.root / "clip_summaries.json").unlink(missing_ok=True)
 
     def annotations(self, clip_id: str, frame_id: str) -> Annotations:
         path = self.root / "annotations" / safe_id(clip_id) / f"{safe_id(frame_id)}.json"

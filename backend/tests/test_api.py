@@ -270,3 +270,21 @@ def test_validation_errors_identify_fields_without_logging_annotation_payload(cl
     assert marker not in caplog.text and marker not in response.text
     invalid['vectors'][0]['label'] = 'lane'
     assert client.put(path, json=invalid).status_code == 200
+
+
+def test_delete_clip_archives_and_preserves_shared_data(client):
+    assert import_json(client, manifest()).status_code == 201
+    store = client.app.state.store
+    shared = store.root / 'pointclouds' / 'shared.npy'
+    shared.write_bytes(b'shared-source')
+    store.save_job({'id': 'pending', 'clip_id': 'test-clip', 'status': 'running'})
+    assert client.delete('/api/clips/test-clip').status_code == 409
+    assert client.get('/api/clips/test-clip').status_code == 200
+    store.save_job({'id': 'pending', 'clip_id': 'test-clip', 'status': 'completed'})
+    assert client.delete('/api/clips/test-clip').json()['deleted'] is True
+    assert client.get('/api/clips').json() == []
+    assert client.get('/api/clips/test-clip').status_code == 404
+    assert (store.root / 'deleted_clips' / 'test-clip.json').is_file()
+    assert shared.read_bytes() == b'shared-source'
+    assert client.delete('/api/clips/test-clip').status_code == 404
+    assert import_json(client, manifest()).status_code == 409

@@ -535,6 +535,8 @@ export function PointCloudView(props: PointCloudViewProps) {
   useEffect(() => {
     const rt = runtime.current;
     if (!rt) return;
+    // A perspective camera looking down still has height-dependent parallax.
+    // BEV must use parallel rays, including during pan, zoom and vertex picking.
     const target = rt.controls.target;
     let distance = props.sceneMode ? Math.max(rt.camera.position.distanceTo(target), 20) : 68;
     const aspect = rt.renderer.domElement.clientWidth / rt.renderer.domElement.clientHeight;
@@ -676,6 +678,11 @@ export function PointCloudView(props: PointCloudViewProps) {
         point = new THREE.Vector3(worldGround.x, worldGround.y, height);
       } else point = new THREE.Vector3(...groundDrawingPoint(current.frame?.points ?? [], [worldGround.x, worldGround.y, worldGround.z], current.groundBand));
     }
+    if (current.tool === 'vector' && current.drawOnGround && point) {
+      const corrected = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1),
+        -(point.z - origin[2])), new THREE.Vector3());
+      if (corrected) point = corrected.add(new THREE.Vector3(...origin));
+    }
     if (!point) return;
     const coordinates: Vec3 = [point.x, point.y, point.z];
     if (current.tool === 'box') current.onCreateBox?.(coordinates);
@@ -701,6 +708,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     ref={container}
     className={props.className}
     data-testid="point-cloud-view"
+    data-projection={props.view === 'top' ? 'orthographic' : 'perspective'}
     data-coordinate-frame={props.sceneMode ? 'world' : 'lidar'}
     data-projection-mode={props.view === 'top' ? 'orthographic' : 'perspective'}
     data-cloud-point-count={pointCount}

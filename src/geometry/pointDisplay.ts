@@ -52,3 +52,36 @@ export function groundDrawingPoint(points: number[][], planePoint: Vec3, groundB
   });
   return [planePoint[0], planePoint[1], height];
 }
+
+/** Repair lane elevations from measured ground without shifting surveyed XY.
+ * Index the small vertex set so a full-resolution map is scanned only once. */
+export function groundVectorHeights(vertices: Vec3[], points: number[][] | Float32Array | Float64Array,
+  groundZ: number, groundBand = .35, radius = .6): {points: Vec3[]; matched: number} {
+  const cells = new Map<string, number[]>();
+  vertices.forEach(([x, y], index) => {
+    const cx = Math.floor(x / radius), cy = Math.floor(y / radius);
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+      const key = `${cx + dx},${cy + dy}`;
+      const indices = cells.get(key) ?? []; indices.push(index); cells.set(key, indices);
+    }
+  });
+  const result = vertices.map(point => [...point] as Vec3);
+  const distances = vertices.map(() => radius * radius);
+  const matched = new Set<number>();
+  const binary = !Array.isArray(points);
+  const count = binary ? points.length / 4 : points.length;
+  for (let index = 0; index < count; index++) {
+    const row = binary ? undefined : (points as number[][])[index];
+    const x = binary ? (points as Float32Array)[index * 4] : row![0];
+    const y = binary ? (points as Float32Array)[index * 4 + 1] : row![1];
+    const z = binary ? (points as Float32Array)[index * 4 + 2] : row![2];
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z) || Math.abs(z - groundZ) > groundBand) continue;
+    for (const vertex of cells.get(`${Math.floor(x / radius)},${Math.floor(y / radius)}`) ?? []) {
+      const distance = (x - vertices[vertex][0]) ** 2 + (y - vertices[vertex][1]) ** 2;
+      if (distance < distances[vertex]) {
+        distances[vertex] = distance; result[vertex][2] = z; matched.add(vertex);
+      }
+    }
+  }
+  return {points: result, matched: matched.size};
+}
