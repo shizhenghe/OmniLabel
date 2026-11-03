@@ -290,3 +290,67 @@ def test_multiframe_selected_lanes_recover_extrinsics_with_independent_holdout(l
         assert job['result']['after']['splits'][split]['mean_px']<.5
         assert job['result']['error_reduction'][split]>.9
     assert client.get(route).json()['pairing']==original
+
+
+def test_one_world_lane_accepts_multiple_image_lanes_but_image_owner_is_unique(lane_api):
+    client, store, route, _ = lane_api
+    client.put(route+'/pairs', json={'revision': 1, 'pairs': []}).raise_for_status()
+    first = _image_derived_lane(store, 'f0', 'lane0')
+    second = _image_derived_lane(store, 'f0', 'lane1')
+    selection = {'revision': 2, 'id': 'one', 'frame_id': 'f0', 'lane_id': 'lane0', 'image_lane_id': first}
+    client.post(route+'/pairs/from-lanes', json=selection).raise_for_status()
+    response = client.post(route+'/pairs/from-lanes', json={**selection, 'revision': 3, 'id': 'two', 'image_lane_id': second})
+    assert response.status_code == 200, response.text
+    document = response.json()
+    assert [p['lane_id'] for p in document['pairs']] == ['lane0', 'lane0']
+    assert [p['image_lane_id'] for p in document['pairs']] == [first, second]
+    # Both entry points enforce ownership, including attempts in another frame.
+    for frame in ('f0', 'f1'):
+        rejected = client.post(route+'/pairs/from-lanes', json={**selection, 'revision': 4, 'id': 'other',
+            'lane_id': 'lane1', 'frame_id': frame})
+        assert rejected.status_code == 422, rejected.text
+    broken = deepcopy(document)
+    broken['pairs'][1]['image_lane_id'] = first
+    assert client.put(route+'/pairs', json=broken).status_code == 422
+    assert client.get(route).json()['pairing'] == document
+
+
+def test_discard_invalidates_all_candidates_preserves_saved_data_and_allows_reselection(lane_api):
+    client, store, route, _ = lane_api
+    # Include a previously applied job and another candidate, as well as a
+    # different camera's state: reset must be scoped and must not undo applying.
+    directory = store.root/'lane_calibration/known/front'
+    saved = {path: path.read_bytes() for path in store.root.rglob('*.json')}
+    for index, applied in enumerate((True, False)):
+        atomic_json(directory/f'jobs/old{index}/job.json', {'id': f'old{index}', 'status': 'completed',
+            'applied': applied, 'can_apply': True, 'result': {'optimized_matrix': np.eye(4).tolist()}})
+    other = store.root/'lane_calibration/known/other/pairs.json'
+    atomic_json(other, {'revision': 9, 'pairs': []})
+    original = client.get(route).json()['pairing']
+    assert client.post(route+'/discard', json={'revision': 0, 'pairs': []}).status_code == 409
+    assert client.post(route+'/discard', json=original).status_code == 422
+    manager = client.app.state.lane_calibration
+    manager.active['busy'] = True
+    try:
+        assert client.post(route+'/discard', json={'revision': 1, 'pairs': []}).status_code == 409
+        assert client.get(route).json()['pairing'] == original
+    finally:
+        manager.active.pop('busy')
+    response = client.post(route+'/discard', json={'revision': 1, 'pairs': []})
+    assert response.status_code == 200, response.text
+    assert response.json()['pairing'] == {'revision': 2, 'pairs': []}
+    assert response.json()['latest_job'] is None
+    assert client.get(route).json()['latest_job'] is None
+    for index in range(2):
+        job = client.get(route+f'/jobs/old{index}').json()
+        assert job['discarded'] and job['result'] is None and not job['can_apply']
+        assert job['applied'] == (index == 0)
+        assert client.post(route+f'/jobs/old{index}/apply', json={'confirm_shared_update': True}).status_code == 409
+        assert client.get(route+f'/jobs/old{index}/download').status_code == 409
+    for path, content in saved.items():
+        if path != directory/'pairs.json': assert path.read_bytes() == content
+    assert json.loads(other.read_text()) == {'revision': 9, 'pairs': []}
+    image = _image_derived_lane(store, 'f0', 'lane0')
+    reselected = client.post(route+'/pairs/from-lanes', json={'revision': 2, 'id': 'new', 'frame_id': 'f0',
+        'lane_id': 'lane0', 'image_lane_id': image})
+    assert reselected.status_code == 200, reselected.text
