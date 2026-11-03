@@ -49,3 +49,4 @@ tests/e2e/*
 !backend/tests/test_lane_optimizer.py
 !backend/tests/test_lane_calibration_api.py
 !tests/e2e/lane-calibration.spec.ts
+!tests/e2e/point-snap.spec.ts

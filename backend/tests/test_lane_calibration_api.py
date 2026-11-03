@@ -354,3 +354,41 @@ def test_discard_invalidates_all_candidates_preserves_saved_data_and_allows_rese
     reselected = client.post(route+'/pairs/from-lanes', json={'revision': 2, 'id': 'new', 'frame_id': 'f0',
         'lane_id': 'lane0', 'image_lane_id': image})
     assert reselected.status_code == 200, reselected.text
+
+
+def test_quality_metrics_do_not_gate_application_of_existing_candidate(lane_api):
+    client, store, route, request = lane_api
+    response = client.post(route+'/jobs', json=request)
+    assert response.status_code == 202, response.text
+    job_id = response.json()['id']
+    deadline = time.monotonic() + 100
+    while time.monotonic() < deadline:
+        job = client.get(route+'/jobs/'+job_id).json()
+        if job['status'] in {'completed', 'failed', 'cancelled'}: break
+        time.sleep(.05)
+    assert job['status'] == 'completed', job
+    path = store.root/f'lane_calibration/known/front/jobs/{job_id}/job.json'
+    saved = json.loads(path.read_text())
+    # Emulate a candidate persisted by the old version that failed its quality
+    # gate. The new policy must apply to it without rerunning optimization.
+    saved['can_apply'] = False
+    saved['result']['usable'] = False
+    saved['result']['rejection_reasons'] = ['验证帧误差没有改善至少 0.5%。']
+    atomic_json(path, saved)
+    assert client.get(route).json()['latest_job']['can_apply']
+    assert client.get(route+'/jobs/'+job_id).json()['can_apply']
+    applied = client.post(route+'/jobs/'+job_id+'/apply', json={'confirm_shared_update': True})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()['applied']
+    np.testing.assert_allclose(store.source_clip('known').cameras[0].camera_from_ego,
+        job['result']['optimized_matrix'], atol=1e-10)
+
+
+def test_application_still_requires_supported_coordinate_mapping():
+    from omnilabel.lane_calibration import LaneCalibrationManager
+    job = {'status': 'completed', 'result': {'usable': False}, 'sensor_lidar_to_ego': np.eye(4).tolist(),
+           'request': {'mode': 'multi', 'pose_mode': 'auto'}}
+    assert LaneCalibrationManager.application_status(deepcopy(job))['can_apply']
+    for changed in ({'request': {'mode': 'single'}}, {'request': {'pose_mode': 'provided'}},
+                    {'sensor_lidar_to_ego': None}, {'discarded': True}, {'status': 'failed'}):
+        assert not LaneCalibrationManager.application_status({**job, **changed})['can_apply']
