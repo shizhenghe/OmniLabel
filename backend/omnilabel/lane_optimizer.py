@@ -2,7 +2,9 @@
 
 All points supplied here are world-space ground truth. Each observation has an
 explicit world_from_lidar pose; one shared camera_from_lidar is optimized using
-T0 @ exp(xi^). Image polylines are independent measured raw-image pixels.
+T0 @ exp(xi^). Image constraints are frozen raw-image pixels, measured directly
+or recovered from explicitly selected image-derived world lines and a saved
+reference projection. The reference is never transformed by the candidate.
 """
 from __future__ import annotations
 
@@ -289,5 +291,5 @@ def write_outputs(problem: dict, result: dict, directory: Path):
                     if valid[i] and valid[i+1]: draw.line([tuple(uv[i]), tuple(uv[i+1])], fill="#fb923c" if name == "before" else "#38bdf8", width=3)
             rows = [r for r in result[name]["pairs"] if r["frame_id"] == frame_id]
             draw.rectangle((0, 0, image.width, 26), fill="black")
-            draw.text((7, 7), f'{name}: mean {np.mean([r["mean_px"] for r in rows]):.2f}px | GT green | projection {"orange" if name == "before" else "cyan"}', fill="white")
+            draw.text((7, 7), f'{name}: mean {np.mean([r["mean_px"] for r in rows]):.2f}px | image reference green | projection {"orange" if name == "before" else "cyan"}', fill="white")
             image.save(output / f"{frame_id}-{name}.png")

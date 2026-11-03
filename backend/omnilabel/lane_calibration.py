@@ -17,28 +17,59 @@ from pydantic import Field, field_validator, model_validator
 from scipy.spatial.transform import Rotation, Slerp
 
 from .calibration import CalibrationUpdate, _revision, save_calibration
-from .lane_optimizer import OptimizationCancelled, optimize, prepare, statistics, write_outputs
-from .models import Identifier, Model, rigid_transform
-from .projection_calibration import _fingerprint, _image_path
+from .lane_optimizer import OptimizationCancelled, optimize, prepare, resample, statistics, write_outputs
+from .models import Camera, Identifier, Model, rigid_transform
+from .projection_calibration import _base_matrix, _fingerprint, _image_path, project_camera_points
 from .scene import get_scene, registered_poses
 from .storage import ConflictError, Store, atomic_json, safe_id
 
 
-class LanePair(Model):
+class LanePairFields(Model):
     id: Identifier
     frame_id: Identifier
     lane_id: Identifier
-    image_points: list[tuple[float, float]] = Field(min_length=2, max_length=512)
-    image_size: tuple[int, int]
     world_range: tuple[float, float] = (0, 1)
+    image_world_range: tuple[float, float] = (0, 1)
     split: Literal["train", "validation"] = "train"
     weight: float = Field(default=1, gt=0, le=100)
 
-    @field_validator("world_range")
+    @field_validator("world_range", "image_world_range")
     @classmethod
     def interval(cls, value):
         if not 0 <= value[0] < value[1] <= 1: raise ValueError("三维取样范围必须在 0–1 内且起点小于终点。")
         return value
+
+
+class ImageLaneReference(Model):
+    frame_id: Identifier
+    camera: Camera
+    camera_from_primary: list[list[float]]
+    world_from_primary: list[list[float]]
+    source_line_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    world_range: tuple[float, float] = (0, 1)
+    _matrices = field_validator("camera_from_primary", "world_from_primary")(rigid_transform)
+
+
+class LanePair(LanePairFields):
+    image_points: list[tuple[float, float]] = Field(min_length=2, max_length=512)
+    image_size: tuple[int, int]
+    image_lane_id: Identifier | None = None
+    image_reference: ImageLaneReference | None = None
+
+    @model_validator(mode="after")
+    def projected_source(self):
+        if self.image_lane_id is not None:
+            if self.image_lane_id == self.lane_id: raise ValueError("真值线与图像投影线不能选择同一条线。")
+            if self.image_reference is None: raise ValueError("请使用 /pairs/from-lanes 保存两条点云线，生成固定图像约束。")
+            if self.image_reference.frame_id != self.frame_id: raise ValueError("图像投影线的参考帧与配对不一致。")
+            if self.image_reference.world_range != self.image_world_range: raise ValueError("固定图像线的取样范围已变化，请重新选择配对。")
+        elif self.image_reference is not None: raise ValueError("图像线参考记录缺少 image_lane_id。")
+        return self
+
+
+class ProjectedLaneSelection(LanePairFields):
+    revision: int = Field(ge=0)
+    image_lane_id: Identifier
 
 
 class PairUpdate(Model):
@@ -49,6 +80,8 @@ class PairUpdate(Model):
     def identities(self):
         if len({p.id for p in self.pairs}) != len(self.pairs): raise ValueError("配对 ID 重复。")
         if len({(p.frame_id, p.lane_id) for p in self.pairs}) != len(self.pairs): raise ValueError("同帧同一条车道线只能配对一次。")
+        image_ids = [(p.frame_id, p.image_lane_id) for p in self.pairs if p.image_lane_id is not None]
+        if len(set(image_ids)) != len(image_ids): raise ValueError("同帧同一条图像投影线不能重复配给不同真值线。")
         roles = {}
         for pair in self.pairs:
             if pair.frame_id in roles and roles[pair.frame_id] != pair.split:
@@ -162,6 +195,19 @@ def resolve_geometry(store, clip, camera, frames, request: OptimizeRequest):
     return poses, initial, mounts[0] if known_mount else None
 
 
+def _line_fingerprint(lane):
+    return _fingerprint({"id": lane.id, "points": lane.points, "closed": lane.closed})
+
+
+def _validate_image_lane(pair, lanes, camera):
+    if pair.image_lane_id is None: return  # Previously saved measured image polylines remain usable.
+    lane = lanes.get(pair.image_lane_id)
+    if lane is None: raise ValueError("图像投影线已删除或不再是开放折线，请重新选择配对。")
+    if pair.image_reference.camera.id != camera.id: raise ValueError("图像投影线参考相机与当前相机不一致。")
+    if pair.image_reference.source_line_fingerprint != _line_fingerprint(lane):
+        raise ConflictError("图像投影线的三维几何已修改，请删除旧配对后重新选择；不会自动移动固定图像约束。")
+
+
 def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, request: OptimizeRequest, *, validate_split=True):
     from PIL import Image
     if pairing["revision"] != request.pairing_revision: raise ConflictError("配对已变化，请重新读取。")
@@ -190,6 +236,7 @@ def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, req
     observations, image_tokens = [], []
     for pair in pairs:
         if pair.lane_id not in lanes: raise ValueError(f"未找到世界坐标车道线 {pair.lane_id}；请先保存三维标注。")
+        _validate_image_lane(pair, lanes, camera)
         if pair.image_size != (camera.width, camera.height): raise ValueError("二维线分辨率与原始相机不一致，禁止猜测缩放或裁剪。")
         pixels = np.asarray(pair.image_points)
         if (pixels < 0).any() or (pixels[:, 0] >= camera.width).any() or (pixels[:, 1] >= camera.height).any():
@@ -248,16 +295,63 @@ class LaneCalibrationManager:
             if self.active: raise ConflictError("优化运行中，请先取消或等待完成再修改配对。")
             if state["pairing"]["revision"] != value.revision: raise ConflictError("配对版本冲突，请重新读取。")
             clip = self.store.source_clip(clip_id); camera = next(c for c in clip.cameras if c.id == camera_id)
-            lanes = {v["id"] for v in state["lanes"]}; frames = {f.id for f in clip.frames}
+            lanes = {v.id: v for v in get_scene(self.store, clip).vectors if not v.closed}; frames = {f.id for f in clip.frames}
+            previous = {p["id"]: LanePair.model_validate(p) for p in state["pairing"]["pairs"]}
             for pair in value.pairs:
                 if pair.frame_id not in frames or pair.lane_id not in lanes: raise ValueError("配对必须引用已保存的帧与世界坐标三维线。")
+                _validate_image_lane(pair, lanes, camera)
+                old = previous.get(pair.id)
+                if old and old.image_lane_id is not None and any(getattr(old, name) != getattr(pair, name)
+                        for name in ("image_points", "image_lane_id", "image_reference", "image_world_range")):
+                    raise ValueError("已保存的图像约束保持固定；如需更换参考，请删除旧配对并重新选择两条线。")
                 if pair.image_size != (camera.width, camera.height): raise ValueError("配对必须使用原图分辨率。")
                 pixels = np.asarray(pair.image_points)
                 if (pixels < 0).any() or (pixels[:, 0] >= camera.width).any() or (pixels[:, 1] >= camera.height).any(): raise ValueError("图像线超出原图。")
-                from .lane_optimizer import resample
                 resample(pair.image_points, 10)
             document = {"revision": value.revision + 1, "pairs": [p.model_dump(mode="json") for p in value.pairs]}
             atomic_json(self.directory(clip_id, camera_id) / "pairs.json", document); return document
+
+    def pair_from_lanes(self, clip_id, camera_id, value: ProjectedLaneSelection):
+        """Freeze a selected image-derived world lane in its reference image.
+
+        Both IDs are explicit user choices. Geometry has no camera provenance,
+        so the current frame/camera is the declared source. Its effective saved
+        projection (including frame overrides) is captured once, never optimized.
+        """
+        from PIL import Image
+        with self.store.lock:
+            current = self.pairing(clip_id, camera_id)
+            if current["revision"] != value.revision: raise ConflictError("配对版本冲突，请重新读取。")
+            if self.active: raise ConflictError("优化运行中，请先取消或等待完成再修改配对。")
+            clip = self.store.clip(clip_id)
+            frame = next((f for f in clip.frames if f.id == value.frame_id), None)
+            camera = next((c for c in clip.cameras if c.id == camera_id), None)
+            if frame is None or camera is None: raise ValueError("请选择存在的帧和相机。")
+            lanes = {v.id: v for v in get_scene(self.store, clip).vectors if not v.closed}
+            if value.lane_id not in lanes or value.image_lane_id not in lanes:
+                raise ValueError("两次选择都必须引用已保存的世界坐标开放车道线。")
+            if value.lane_id == value.image_lane_id: raise ValueError("真值线与图像投影线不能选择同一条线。")
+            with Image.open(_image_path(self.store, frame, camera.id)) as image:
+                if image.size != (camera.width, camera.height): raise ValueError("实际图像分辨率与内参声明不一致。")
+            lane = lanes[value.image_lane_id]
+            pose = registered_poses(self.store, clip)[frame.id]
+            matrix = np.asarray(_base_matrix(frame, camera))
+            world = resample(lane.points, 512, *value.image_world_range)
+            primary = (world - pose[:3, 3]) @ pose[:3, :3]
+            pixels, depth = project_camera_points(primary, matrix, np.asarray(camera.intrinsics), np.asarray(camera.distortion))
+            visible = (np.isfinite(pixels).all(1) & (depth > .05) & (pixels[:, 0] >= 0) & (pixels[:, 0] < camera.width)
+                       & (pixels[:, 1] >= 0) & (pixels[:, 1] < camera.height))
+            indices = np.flatnonzero(visible)
+            if len(indices) < 2: raise ValueError("图像投影线在当前帧/相机中没有足够的可见线段，请检查来源和取样范围。")
+            if np.any(np.diff(indices) != 1): raise ValueError("图像投影线有不连续的可见区间，请缩小其取样范围，避免跨过不可见区域连线。")
+            reference = ImageLaneReference(frame_id=frame.id, camera=camera,
+                world_from_primary=pose.tolist(), camera_from_primary=matrix.tolist(),
+                world_range=value.image_world_range, source_line_fingerprint=_line_fingerprint(lane))
+            pair = LanePair(**value.model_dump(exclude={"revision"}), image_points=pixels[visible].tolist(),
+                            image_size=(camera.width, camera.height), image_reference=reference)
+            pairs = [LanePair.model_validate(p) for p in current["pairs"]]
+            pairs = [p.model_copy(update={"split": value.split}) if p.frame_id == value.frame_id else p for p in pairs]
+            return self.save_pairs(clip_id, camera_id, PairUpdate(revision=value.revision, pairs=[*pairs, pair]))
 
     def preview(self, clip_id, camera_id, request: OptimizeRequest):
         with self.store.lock:
@@ -367,6 +461,10 @@ def mount_lane_calibration_routes(app: FastAPI, manager: LaneCalibrationManager)
 
     @app.put(route + "/pairs")
     def pairs(clip_id: str, camera_id: str, value: PairUpdate): return respond(manager.save_pairs, clip_id, camera_id, value)
+
+    @app.post(route + "/pairs/from-lanes")
+    def pair_from_lanes(clip_id: str, camera_id: str, value: ProjectedLaneSelection):
+        return respond(manager.pair_from_lanes, clip_id, camera_id, value)
 
     @app.post(route + "/preview")
     def preview(clip_id: str, camera_id: str, value: OptimizeRequest): return respond(manager.preview, clip_id, camera_id, value)

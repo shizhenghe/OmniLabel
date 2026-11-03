@@ -7,7 +7,8 @@ import './LaneCalibrationPanel.css';
 export interface LaneCalibrationOverlay {label: string; color: string; points: ([number, number] | null)[];}
 interface Pair {
   id: string; frame_id: string; lane_id: string; image_points: number[][]; image_size: number[];
-  world_range: number[]; split: 'train' | 'validation'; weight: number;
+  world_range: number[]; image_world_range?: number[]; image_lane_id?: string | null;
+  split: 'train' | 'validation'; weight: number;
 }
 interface Pairing {revision: number; pairs: Pair[];}
 interface Metrics {mean_px: number; rmse_px: number; median_px: number; p95_px: number; frames: number; samples: number;}
@@ -33,8 +34,6 @@ interface State {
 }
 interface Props {
   clipId: string; camera: Camera; frame: Frame; selectedId: string | null; disabled: boolean;
-  drawing: boolean; pixels: [number, number][];
-  onDrawing: (active: boolean) => void; onPixels: (pixels: [number, number][]) => void;
   onSelectLane: (id: string) => void; onOverlays: (lines: LaneCalibrationOverlay[]) => void;
   onBusy: (busy: boolean) => void; onApplied: () => Promise<void>; onClose: () => void;
 }
@@ -49,7 +48,9 @@ export function LaneCalibrationPanel(props: Props) {
   const [before, setBefore] = useState<Statistics | null>(null);
   const [showResult, setShowResult] = useState(true);
   const [chosenLane, setChosenLane] = useState('');
+  const [chosenImageLane, setChosenImageLane] = useState('');
   const [range, setRange] = useState([0, 100]);
+  const [imageRange, setImageRange] = useState([0, 100]);
   const [role, setRole] = useState<'train' | 'validation'>('train');
   const [mode, setMode] = useState('multi');
   const [poseMode, setPoseMode] = useState('auto');
@@ -76,10 +77,10 @@ export function LaneCalibrationPanel(props: Props) {
     return () => {alive = false; controller.abort();};
   }, [endpoint]);
   useEffect(() => {latest.current.onBusy(loading || Boolean(operation));}, [loading, operation]);
-  useEffect(() => () => {latest.current.onBusy(false); latest.current.onDrawing(false); latest.current.onPixels([]); latest.current.onOverlays([]);}, []);
+  useEffect(() => () => {latest.current.onBusy(false); latest.current.onOverlays([]);}, []);
   useEffect(() => {
-    setChosenLane(''); setRole(pairing.pairs.find(pair => pair.frame_id === props.frame.id)?.split ?? 'train');
-    latest.current.onDrawing(false); latest.current.onPixels([]);
+    setChosenLane(''); setChosenImageLane(''); setRange([0, 100]); setImageRange([0, 100]);
+    setRole(pairing.pairs.find(pair => pair.frame_id === props.frame.id)?.split ?? 'train');
   }, [props.frame.id]);
   useEffect(() => {
     let alive = true; let timer: ReturnType<typeof setTimeout>;
@@ -98,7 +99,7 @@ export function LaneCalibrationPanel(props: Props) {
     const lines: LaneCalibrationOverlay[] = [];
     for (const pair of pairing.pairs.filter(p => p.frame_id === props.frame.id)) {
       const index = pairing.pairs.indexOf(pair) + 1;
-      lines.push({label: `${index} 人工图像线`, color: '#4ade80', points: pair.image_points as [number, number][]});
+      lines.push({label: `${index} 固定图像线${pair.image_lane_id ? ` ${pair.image_lane_id}` : ''}`, color: '#4ade80', points: pair.image_points as [number, number][]});
       const a = (result?.before ?? before)?.overlays.find(p => p.id === pair.id);
       const b = result?.after.overlays.find(p => p.id === pair.id);
       if (a) lines.push({label: `${index} 优化前`, color: '#fb923c', points: a.pixels});
@@ -116,11 +117,16 @@ export function LaneCalibrationPanel(props: Props) {
     finally {setOperation('');}
   };
   const addPair = async () => {
-    if (!chosenLane || props.pixels.length < 2 || locked || active) return;
-    const pairs = [...pairing.pairs.map(p => p.frame_id === props.frame.id ? {...p, split: role} : p), {id: annotationId('lane-pair'), frame_id: props.frame.id, lane_id: chosenLane,
-      image_points: props.pixels, image_size: [props.camera.width, props.camera.height],
-      world_range: range.map(v => v / 100), split: role, weight: 1}];
-    if (await persist(pairs)) {props.onDrawing(false); props.onPixels([]); setChosenLane('');}
+    if (!chosenLane || !chosenImageLane || chosenLane === chosenImageLane || locked || active) return;
+    setOperation('pairs'); setError('');
+    try {
+      const value = await jsonRequest<Pairing>(`${endpoint}/pairs/from-lanes`, {
+        revision: pairing.revision, id: annotationId('lane-pair'), frame_id: props.frame.id,
+        lane_id: chosenLane, image_lane_id: chosenImageLane, world_range: range.map(v => v / 100),
+        image_world_range: imageRange.map(v => v / 100), split: role, weight: 1,
+      });
+      setPairing(value); setBefore(null); setShowResult(false); setChosenLane(''); setChosenImageLane('');
+    } catch (cause) {setError(errorText(cause));} finally {setOperation('');}
   };
   const settings = () => {
     const extra = advanced.trim() ? JSON.parse(advanced) as Record<string, unknown> : {};
@@ -129,7 +135,7 @@ export function LaneCalibrationPanel(props: Props) {
       config: {...(extra.config as Record<string, unknown> ?? {}), adam_iterations: iterations}};
   };
   const calculate = async (preview: boolean) => {
-    setOperation(preview ? 'preview' : 'start'); setError(''); props.onDrawing(false);
+    setOperation(preview ? 'preview' : 'start'); setError('');
     try {
       if (preview) {
         const value = await jsonRequest<{statistics: Statistics}>(`${endpoint}/preview`, settings());
@@ -153,23 +159,26 @@ export function LaneCalibrationPanel(props: Props) {
   return <div className="lane-calibration-panel" data-testid="lane-calibration-panel" role="region" aria-label="车道线外参优化">
     <div className="lane-calibration-heading"><h2>车道线外参优化</h2><button className="icon-button" aria-label="关闭车道线优化" disabled={Boolean(operation)} onClick={props.onClose}>×</button></div>
     <p>{props.camera.name} · 当前帧 <strong>{props.frame.id}</strong></p>
-    <p>先选择世界坐标三维真值线，再沿原图中的真实车道线点选。按添加顺序建立明确配对，不自动猜测车道线身份。此模式多帧共享一个外参；真实的逐帧相对震动仍需逐帧校准。</p>
+    <p>在点云中先选三维真值线，再选已由图像投到点云的车道线。两次选择按添加顺序配对，无需重新描绘图像。此模式多帧共享一个外参；真实的逐帧相对震动仍需逐帧校准。</p>
     {loading ? <p role="status">正在读取世界车道线与已保存配对…</p> : state && <>
       <section><h3>1. 选择三维真值线</h3><p>在点云中点击已保存的线，或使用下方 ID 列表选择并在点云中确认高亮，再点击按钮。</p>
-        <button className="button subtle full-width" aria-label="使用选中三维车道线" disabled={locked || active || !selected} onClick={() => {setChosenLane(selected!.id); props.onPixels([]); props.onDrawing(false);}}>使用选中三维线：{selected?.id ?? '尚未选中'}</button>
-        <label className="field-label">或按 ID 选择<select aria-label="优化三维车道线" value={chosenLane} disabled={locked || active} onChange={e => {setChosenLane(e.target.value); props.onSelectLane(e.target.value); props.onPixels([]); props.onDrawing(false);}}>
+        <button className="button subtle full-width" aria-label="使用选中三维车道线" disabled={locked || active || !selected} onClick={() => {setChosenLane(selected!.id); if (selected!.id === chosenImageLane) setChosenImageLane('');}}>使用选中三维线：{selected?.id ?? '尚未选中'}</button>
+        <label className="field-label">已选真值线 / 按 ID 选择<select aria-label="优化三维车道线" value={chosenLane} disabled={locked || active} onChange={e => {setChosenLane(e.target.value); props.onSelectLane(e.target.value); if (e.target.value === chosenImageLane) setChosenImageLane('');}}>
           <option value="">请选择已保存的三维线</option>{state.lanes.map(lane => <option key={lane.id} value={lane.id}>{lane.id} · {lane.label} · {lane.points.length} 顶点</option>)}</select></label>
         <div className="lane-calibration-range">三维线取样范围（%）{range.map((value, axis) => <input key={axis} aria-label={axis ? '三维线范围终点' : '三维线范围起点'} type="number" min="0" max="100" value={value} disabled={locked || active} onChange={e => setRange(range.map((v, i) => i === axis ? Number(e.target.value) : v))}/>)}</div>
       </section>
-      <section><h3>2. 点选对应图像线</h3><p>至少两个顶点；沿图像中的实测车道线绘制，不要描摹橙色投影线。界面缩放自动转换为原始像素坐标。</p>
-        <button className={`button subtle full-width${props.drawing ? ' active' : ''}`} aria-label="绘制优化图像车道线" disabled={locked || active || !chosenLane || !props.frame.images[props.camera.id]} onClick={() => {props.onPixels([]); props.onDrawing(true);}}>开始点选图像线</button>
-        <p role="status">{props.drawing ? '请在左侧当前相机图像依次点击车道线顶点。' : ''} 已选 {props.pixels.length} 个图像点</p>
-        <div className="lane-calibration-actions"><button className="button ghost" disabled={!props.pixels.length || locked} onClick={() => props.onPixels(props.pixels.slice(0, -1))}>撤销图像点</button><button className="button ghost" disabled={locked} onClick={() => {props.onDrawing(false); props.onPixels([]);}}>取消绘制</button></div>
+      <section><h3>2. 选择对应图像投影线</h3><p>在点云中点击另一条已保存的图像投影线，再点击下方按钮；也可按 ID 选择。请选择来自当前帧 {props.frame.id}、当前相机 {props.camera.name} 的线。</p>
+        <button className="button subtle full-width" aria-label="使用选中图像投影车道线" disabled={locked || active || !chosenLane || !selected || selected.id === chosenLane} onClick={() => setChosenImageLane(selected!.id)}>使用选中图像投影线：{selected?.id ?? '尚未选中'}</button>
+        <label className="field-label">已选图像投影线 / 按 ID 选择<select aria-label="优化图像投影车道线" value={chosenImageLane} disabled={locked || active || !chosenLane} onChange={e => {setChosenImageLane(e.target.value); props.onSelectLane(e.target.value);}}>
+          <option value="">请选择点云中的图像投影线</option>{state.lanes.filter(lane => lane.id !== chosenLane).map(lane => <option key={lane.id} value={lane.id}>{lane.id} · {lane.label} · {lane.points.length} 顶点</option>)}</select></label>
+        <div className="lane-calibration-range">图像投影线取样范围（%）{imageRange.map((value, axis) => <input key={axis} aria-label={axis ? '图像投影线范围终点' : '图像投影线范围起点'} type="number" min="0" max="100" value={value} disabled={locked || active} onChange={e => setImageRange(imageRange.map((v, i) => i === axis ? Number(e.target.value) : v))}/>)}</div>
+        <p>保存配对时按当前已保存的投影参数固定图像位置，绿色叠加可供核对。若当初使用了其他帧或标定，请先恢复对应参考。</p>
+        <p role="status">{chosenLane && chosenImageLane ? `待添加：${chosenLane} ↔ ${chosenImageLane}` : '请选择两条不同的线。'}</p>
         <label className="field-label">本帧用途<select aria-label="优化当前帧用途" value={role} disabled={locked || active} onChange={e => setRole(e.target.value as typeof role)}><option value="train">训练帧</option><option value="validation">独立验证帧</option></select></label>
-        <button className="button primary full-width" aria-label="添加车道线配对" disabled={locked || active || !chosenLane || props.pixels.length < 2} onClick={() => void addPair()}>添加配对 #{pairing.pairs.length + 1}</button>
+        <button className="button primary full-width" aria-label="添加车道线配对" disabled={locked || active || !chosenLane || !chosenImageLane || chosenLane === chosenImageLane || !props.frame.images[props.camera.id]} onClick={() => void addPair()}>添加配对 #{pairing.pairs.length + 1}</button>
       </section>
       <section><h3>已保存配对（{pairing.pairs.length}）</h3><p>同一帧的所有线共用训练/验证用途，防止验证泄漏。正式优化至少需要 2 个训练帧和 1 个验证帧。</p>
-        <ol className="lane-calibration-pairs">{pairing.pairs.map((pair, index) => <li key={pair.id}><strong>#{index + 1} {pair.frame_id} / {pair.lane_id}</strong>
+        <ol className="lane-calibration-pairs">{pairing.pairs.map((pair, index) => <li key={pair.id}><strong>#{index + 1} {pair.frame_id} / {pair.lane_id} ↔ {pair.image_lane_id ?? '旧版图像线'}</strong>
           <select aria-label={`配对${index + 1}用途`} value={pair.split} disabled={locked || active} onChange={e => void persist(pairing.pairs.map(p => p.frame_id === pair.frame_id ? {...p, split: e.target.value as Pair['split']} : p))}><option value="train">训练</option><option value="validation">验证</option></select>
           <button aria-label={`上移配对${index + 1}`} disabled={locked || active || index === 0} onClick={() => {const next = [...pairing.pairs]; [next[index-1], next[index]] = [next[index], next[index-1]]; void persist(next);}}>↑</button>
           <button aria-label={`删除配对${index + 1}`} disabled={locked || active} onClick={() => void persist(pairing.pairs.filter(p => p.id !== pair.id))}>×</button>
@@ -190,7 +199,7 @@ export function LaneCalibrationPanel(props: Props) {
         <label className="field-label">Adam 迭代次数<input type="number" aria-label="车道线优化迭代次数" min="1" max="1000" value={iterations} disabled={locked || active} onChange={e => setIterations(Number(e.target.value))}/></label>
         <button className="button subtle full-width" aria-label="预览车道线投影误差" disabled={locked || active || !pairing.pairs.length || !confirmed || !synchronized} onClick={() => void calculate(true)}>预览当前投影与误差</button>
         <button className="button primary full-width" aria-label="运行车道线外参优化" disabled={locked || active || !state.runtime.available || !pairing.pairs.length || !confirmed || !synchronized} onClick={() => void calculate(false)}>{operation === 'start' ? '正在提交…' : '运行共享外参优化'}</button>
-        <p className="lane-calibration-legend"><span style={{color:'#4ade80'}}>● 人工图像线</span><span style={{color:'#fb923c'}}>● 优化前</span><span style={{color:'#38bdf8'}}>● 优化后</span></p>
+        <p className="lane-calibration-legend"><span style={{color:'#4ade80'}}>● 固定图像线</span><span style={{color:'#fb923c'}}>● 优化前</span><span style={{color:'#38bdf8'}}>● 优化后</span></p>
       </section>
     </>}
     {job && <section aria-label="车道线优化任务"><h3>任务：{job.status}</h3><p role="status">迭代 {job.iteration} {job.loss === undefined ? '' : `· 损失 ${job.loss.toFixed(4)}`}</p>

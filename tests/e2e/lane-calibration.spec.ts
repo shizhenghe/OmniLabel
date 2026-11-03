@@ -1,54 +1,75 @@
 import {expect, test} from '@playwright/test';
 import {readFile} from 'node:fs/promises';
 import {projectLidarPoint} from '../../src/geometry/cameraProjection';
+import * as THREE from 'three';
 import type {Camera, Frame, Vec3} from '../../src/types';
 
-test('ordered 3D selection and raw-image polyline drive a real preview and debug optimization without changing source extrinsics', async ({page, request}) => {
+test('two point-cloud lane selections drive a frozen image reference and real optimization without redrawing pixels', async ({page, request}) => {
   test.setTimeout(120_000);
   const id = 'lane-calibration-ui';
   const demo = await (await request.get('/api/clips/demo')).json();
   const camera: Camera = demo.cameras.find((c: Camera) => c.id === 'front');
   const identity = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
   const lane: Vec3[] = [[10, -2, -1.6], [22, -2.5, -1.5], [40, -1, -1.3]];
+  const imageLane: Vec3[] = lane.map(p => [p[0], p[1]-1.2, p[2]+.3]);
   const frames = [0, 1].map(index => ({id: `f${index}`, timestamp: index * .1, ego_to_world: identity,
     lidar_to_ego: identity, points: Array.from({length: 400}, (_, n) => [8 + n % 20, -5 + Math.floor(n/20)*.5, -1.6, .5]),
     images: {front: demo.frames[index].images.front}}));
   const imported = await request.post('/api/clips/import', {multipart: {file: {name: `${id}.json`, mimeType: 'application/json',
     buffer: Buffer.from(JSON.stringify({clip: {id, name: id, fps: 10, cameras: [camera], frames},
       scene_annotations: {revision: 0, coordinate_frame: 'world', tracks: [],
-        vectors: [{id: 'world-lane', label: 'lane', points: lane, closed: false}]}}))}}});
+        vectors: [{id: 'world-lane', label: 'lane', points: lane, closed: false},
+          {id: 'image-projected-lane', label: 'image-lane', points: imageLane, closed: false}]}}))}}});
   expect(imported.ok(), await imported.text()).toBe(true);
   const calibrationBefore = await (await request.get(`/api/clips/${id}/calibration`)).json();
   const sceneBefore = await (await request.get(`/api/clips/${id}/scene/annotations`)).json();
   await page.goto(`/?clip=${id}`);
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.locator('.task-button').filter({hasText: '车道线标注'}).click();
   await page.getByLabel('车道线外参优化', {exact: true}).click();
   const panel = page.getByTestId('lane-calibration-panel');
   await expect(panel).toBeVisible();
   await expect(panel.getByLabel('使用选中三维车道线')).toBeDisabled();
-  await panel.getByLabel('优化三维车道线').selectOption('world-lane');
-  await expect(panel.getByLabel('使用选中三维车道线')).toBeEnabled();
+  await expect(panel.getByLabel('绘制优化图像车道线')).toHaveCount(0);
+  await expect(panel.getByLabel('优化图像投影车道线')).toBeDisabled();
+  const cloud = page.getByTestId('point-cloud-view');
+  await expect(cloud).toHaveAttribute('data-annotation-vector-count', '2');
+  await expect(cloud).toHaveAttribute('data-vector-editable', 'false');
+  await expect(cloud.locator('..')).not.toHaveClass(/scene-disabled/);
+  const clickWorld = async (point: Vec3) => {
+    const bounds = (await cloud.locator('canvas[aria-label="三维点云标注视图"]').boundingBox())!;
+    const view = new THREE.PerspectiveCamera(47, bounds.width/bounds.height, .05, 4000);
+    const center = new THREE.Vector3(17.5, -.25, -1.6);
+    view.up.set(0, 0, 1); view.position.copy(center).add(new THREE.Vector3(-.01, 0, 30));
+    view.lookAt(center); view.updateMatrixWorld();
+    const pixel = new THREE.Vector3(...point).project(view);
+    await page.mouse.click(bounds.x + (pixel.x+1)*bounds.width/2, bounds.y + (1-pixel.y)*bounds.height/2);
+  };
+  await clickWorld([22, -2.5, -1.5]);
+  await expect(panel.getByLabel('使用选中三维车道线')).toContainText('world-lane');
   await panel.getByLabel('使用选中三维车道线').click();
-  await panel.getByLabel('绘制优化图像车道线').click();
+  await expect(panel.getByLabel('优化三维车道线')).toHaveValue('world-lane');
+  await expect(panel.getByLabel('使用选中图像投影车道线')).toBeDisabled();
+  await clickWorld([22, -3.7, -1.2]);
+  await expect(panel.getByLabel('使用选中图像投影车道线')).toContainText('image-projected-lane');
+  await panel.getByLabel('使用选中图像投影车道线').click();
+  await expect(panel.getByLabel('优化图像投影车道线')).toHaveValue('image-projected-lane');
+  await expect(panel).toContainText('待添加：world-lane ↔ image-projected-lane');
   const image = page.getByTestId('camera-front');
   await expect(image).toHaveAttribute('data-image-state', 'ready');
-  const bounds = await image.boundingBox(); expect(bounds).not.toBeNull();
-  const scale = Math.min(bounds!.width/camera.width, bounds!.height/camera.height);
-  for (const point of lane) {
-    const pixel = projectLidarPoint(point, camera, {...frames[0], point_count: 400} as Frame)!;
-    await page.mouse.click(bounds!.x + (bounds!.width-camera.width*scale)/2 + (pixel[0]+6)*scale,
-      bounds!.y + (bounds!.height-camera.height*scale)/2 + (pixel[1]-4)*scale);
-  }
-  await expect(image).toHaveAttribute('data-lane-calibration-draft-count', '3');
   await panel.getByLabel('添加车道线配对').click();
-  await expect(panel).toContainText('#1 f0 / world-lane');
-  await expect(image).toHaveAttribute('data-lane-calibration-draft-count', '0');
+  await expect(panel).toContainText('#1 f0 / world-lane ↔ image-projected-lane');
   const endpoint = `/api/clips/${id}/lane-calibration/front`;
   const state = await (await request.get(endpoint)).json();
   expect(state.pairing.pairs).toHaveLength(1);
-  expect(state.pairing.pairs[0].image_points).toHaveLength(3);
+  expect(state.pairing.pairs[0].image_points.length).toBeGreaterThan(20);
+  expect(state.pairing.pairs[0].image_lane_id).toBe('image-projected-lane');
+  expect(state.pairing.pairs[0].image_reference.frame_id).toBe('f0');
+  expect(state.pairing.pairs[0].image_reference.camera.id).toBe('front');
   expect(state.pairing.pairs[0].image_size).toEqual([camera.width, camera.height]);
-  expect(state.pairing.pairs[0].image_points[0][0]).toBeGreaterThan(bounds!.width);
+  const expected = projectLidarPoint(imageLane[0], camera, {...frames[0], point_count: 400} as Frame)!;
+  expect(state.pairing.pairs[0].image_points[0][0]).toBeCloseTo(expected[0], 5);
+  expect(state.pairing.pairs[0].image_points[0][1]).toBeCloseTo(expected[1], 5);
   await panel.getByLabel('确认车道线坐标约定').check();
   await panel.getByLabel('确认图像Pose同步').check();
   await panel.getByLabel('预览车道线投影误差').click();
@@ -76,6 +97,8 @@ test('ordered 3D selection and raw-image polyline drive a real preview and debug
   expect(await (await request.get(`/api/clips/${id}/scene/annotations`)).json()).toEqual(sceneBefore);
   await page.getByLabel('下一帧', {exact: true}).click();
   await expect(panel).toContainText('当前帧 f1');
+  await expect(panel.getByLabel('优化三维车道线')).toHaveValue('');
+  await expect(panel.getByLabel('优化图像投影车道线')).toHaveValue('');
   await expect(image).toHaveAttribute('data-lane-calibration-overlay-count', '0');
   await page.reload();
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
