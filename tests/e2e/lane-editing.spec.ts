@@ -225,3 +225,50 @@ for (const space of ['world', 'lidar'] as const) {
     expect((await (await request.get(path)).json()).vectors[0].label).toBe('lane-corrected');
   });
 }
+
+for (const space of ['world', 'lidar'] as const) {
+  test(`BEV pan and zoom keep equal XY lane vertices aligned across heights in ${space}`, async ({page, request}) => {
+    const id = `zz-bev-pan-${space}`;
+    const elevated: Vector = {id: 'vertical-check', label: 'lane', closed: false,
+      points: [[15, -1, -1.7], [15, -1, 3.3], [20, -1, -1.7]]};
+    const paths = await importLaneFixture(request, id, [500000, 3500000, 140], [elevated]);
+    await openLaneFixture(page, id, space);
+    const cloud = page.getByTestId('point-cloud-view');
+    await expect(cloud).toHaveAttribute('data-projection-mode', 'orthographic');
+    await page.locator('.object-row').first().click();
+    const center = async (index: number) => {
+      const box = await page.getByTestId(`vector-vertex-${index}`).boundingBox();
+      if (!box) throw new Error('Missing vertex handle');
+      return [box.x + box.width/2, box.y + box.height/2];
+    };
+    const separation = async () => {
+      const [a, b] = await Promise.all([center(0), center(1)]);
+      return Math.hypot(a[0]-b[0], a[1]-b[1]);
+    };
+    await expect.poll(separation).toBeLessThan(.05);
+    const original = await center(0);
+    const path = space === 'world' ? paths.scenePath : paths.framePath;
+    const saved = await (await request.get(path)).json();
+    const canvas = cloud.locator('canvas');
+    const image = await canvas.screenshot();
+    const bounds = (await canvas.boundingBox())!;
+    await page.mouse.move(bounds.x+bounds.width*.25, bounds.y+bounds.height*.25);
+    await page.mouse.down({button: 'right'});
+    await page.mouse.move(bounds.x+bounds.width*.25+65, bounds.y+bounds.height*.25+35, {steps: 10});
+    await page.mouse.up({button: 'right'});
+    await expect.poll(async () => {const p = await center(0); return Math.hypot(p[0]-original[0], p[1]-original[1]);}).toBeGreaterThan(30);
+    await expect.poll(separation).toBeLessThan(.05);
+    expect(await canvas.screenshot()).not.toEqual(image);
+    await page.mouse.wheel(0, -100);
+    await expect.poll(separation).toBeLessThan(.05);
+    await page.setViewportSize({width: 1500, height: 1000});
+    await expect.poll(separation).toBeLessThan(.05);
+    await page.getByRole('button', {name: '透视 3D', exact: true}).click();
+    await expect(cloud).toHaveAttribute('data-projection-mode', 'perspective');
+    await expect.poll(separation).toBeGreaterThan(1);
+    await page.getByRole('button', {name: '俯视 BEV', exact: true}).click();
+    await expect.poll(separation).toBeLessThan(.05);
+    await expect(page.getByLabel('保存标注', {exact: true})).toBeDisabled();
+    expect(await (await request.get(path)).json()).toEqual(saved);
+  });
+}

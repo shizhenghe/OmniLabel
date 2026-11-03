@@ -147,7 +147,8 @@ function boxMesh(box: Box, selected: boolean, origin: Vec3) {
 interface Runtime {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
-  camera: THREE.PerspectiveCamera;
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+  invalidate: () => void;
   controls: OrbitControls;
   pointsGroup: THREE.Group;
   annotationsGroup: THREE.Group;
@@ -167,6 +168,7 @@ export function PointCloudView(props: PointCloudViewProps) {
   const [error, setError] = useState('');
   const [cursor, setCursor] = useState('');
   const [ready, setReady] = useState(false);
+  const [, setCameraVersion] = useState(0);
   const pointerStart = useRef<[number, number] | null>(null);
   const origin = useMemo<Vec3>(() => {
     if (!props.binaryPoints) return renderOriginForPoints(props.frame?.points ?? []);
@@ -238,14 +240,19 @@ export function PointCloudView(props: PointCloudViewProps) {
     const trajectoryGroup = new THREE.Group();
     const calibrationGroup = new THREE.Group();
     scene.add(pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup);
-    const rt: Runtime = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup, cloud: null, grid, needsRender: true };
+    const rt: Runtime = { renderer, scene, camera, controls, pointsGroup, annotationsGroup, overlaysGroup, trajectoryGroup, calibrationGroup, cloud: null, grid, needsRender: true, invalidate: () => {rt.needsRender = true;} };
     runtime.current = rt;
+    controls.addEventListener('change', rt.invalidate);
     const resize = () => {
       const { width, height } = host.getBoundingClientRect();
       if (width <= 0 || height <= 0) return;
       renderer.setSize(width, height, false);
-      camera.aspect = width / height;
-      camera.updateProjectionMatrix();
+      if (rt.camera instanceof THREE.PerspectiveCamera) rt.camera.aspect = width / height;
+      else {
+        const halfHeight = (rt.camera.top - rt.camera.bottom) / 2;
+        rt.camera.left = -halfHeight * width / height; rt.camera.right = halfHeight * width / height;
+      }
+      rt.camera.updateProjectionMatrix();
       rt.needsRender = true;
     };
     const observer = new ResizeObserver(resize);
@@ -254,12 +261,12 @@ export function PointCloudView(props: PointCloudViewProps) {
     let animation = 0;
     const render = () => {
       animation = requestAnimationFrame(render);
-      const cameraChanged = controls.update();
+      const cameraChanged = rt.controls.update();
       // A supplied map can contain millions of points. Repeatedly drawing an
       // unchanged view saturates software GPUs and stalls image-pairing input.
       if (cameraChanged || rt.needsRender) {
         rt.needsRender = false;
-        renderer.render(scene, camera);
+        renderer.render(scene, rt.camera);
       }
     };
     render();
@@ -268,7 +275,8 @@ export function PointCloudView(props: PointCloudViewProps) {
       setReady(false);
       cancelAnimationFrame(animation);
       observer.disconnect();
-      controls.dispose();
+      rt.controls.removeEventListener('change', rt.invalidate);
+      rt.controls.dispose();
       disposeObject(scene);
       renderer.dispose();
       renderer.domElement.remove();
@@ -380,10 +388,16 @@ export function PointCloudView(props: PointCloudViewProps) {
     const center = bounds.getCenter(new THREE.Vector3());
     const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 12);
     rt.controls.target.copy(center);
-    if (props.view === 'top') rt.camera.position.copy(center).add(new THREE.Vector3(-0.01, 0, radius * 2.4));
+    if (props.view === 'top') rt.camera.position.copy(center).add(new THREE.Vector3(0, 0, radius * 2.4));
     else rt.camera.position.copy(center).add(new THREE.Vector3(-1, -1, 0.85).normalize().multiplyScalar(radius * 2.5));
     rt.controls.maxDistance = Math.max(radius * 20, 800);
     rt.camera.far = Math.max(radius * 40, 4000);
+    if (rt.camera instanceof THREE.OrthographicCamera) {
+      const halfHeight = radius * 2.4 * Math.tan(THREE.MathUtils.degToRad(47 / 2));
+      const aspect = rt.renderer.domElement.clientWidth / rt.renderer.domElement.clientHeight;
+      rt.camera.left = -halfHeight * aspect; rt.camera.right = halfHeight * aspect;
+      rt.camera.top = halfHeight; rt.camera.bottom = -halfHeight; rt.camera.zoom = 1;
+    }
     rt.camera.updateProjectionMatrix();
     rt.controls.update();
   }, [ready, props.sceneMode, props.frame?.points, props.binaryPoints, props.cloudBounds, props.autoFitReference, props.view, pointCount, origin]);
@@ -522,16 +536,58 @@ export function PointCloudView(props: PointCloudViewProps) {
     const rt = runtime.current;
     if (!rt) return;
     const target = rt.controls.target;
-    const distance = props.sceneMode ? Math.max(rt.camera.position.distanceTo(target), 20) : 68;
+    let distance = props.sceneMode ? Math.max(rt.camera.position.distanceTo(target), 20) : 68;
+    const aspect = rt.renderer.domElement.clientWidth / rt.renderer.domElement.clientHeight;
+    // Flush damping against the old camera before swapping the control object.
+    const damping = rt.controls.enableDamping;
+    rt.controls.enableDamping = false; rt.controls.update();
+    let cameraChanged = false;
+    const replaceCamera = (camera: Runtime['camera']) => {
+      const previous = rt.controls;
+      previous.removeEventListener('change', rt.invalidate); previous.dispose();
+      rt.camera = camera;
+      // OrbitControls caches the camera's up axis at construction. Recreate
+      // it when changing BEV's up axis, and retain the current pan target.
+      rt.controls = new OrbitControls(camera, rt.renderer.domElement);
+      rt.controls.target.copy(target);
+      rt.controls.dampingFactor = previous.dampingFactor;
+      rt.controls.minDistance = previous.minDistance; rt.controls.maxDistance = previous.maxDistance;
+      rt.controls.minZoom = .02; rt.controls.maxZoom = 100;
+      rt.controls.maxPolarAngle = previous.maxPolarAngle;
+      rt.controls.enableDamping = false;
+      rt.controls.addEventListener('change', rt.invalidate);
+      cameraChanged = true;
+    };
     if (props.view === 'top') {
-      rt.camera.position.set(target.x - 0.01, target.y, target.z + distance);
+      if (!(rt.camera instanceof THREE.OrthographicCamera)) {
+        const halfHeight = distance * Math.tan(THREE.MathUtils.degToRad(rt.camera.fov / 2));
+        const camera = new THREE.OrthographicCamera(-halfHeight * aspect, halfHeight * aspect, halfHeight, -halfHeight, .05, rt.camera.far);
+        camera.up.set(1, 0, 0);
+        replaceCamera(camera);
+      }
+      // Match the previous BEV screen axes without tilting the optical axis.
+      rt.camera.up.set(1, 0, 0);
+      rt.camera.position.set(target.x, target.y, target.z + distance);
       rt.controls.enableRotate = false;
     } else {
+      if (rt.camera instanceof THREE.OrthographicCamera) {
+        distance = (rt.camera.top - rt.camera.bottom) / (2 * rt.camera.zoom * Math.tan(THREE.MathUtils.degToRad(47 / 2)));
+        const camera = new THREE.PerspectiveCamera(47, aspect, .05, rt.camera.far);
+        camera.up.set(0, 0, 1);
+        replaceCamera(camera);
+      }
+      rt.camera.up.set(0, 0, 1);
       if (props.sceneMode) rt.camera.position.copy(target).add(new THREE.Vector3(-41, -36, 35).normalize().multiplyScalar(distance));
       else rt.camera.position.set(target.x - 41, target.y - 36, target.z + 35);
       rt.controls.enableRotate = true;
     }
+    rt.camera.lookAt(target);
+    rt.camera.updateProjectionMatrix();
+    rt.camera.updateMatrixWorld();
     rt.controls.update();
+    rt.controls.enableDamping = damping;
+    rt.needsRender = true;
+    if (cameraChanged) setCameraVersion(value => value + 1);
   }, [ready, props.view, props.sceneMode]);
 
   useEffect(() => {
@@ -548,7 +604,16 @@ export function PointCloudView(props: PointCloudViewProps) {
     const direction = rt.camera.position.clone().sub(rt.controls.target).normalize();
     if (direction.lengthSq() < 1e-6) direction.set(-1, -1, 1).normalize();
     rt.controls.target.copy(center);
-    if (current.view === 'top') rt.camera.position.copy(center).add(new THREE.Vector3(-.001, 0, distance));
+    if (current.view === 'top') {
+      rt.camera.position.copy(center).add(new THREE.Vector3(0, 0, distance));
+      if (rt.camera instanceof THREE.OrthographicCamera) {
+        const halfHeight = distance * Math.tan(THREE.MathUtils.degToRad(47 / 2));
+        const aspect = rt.renderer.domElement.clientWidth / rt.renderer.domElement.clientHeight;
+        rt.camera.left = -halfHeight * aspect; rt.camera.right = halfHeight * aspect;
+        rt.camera.top = halfHeight; rt.camera.bottom = -halfHeight; rt.camera.zoom = 1;
+        rt.camera.updateProjectionMatrix();
+      }
+    }
     else rt.camera.position.copy(center).addScaledVector(direction, distance);
     rt.controls.update();
     rt.controls.enableDamping = damping;
@@ -637,6 +702,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     className={props.className}
     data-testid="point-cloud-view"
     data-coordinate-frame={props.sceneMode ? 'world' : 'lidar'}
+    data-projection-mode={props.view === 'top' ? 'orthographic' : 'perspective'}
     data-cloud-point-count={pointCount}
     data-visible-point-count={visibleCount}
     data-color-mode={colorMode}

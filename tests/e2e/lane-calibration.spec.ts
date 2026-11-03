@@ -20,7 +20,7 @@ test('two point-cloud lane selections drive a frozen image reference and real op
       scene_annotations: {revision: 0, coordinate_frame: 'world', tracks: [],
         vectors: [{id: 'world-lane', label: 'lane', points: lane, closed: false},
           {id: 'image-projected-lane', label: 'image-lane', points: imageLane, closed: false},
-          {id: 'image-projected-lane-2', label: 'image-lane', points: imageLane.map(p => [p[0], p[1]-.4, p[2]]), closed: false}]}}))}}});
+          {id: 'image-projected-lane-2', label: 'image-lane', points: imageLane.map(p => [p[0], p[1]-.8, p[2]]), closed: false}]}}))}}});
   expect(imported.ok(), await imported.text()).toBe(true);
   const calibrationBefore = await (await request.get(`/api/clips/${id}/calibration`)).json();
   const sceneBefore = await (await request.get(`/api/clips/${id}/scene/annotations`)).json();
@@ -39,9 +39,10 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await expect(cloud.locator('..')).not.toHaveClass(/scene-disabled/);
   const clickWorld = async (point: Vec3) => {
     const bounds = (await cloud.locator('canvas[aria-label="三维点云标注视图"]').boundingBox())!;
-    const view = new THREE.PerspectiveCamera(47, bounds.width/bounds.height, .05, 4000);
+    const halfHeight = 28.8 * Math.tan(THREE.MathUtils.degToRad(47 / 2));
+    const view = new THREE.OrthographicCamera(-halfHeight*bounds.width/bounds.height, halfHeight*bounds.width/bounds.height, halfHeight, -halfHeight, .05, 4000);
     const center = new THREE.Vector3(17.5, -.25, -1.6);
-    view.up.set(0, 0, 1); view.position.copy(center).add(new THREE.Vector3(-.01, 0, 30));
+    view.up.set(1, 0, 0); view.position.copy(center).add(new THREE.Vector3(0, 0, 28.8));
     view.lookAt(center); view.updateMatrixWorld();
     const pixel = new THREE.Vector3(...point).project(view);
     await page.mouse.click(bounds.x + (pixel.x+1)*bounds.width/2, bounds.y + (1-pixel.y)*bounds.height/2);
