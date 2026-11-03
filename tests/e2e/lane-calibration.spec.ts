@@ -19,7 +19,8 @@ test('two point-cloud lane selections drive a frozen image reference and real op
     buffer: Buffer.from(JSON.stringify({clip: {id, name: id, fps: 10, cameras: [camera], frames},
       scene_annotations: {revision: 0, coordinate_frame: 'world', tracks: [],
         vectors: [{id: 'world-lane', label: 'lane', points: lane, closed: false},
-          {id: 'image-projected-lane', label: 'image-lane', points: imageLane, closed: false}]}}))}}});
+          {id: 'image-projected-lane', label: 'image-lane', points: imageLane, closed: false},
+          {id: 'image-projected-lane-2', label: 'image-lane', points: imageLane.map(p => [p[0], p[1]-.4, p[2]]), closed: false}]}}))}}});
   expect(imported.ok(), await imported.text()).toBe(true);
   const calibrationBefore = await (await request.get(`/api/clips/${id}/calibration`)).json();
   const sceneBefore = await (await request.get(`/api/clips/${id}/scene/annotations`)).json();
@@ -33,7 +34,7 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await expect(panel.getByLabel('绘制优化图像车道线')).toHaveCount(0);
   await expect(panel.getByLabel('优化图像投影车道线')).toBeDisabled();
   const cloud = page.getByTestId('point-cloud-view');
-  await expect(cloud).toHaveAttribute('data-annotation-vector-count', '2');
+  await expect(cloud).toHaveAttribute('data-annotation-vector-count', '3');
   await expect(cloud).toHaveAttribute('data-vector-editable', 'false');
   await expect(cloud.locator('..')).not.toHaveClass(/scene-disabled/);
   const clickWorld = async (point: Vec3) => {
@@ -95,6 +96,30 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   expect((await (await request.get(endpoint+'/jobs/'+jobId)).json()).status).toBe('completed');
   expect((await (await request.get(`/api/clips/${id}/calibration`)).json()).revision).toBe(calibrationBefore.revision);
   expect(await (await request.get(`/api/clips/${id}/scene/annotations`)).json()).toEqual(sceneBefore);
+  // Retain the real line so another image segment can be paired to it.
+  await expect(panel.getByLabel('优化三维车道线')).toHaveValue('world-lane');
+  await expect(panel.getByLabel('优化图像投影车道线').locator('option[value="image-projected-lane"]')).toHaveJSProperty('disabled', true);
+  await panel.getByLabel('优化图像投影车道线').selectOption('image-projected-lane-2');
+  await panel.getByLabel('添加车道线配对').click();
+  await expect(panel).toContainText('#2 f0 / world-lane ↔ image-projected-lane-2');
+  expect((await (await request.get(endpoint)).json()).pairing.pairs).toHaveLength(2);
+  page.once('dialog', dialog => void dialog.dismiss());
+  await panel.getByLabel('丢弃当前优化并重新选择').click();
+  await expect(panel).toContainText('已保存配对（2）');
+  page.once('dialog', dialog => void dialog.accept());
+  await panel.getByLabel('丢弃当前优化并重新选择').click();
+  await expect(panel).toContainText('已保存配对（0）');
+  await expect(panel.getByLabel('优化三维车道线')).toHaveValue('');
+  await expect(panel.getByLabel('优化图像投影车道线')).toHaveValue('');
+  await expect(panel.getByLabel('车道线优化任务')).toHaveCount(0);
+  await expect(panel.getByText('像素误差（前 → 后）', {exact: true})).toHaveCount(0);
+  await expect(image).toHaveAttribute('data-lane-calibration-overlay-count', '0');
+  const cleared = await (await request.get(endpoint)).json();
+  expect(cleared.pairing.pairs).toEqual([]);
+  expect(cleared.latest_job).toBeNull();
+  expect((await request.post(endpoint+'/jobs/'+jobId+'/apply', {data: {confirm_shared_update: true}})).status()).toBe(409);
+  expect(await (await request.get(`/api/clips/${id}/calibration`)).json()).toEqual(calibrationBefore);
+  expect(await (await request.get(`/api/clips/${id}/scene/annotations`)).json()).toEqual(sceneBefore);
   await page.getByLabel('下一帧', {exact: true}).click();
   await expect(panel).toContainText('当前帧 f1');
   await expect(panel.getByLabel('优化三维车道线')).toHaveValue('');
@@ -103,6 +128,10 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await page.reload();
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
   await page.getByLabel('车道线外参优化', {exact: true}).click();
-  await expect(panel).toContainText('#1 f0 / world-lane');
-  await expect(panel.getByText('任务：completed', {exact: true})).toBeVisible();
+  await expect(panel).toContainText('已保存配对（0）');
+  await expect(panel.getByLabel('车道线优化任务')).toHaveCount(0);
+  await panel.getByLabel('优化三维车道线').selectOption('world-lane');
+  await panel.getByLabel('优化图像投影车道线').selectOption('image-projected-lane');
+  await panel.getByLabel('添加车道线配对').click();
+  await expect(panel).toContainText('#1 f0 / world-lane ↔ image-projected-lane');
 });

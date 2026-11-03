@@ -79,9 +79,14 @@ class PairUpdate(Model):
     @model_validator(mode="after")
     def identities(self):
         if len({p.id for p in self.pairs}) != len(self.pairs): raise ValueError("配对 ID 重复。")
-        if len({(p.frame_id, p.lane_id) for p in self.pairs}) != len(self.pairs): raise ValueError("同帧同一条车道线只能配对一次。")
         image_ids = [(p.frame_id, p.image_lane_id) for p in self.pairs if p.image_lane_id is not None]
         if len(set(image_ids)) != len(image_ids): raise ValueError("同帧同一条图像投影线不能重复配给不同真值线。")
+        owners = {}
+        for pair in self.pairs:
+            if pair.image_lane_id is None: continue
+            if pair.image_lane_id in owners and owners[pair.image_lane_id] != pair.lane_id:
+                raise ValueError("同一条图像投影线只能归属一条真值线。")
+            owners[pair.image_lane_id] = pair.lane_id
         roles = {}
         for pair in self.pairs:
             if pair.frame_id in roles and roles[pair.frame_id] != pair.split:
@@ -281,9 +286,10 @@ class LaneCalibrationManager:
             clip = self.store.source_clip(clip_id); scene = get_scene(self.store, clip)
             if camera_id not in {c.id for c in clip.cameras}: raise KeyError("未找到相机。")
             jobs = sorted((self.directory(clip_id, camera_id) / "jobs").glob("*/job.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True)
+            latest_job = next((job for path in jobs if not (job := json.loads(path.read_text())).get("discarded")), None)
             return {"runtime": runtime_status(), "pairing": self.pairing(clip_id, camera_id),
                     "lanes": [v.model_dump(mode="json") for v in scene.vectors if not v.closed],
-                    "latest_job": json.loads(jobs[0].read_text()) if jobs else None,
+                    "latest_job": latest_job,
                     "coordinate_info": {"world_lanes": "scene.vectors", "ego_pose": "ego_to_world: ego → world",
                         "camera_mount": "camera_from_ego: ego → camera", "primary_lidar_mount": "lidar_to_ego: primary points → ego",
                         "fused_map": clip.source.startswith("4d-"), "sensor_mount_available": all(
@@ -352,6 +358,22 @@ class LaneCalibrationManager:
             pairs = [LanePair.model_validate(p) for p in current["pairs"]]
             pairs = [p.model_copy(update={"split": value.split}) if p.frame_id == value.frame_id else p for p in pairs]
             return self.save_pairs(clip_id, camera_id, PairUpdate(revision=value.revision, pairs=[*pairs, pair]))
+
+    def discard(self, clip_id, camera_id, value: PairUpdate):
+        with self.store.lock:
+            if value.pairs: raise ValueError("重新选择必须清空所有配对。")
+            state = self.read(clip_id, camera_id)
+            if state["pairing"]["revision"] != value.revision: raise ConflictError("配对版本冲突，请重新读取。")
+            if self.active: raise ConflictError("请先取消正在运行的优化，等待结束后再丢弃。")
+            document = {"revision": value.revision + 1, "pairs": []}
+            # Never touch calibration or scene annotations. Invalidate every old
+            # candidate so reopening the panel cannot resurrect an earlier job.
+            for path in (self.directory(clip_id, camera_id) / "jobs").glob("*/job.json"):
+                job = json.loads(path.read_text())
+                job.update(discarded=True, result=None, can_apply=False)
+                atomic_json(path, job)
+            atomic_json(self.directory(clip_id, camera_id) / "pairs.json", document)
+            return self.read(clip_id, camera_id)
 
     def preview(self, clip_id, camera_id, request: OptimizeRequest):
         with self.store.lock:
@@ -426,6 +448,7 @@ class LaneCalibrationManager:
         with self.store.lock:
             if not value.confirm_shared_update: raise ValueError("请明确确认将共享外参应用到整个 clip 的当前相机。")
             job = self.get_job(clip_id, camera_id, job_id)
+            if job.get("discarded"): raise ConflictError("候选已丢弃，请重新选择配对并优化。")
             if job.get("applied"): return job
             if job["status"] != "completed" or not job.get("can_apply"): raise ValueError("候选未通过训练/独立验证或仅供调试，不能应用；可导出检查。")
             _, current, mount = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), OptimizeRequest.model_validate(job["request"]))
@@ -469,6 +492,9 @@ def mount_lane_calibration_routes(app: FastAPI, manager: LaneCalibrationManager)
     @app.post(route + "/preview")
     def preview(clip_id: str, camera_id: str, value: OptimizeRequest): return respond(manager.preview, clip_id, camera_id, value)
 
+    @app.post(route + "/discard")
+    def discard(clip_id: str, camera_id: str, value: PairUpdate): return respond(manager.discard, clip_id, camera_id, value)
+
     @app.post(route + "/jobs", status_code=202)
     def start(clip_id: str, camera_id: str, value: OptimizeRequest): return respond(manager.start, clip_id, camera_id, value)
 
@@ -484,6 +510,7 @@ def mount_lane_calibration_routes(app: FastAPI, manager: LaneCalibrationManager)
     @app.get(route + "/jobs/{job_id}/download")
     def download(clip_id: str, camera_id: str, job_id: str):
         job = respond(manager.get_job, clip_id, camera_id, job_id)
+        if job.get("discarded"): raise HTTPException(409, "候选已丢弃，请重新选择配对并优化。")
         if job["status"] != "completed": raise HTTPException(409, "任务尚未完成，没有完整结果包。")
         directory = manager.job_path(clip_id, camera_id, job_id); archive = directory / "results.zip"
         with manager.store.lock:
