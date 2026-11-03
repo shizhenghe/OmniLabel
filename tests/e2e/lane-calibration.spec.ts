@@ -135,4 +135,70 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await panel.getByLabel('优化图像投影车道线').selectOption('image-projected-lane');
   await panel.getByLabel('添加车道线配对').click();
   await expect(panel).toContainText('#1 f0 / world-lane ↔ image-projected-lane');
+  // Keep both selection paths in one saved pairing document.
+  await panel.getByLabel('图像约束选择方式').selectOption('image');
+  await panel.getByLabel('绘制优化图像车道线').click();
+  await expect(image).toHaveAttribute('data-calibration-picking', 'true');
+  const pixels: [number, number][] = [[210, 275], [300, 235], [390, 205]];
+  const clickPixel = async ([u, v]: [number, number]) => {
+    const target = page.getByTestId('camera-front').last();
+    await expect(target).toHaveAttribute('data-image-state', 'ready');
+    const box = (await target.locator('canvas').boundingBox())!;
+    const size = await target.evaluate(element => ({width: element.clientWidth, height: element.clientHeight}));
+    const scale = Math.min(size.width/camera.width, size.height/camera.height);
+    await target.evaluate(element => element.addEventListener('click', event => {
+      const mouse = event as MouseEvent;
+      element.setAttribute('data-test-last-click', JSON.stringify([mouse.clientX, mouse.clientY]));
+    }, {once: true}));
+    await page.mouse.click(box.x+((size.width-camera.width*scale)/2+u*scale)*box.width/size.width,
+      box.y+((size.height-camera.height*scale)/2+v*scale)*box.height/size.height);
+    // Chromium quantizes MouseEvent client coordinates to CSS pixels. Check
+    // the delivered click, rather than CDP's requested fractional coordinate.
+    const [cx, cy] = JSON.parse((await target.getAttribute('data-test-last-click'))!) as number[];
+    return [((cx-box.x)*size.width/box.width-(size.width-camera.width*scale)/2)/scale,
+      ((cy-box.y)*size.height/box.height-(size.height-camera.height*scale)/2)/scale];
+  };
+  const expectedPixels = [];
+  for (const pixel of pixels) expectedPixels.push(await clickPixel(pixel));
+  await expect(panel).toContainText('手绘图像线：3 点');
+  await panel.getByLabel('撤回优化图像线一点').click();
+  await expect(panel).toContainText('手绘图像线：2 点');
+  expectedPixels[2] = await clickPixel(pixels[2]);
+  await panel.getByLabel('添加车道线配对').click();
+  await expect(panel).toContainText('#2 f0 / world-lane ↔ 图像手绘线');
+  await expect(image).toHaveAttribute('data-calibration-picking', 'false');
+  const mixed = await (await request.get(endpoint)).json();
+  expect(mixed.pairing.pairs).toHaveLength(2);
+  expect(mixed.pairing.pairs[0].image_lane_id).toBe('image-projected-lane');
+  const manual = mixed.pairing.pairs[1];
+  expect(manual.image_lane_id).toBeNull();
+  expect(manual.image_reference).toBeNull();
+  expect(manual.image_size).toEqual([camera.width, camera.height]);
+  expectedPixels.forEach((point, i) => point.forEach((value, axis) => expect(manual.image_points[i][axis]).toBeCloseTo(value, 4)));
+  expect(await (await request.get(`/api/clips/${id}/scene/annotations`)).json()).toEqual(sceneBefore);
+  await panel.getByLabel('确认车道线坐标约定').check();
+  await panel.getByLabel('确认图像Pose同步').check();
+  await panel.getByLabel('预览车道线投影误差').click();
+  await expect(panel).toContainText('像素误差（前 → 后）');
+  await panel.getByLabel('车道线优化模式').selectOption('single');
+  await panel.getByLabel('车道线优化迭代次数').fill('2');
+  await panel.getByText('外参、时间戳与约束高级配置', {exact: true}).click();
+  await panel.getByLabel('车道线优化高级配置').fill('{"config":{"lbfgs_iterations":0,"samples_per_lane":24}}');
+  await panel.getByLabel('运行车道线外参优化').click();
+  await expect(panel.getByText('任务：completed', {exact: true})).toBeVisible({timeout: 40_000});
+  // Frame navigation clears only the unfinished image stroke.
+  await panel.getByLabel('绘制优化图像车道线').click();
+  await page.getByLabel(`放大 ${camera.name}`, {exact: true}).first().click();
+  await clickPixel(pixels[0]);
+  await page.getByLabel(`放大 ${camera.name}`, {exact: true}).last().click();
+  await expect(panel).toContainText('手绘图像线：1 点');
+  await page.getByLabel('下一帧', {exact: true}).click();
+  await expect(panel).toContainText('当前帧 f1');
+  await expect(panel).toContainText('手绘图像线：0 点');
+  await expect(image).toHaveAttribute('data-calibration-picking', 'false');
+  await page.reload();
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await page.getByLabel('车道线外参优化', {exact: true}).click();
+  await expect(panel).toContainText('#1 f0 / world-lane ↔ image-projected-lane');
+  await expect(panel).toContainText('#2 f0 / world-lane ↔ 图像手绘线');
 });

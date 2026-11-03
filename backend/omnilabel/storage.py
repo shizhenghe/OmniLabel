@@ -183,6 +183,10 @@ class Store:
                     job = json.loads(path.read_text())
                     if job.get("clip_id") == clip_id and job.get("status") in {"queued", "running", "cancelling"}:
                         raise ConflictError("该 CLIP 仍有后台任务，请等待完成或取消后再删除。")
+            for path in (self.root / "lane_calibration" / safe_id(clip_id)).glob("*/jobs/*/job.json"):
+                job = json.loads(path.read_text())
+                if job.get("status") in {"queued", "running", "cancelling"}:
+                    raise ConflictError("该 CLIP 的车道线优化仍在运行，请取消并等待结束后再删除。")
             destination = self.root / "deleted_clips" / f"{safe_id(clip_id)}.json"
             destination.parent.mkdir(parents=True, exist_ok=True)
             (self.root / "clips" / f"{clip_id}.json").replace(destination)
