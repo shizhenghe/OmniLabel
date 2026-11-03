@@ -189,7 +189,7 @@ export function LaneCalibrationPanel(props: Props) {
         <button className="button primary full-width" aria-label="添加车道线配对" disabled={locked || active || !chosenLane || !chosenImageLane || chosenLane === chosenImageLane || imageUnavailable(chosenImageLane) || !props.frame.images[props.camera.id]} onClick={() => void addPair()}>添加配对 #{pairing.pairs.length + 1}</button>
         <p>一条真值线可对应多条图像投影线；每条图像投影线只能归属一条真值线，同帧不能重复添加。</p>
       </section>
-      <section><h3>已保存配对（{pairing.pairs.length}）</h3><p>同一帧的所有线共用训练/验证用途，防止验证泄漏。正式优化至少需要 2 个训练帧和 1 个验证帧。</p>
+      <section><h3>已保存配对（{pairing.pairs.length}）</h3><p>同一帧的所有线共用训练/验证用途，防止验证泄漏。至少需要一组训练配对；建议增加训练帧和独立验证帧，是否采纳由你决定。</p>
         <ol className="lane-calibration-pairs">{pairing.pairs.map((pair, index) => <li key={pair.id}><strong>#{index + 1} {pair.frame_id} / {pair.lane_id} ↔ {pair.image_lane_id ?? '旧版图像线'}</strong>
           <select aria-label={`配对${index + 1}用途`} value={pair.split} disabled={locked || active} onChange={e => void persist(pairing.pairs.map(p => p.frame_id === pair.frame_id ? {...p, split: e.target.value as Pair['split']} : p))}><option value="train">训练</option><option value="validation">验证</option></select>
           <button aria-label={`上移配对${index + 1}`} disabled={locked || active || index === 0} onClick={() => {const next = [...pairing.pairs]; [next[index-1], next[index]] = [next[index], next[index-1]]; void persist(next);}}>↑</button>

@@ -392,3 +392,25 @@ def test_application_still_requires_supported_coordinate_mapping():
     for changed in ({'request': {'mode': 'single'}}, {'request': {'pose_mode': 'provided'}},
                     {'sensor_lidar_to_ego': None}, {'discarded': True}, {'status': 'failed'}):
         assert not LaneCalibrationManager.application_status({**job, **changed})['can_apply']
+
+
+def test_shared_candidate_can_run_without_three_frame_quality_gate(lane_api):
+    client, store, route, request = lane_api
+    document = client.get(route).json()['pairing']
+    document['pairs'] = [pair for pair in document['pairs'] if pair['frame_id'] == 'f0']
+    updated = client.put(route+'/pairs', json=document)
+    assert updated.status_code == 200, updated.text
+    response = client.post(route+'/jobs', json={**request, 'pairing_revision': 2,
+        'config': {'adam_iterations': 2, 'lbfgs_iterations': 0}})
+    assert response.status_code == 202, response.text
+    job_id = response.json()['id']
+    deadline = time.monotonic()+30
+    while time.monotonic() < deadline:
+        job = client.get(route+'/jobs/'+job_id).json()
+        if job['status'] in {'completed', 'failed', 'cancelled'}: break
+        time.sleep(.05)
+    assert job['status'] == 'completed', job
+    assert job['can_apply']
+    assert job['result']['after']['splits']['validation'] is None
+    applied = client.post(route+'/jobs/'+job_id+'/apply', json={'confirm_shared_update': True})
+    assert applied.status_code == 200, applied.text

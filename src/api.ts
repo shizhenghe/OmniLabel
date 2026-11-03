@@ -2,15 +2,31 @@ import type {PointBuffer} from './types';
 
 const base = '/api';
 
+export class ApiError extends Error {
+  constructor(public status: number, public path: string, public method: string, detail: string) {
+    super(`${status} · ${method} ${base}${path}：${detail}`);
+    this.name = 'ApiError';
+  }
+}
+
+async function responseError(response: Response, path: string, method: string): Promise<ApiError> {
+  let detail = response.statusText || '请求失败，服务未返回详细原因';
+  try {
+    const payload = await response.json();
+    if (typeof payload.detail === 'string') detail = payload.detail;
+    else if (Array.isArray(payload.detail)) detail = payload.detail.map((issue: {loc?: (string | number)[]; msg?: string}) => {
+      const field = issue.loc?.filter(part => part !== 'body').join('.');
+      return `${field ? `${field}：` : ''}${issue.msg ?? '字段校验失败'}`;
+    }).join('；');
+    else if (typeof payload.message === 'string') detail = payload.message;
+  } catch { /* Keep status and operation when proxies return non-JSON errors. */ }
+  return new ApiError(response.status, path, method, detail);
+}
+
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(base + path, options);
   if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`;
-    try {
-      const payload = await response.json();
-      message = typeof payload.detail === 'string' ? payload.detail : JSON.stringify(payload.detail ?? payload);
-    } catch { /* Preserve HTTP status for non-JSON errors. */ }
-    throw new Error(message);
+    throw await responseError(response, path, options.method ?? 'GET');
   }
   return response.json() as Promise<T>;
 }
@@ -58,7 +74,7 @@ export function parsePointNpy(buffer: ArrayBuffer): PointBuffer {
 /** Load a C-order (N, 4) little-endian Float32/Float64 array without JSON expansion. */
 export async function requestPointNpy(path: string): Promise<PointBuffer> {
   const response = await fetch(base + path);
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) throw await responseError(response, path, 'GET');
   return parsePointNpy(await response.arrayBuffer());
 }
 

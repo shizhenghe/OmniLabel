@@ -201,3 +201,27 @@ for (const space of ['world', 'lidar'] as const) {
     }
   });
 }
+
+for (const space of ['world', 'lidar'] as const) {
+  test(`invalid ${space} lane saves identify the field, preserve drafts, and can be corrected`, async ({page, request}) => {
+    const id = `zz-save-errors-${space}`;
+    const paths = await importLaneFixture(request, id, [25, -8, 1.7]);
+    await openLaneFixture(page, id, space);
+    await page.locator('.object-row').first().click();
+    await page.getByLabel('要素类别', {exact: true}).fill('');
+    const path = space === 'world' ? paths.scenePath : paths.framePath;
+    const failed = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith(path));
+    await page.getByLabel('保存标注', {exact: true}).click();
+    expect((await failed).status()).toBe(422);
+    await expect(page.getByRole('alert')).toContainText(`422 · PUT ${path}`);
+    await expect(page.getByRole('alert')).toContainText('vectors.0.label');
+    await expect(page.getByLabel('要素类别', {exact: true})).toHaveValue('');
+    expect((await (await request.get(path)).json()).vectors[0].label).toBe('lane');
+    await expect(page.getByRole('alert')).toContainText('尚未保存的修改仍保留');
+    await page.getByLabel('要素类别', {exact: true}).fill('lane-corrected');
+    const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith(path));
+    await page.getByLabel('保存标注', {exact: true}).click();
+    expect((await saved).ok()).toBe(true);
+    expect((await (await request.get(path)).json()).vectors[0].label).toBe('lane-corrected');
+  });
+}
