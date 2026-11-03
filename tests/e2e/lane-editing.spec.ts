@@ -6,12 +6,12 @@ const localLane: Vector = {id: 'editable-lane', label: 'lane', closed: false,
   points: [[10, -1, -1.7], [15, -1, -1.58], [20, -1, -1.45]]};
 
 async function importLaneFixture(request: APIRequestContext, id: string, offset: Vec3,
-  localVectors: Vector[] = [localLane]) {
+  localVectors: Vector[] = [localLane], displayName = id) {
   const world = identity.map(row => [...row]);
   offset.forEach((value, index) => {world[index][3] = value;});
   const points = Array.from({length: 1089}, (_, index) => [7 + (index % 33) * .55,
     -6 + Math.floor(index / 33) * .375, -1.7, .4]);
-  const clip = {id, name: id, fps: 10,
+  const clip = {id, name: displayName, fps: 10,
     cameras: [{id: 'front', name: 'Front', width: 640, height: 360,
       intrinsics: [[295, 0, 320], [0, 295, 180], [0, 0, 1]],
       camera_from_ego: [[0, -1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]]}],
@@ -272,3 +272,81 @@ for (const space of ['world', 'lidar'] as const) {
     expect(await (await request.get(path)).json()).toEqual(saved);
   });
 }
+
+
+test('BEV keeps equal XY aligned across heights while panning and zooming', async ({page, request}) => {
+  const id = 'zz-bev-parallax';
+  const lower: Vector = {...localLane, id: 'lower', points: [[10, -1, -1.7], [20, -1, -1.7]]};
+  const upper: Vector = {...lower, id: 'upper', points: lower.points.map(([x, y, z]) => [x, y, z + 5])};
+  await importLaneFixture(request, id, [500000, 3500000, 1.7], [lower, upper]);
+  await openLaneFixture(page, id, 'world');
+  const view = page.getByTestId('point-cloud-view');
+  await expect(view).toHaveAttribute('data-projection', 'orthographic');
+  const compare = async () => {
+    const centers: number[][] = [];
+    for (const index of [0, 1]) {
+      await page.locator('.object-row').nth(index).click();
+      await expect(page.getByTestId('vector-vertex-gizmo')).toHaveAttribute('data-vector-id', index ? 'upper' : 'lower');
+      await page.waitForTimeout(200);
+      const box = await page.getByTestId('vector-vertex-0').boundingBox();
+      expect(box).not.toBeNull();
+      centers.push([box!.x, box!.y]);
+    }
+    expect(Math.abs(centers[0][0] - centers[1][0])).toBeLessThan(1);
+    expect(Math.abs(centers[0][1] - centers[1][1])).toBeLessThan(1);
+  };
+  await compare();
+  const box = (await view.boundingBox())!;
+  const x = box.x + box.width / 2, y = box.y + box.height * .7;
+  for (const dx of [-160, 320]) {
+    await page.mouse.move(x, y); await page.mouse.down({button: 'right'});
+    await page.mouse.move(x + dx, y, {steps: 15}); await page.mouse.up({button: 'right'});
+    let previousX = Infinity;
+    await expect.poll(async () => {
+      const handle = await page.getByTestId('vector-vertex-0').boundingBox();
+      const movement = Math.abs(handle!.x - previousX); previousX = handle!.x;
+      return movement;
+    }, {intervals: [300], timeout: 15000}).toBeLessThan(.05);
+    await compare();
+  }
+  await page.mouse.wheel(0, -100); await page.waitForTimeout(1500);
+  await compare();
+  await page.getByRole('button', {name: '透视 3D', exact: true}).click();
+  await expect(view).toHaveAttribute('data-projection', 'perspective');
+  await page.getByRole('button', {name: '俯视 BEV', exact: true}).click();
+  await compare();
+  await page.getByLabel('贴合点云路面', {exact: true}).click();
+  await expect(page.getByLabel('顶点1Z', {exact: true})).toHaveValue('0');
+  await expect(page.getByLabel('顶点2Z', {exact: true})).toHaveValue('0');
+  await expect(page.getByLabel('顶点1X', {exact: true})).toHaveValue('500010');
+  await page.getByLabel('保存标注', {exact: true}).click();
+  const saved = await (await request.get(`/api/clips/${id}/scene/annotations`)).json();
+  expect(saved.vectors.find((v: Vector) => v.id === 'upper').points).toEqual([[500010, 3499999, 0], [500020, 3499999, 0]]);
+});
+
+test('clip names show original prefix and deletion persists across reload', async ({page, request}) => {
+  const id = 'zz-delete-clip';
+  await importLaneFixture(request, id, [0, 0, 0], [localLane], '原始名称 · manager1 草稿标注');
+  await page.goto(`/?clip=${id}`);
+  await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
+  await expect(page.locator(`#clip-select option[value="${id}"]`)).toHaveText('原始名称');
+  page.on('dialog', dialog => dialog.accept());
+  await page.getByLabel('删除clip', {exact: true}).click();
+  await expect(page.locator(`#clip-select option[value="${id}"]`)).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByLabel('选择clip')).toBeVisible();
+  await expect(page.locator(`#clip-select option[value="${id}"]`)).toHaveCount(0);
+  expect((await request.get(`/api/clips/${id}`)).status()).toBe(404);
+});
+
+test('ground fitting keeps XY and unmatched elevations, excluding roofs for Float64 maps', async () => {
+  const {groundVectorHeights} = await import('../../src/geometry/pointDisplay');
+  const vertices: Vec3[] = [[500000.1, 3500000.1, 3], [500010, 3500010, 4]];
+  const rows = [[500000.1, 3500000.1, 10, 1], [500000.12, 3500000.12, -.12, .7]];
+  for (const cloud of [rows, new Float64Array(rows.flat())]) {
+    expect(groundVectorHeights(vertices, cloud, 0, .35)).toEqual({
+      points: [[500000.1, 3500000.1, -.12], [500010, 3500010, 4]], matched: 1,
+    });
+  }
+  expect(vertices[0][2]).toBe(3);
+});
