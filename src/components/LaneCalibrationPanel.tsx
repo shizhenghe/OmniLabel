@@ -226,7 +226,8 @@ export function LaneCalibrationPanel(props: Props) {
       return <div key={split} className="lane-calibration-metrics"><h4>{split === 'train' ? '训练帧' : '独立验证帧'} {a?.frames ?? 0} 帧</h4><p>Mean {metric(a?.mean_px)} → {metric(b?.mean_px)}</p><p>RMSE {metric(a?.rmse_px)} → {metric(b?.rmse_px)}</p><p>Median {metric(a?.median_px)} → {metric(b?.median_px)}</p><p>P95 {metric(a?.p95_px)} → {metric(b?.p95_px)}</p>{result?.error_reduction[split] !== null && result?.error_reduction[split] !== undefined && <p>误差下降 {(result.error_reduction[split]! * 100).toFixed(1)}%</p>}</div>;
     })}</section>}
     {result && <section><h3>优化后的 T_CL</h3><pre>{result.optimized_matrix.map(row => row.map(v => v.toFixed(7)).join(' ')).join('\n')}</pre>
-      <p>{result.usable ? '训练与独立验证均改善，仍需复核不同距离的静态物体。' : `候选不可应用：${result.rejection_reasons.join('；')}`}</p>
+      <p>请根据前后投影和误差自行决定是否采纳，质量指标不限制应用。</p>
+      {result.rejection_reasons.length > 0 && <p>复核提示：{result.rejection_reasons.join('；')}</p>}
       {job?.apply_block_reason && <p>{job.apply_block_reason}</p>}
       <button className="button primary full-width" aria-label="应用车道线优化外参" disabled={locked || active || !job?.can_apply || job.applied} onClick={() => void apply()}>{job?.applied ? '已应用' : '复核后应用到整段当前相机'}</button>
     </section>}

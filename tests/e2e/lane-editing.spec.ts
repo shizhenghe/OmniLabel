@@ -148,3 +148,56 @@ test('duplicate lane fusion previews without saving, extends a lane and preserve
   await expect(page.getByLabel('重建整个场景', {exact: true})).toBeEnabled();
   await expect(page.getByTestId('point-cloud-view')).toHaveAttribute('data-annotation-vector-count', '4');
 });
+
+for (const space of ['world', 'lidar'] as const) {
+  test(`lane vertex snapping uses measured XYZ in ${space}, can be disabled, and persists`, async ({page, request}) => {
+    const id = `zz-lane-snap-${space}`;
+    const offset: Vec3 = space === 'world' ? [500000, 3500000, 1.7] : [0, 0, 0];
+    const paths = await importLaneFixture(request, id, offset);
+    await openLaneFixture(page, id, space);
+    await page.locator('.object-row').first().click();
+    await expect(page.getByLabel('车道线吸附点云')).not.toBeChecked();
+    await page.getByLabel('车道线吸附点云').check();
+    await page.getByLabel('车道线吸附距离').fill('0.6');
+    await dragVertex(page, 1, 25, -12);
+    const vertex = page.getByTestId('vector-vertex-1');
+    const actual = await Promise.all(['x', 'y', 'z'].map(async axis => Number(await vertex.getAttribute(`data-world-${axis}`))));
+    const shift = space === 'world' ? offset : [0, 0, 0];
+    expect(actual[2]).toBeCloseTo(-1.7 + shift[2], 6);
+    expect((actual[0] - shift[0] - 7) / .55).toBeCloseTo(Math.round((actual[0] - shift[0] - 7) / .55), 6);
+    expect((actual[1] - shift[1] + 6) / .375).toBeCloseTo(Math.round((actual[1] - shift[1] + 6) / .375), 6);
+    await page.getByLabel('车道线吸附点云').uncheck();
+    await dragVertex(page, 1, 13, -7);
+    const free = await Promise.all(['x', 'y', 'z'].map(async axis => Number(await vertex.getAttribute(`data-world-${axis}`))));
+    expect(Math.hypot(free[0]-actual[0], free[1]-actual[1])).toBeGreaterThan(.05);
+    expect(free[2]).toBe(actual[2]);
+    // A vertex far above the road is left at its own height even with snapping.
+    await page.getByLabel('顶点2Z', {exact: true}).fill(String(actual[2]+2));
+    await page.getByLabel('车道线吸附点云').check();
+    await dragVertex(page, 1, 10, -5);
+    await expect(page.getByLabel('顶点2Z', {exact: true})).toHaveValue(String(Number((actual[2]+2).toFixed(3))));
+    await page.getByLabel('顶点2Z', {exact: true}).fill(String(actual[2]));
+    await dragVertex(page, 1, -10, 5);
+    const snapped = await Promise.all(['x', 'y', 'z'].map(async axis => Number(await vertex.getAttribute(`data-world-${axis}`))));
+    const path = space === 'world' ? paths.scenePath : paths.framePath;
+    const saved = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith(path));
+    await page.getByLabel('保存标注', {exact: true}).click();
+    expect((await saved).ok()).toBe(true);
+    expect((await (await request.get(path)).json()).vectors[0].points[1]).toEqual(snapped);
+    await page.getByLabel('开始绘制车道线', {exact: true}).click();
+    const canvas = page.locator('canvas[aria-label="三维点云标注视图"]');
+    await canvas.click({position: {x: (await canvas.boundingBox())!.width * .48, y: (await canvas.boundingBox())!.height * .48}});
+    await canvas.click({position: {x: (await canvas.boundingBox())!.width * .52, y: (await canvas.boundingBox())!.height * .52}});
+    await page.getByRole('button', {name: '完成绘制', exact: true}).click();
+    const savedDrawing = page.waitForResponse(r => r.request().method() === 'PUT' && r.url().endsWith(path));
+    await page.getByLabel('保存标注', {exact: true}).click();
+    expect((await savedDrawing).ok()).toBe(true);
+    const drawing = (await (await request.get(path)).json()).vectors.find((v: Vector) => v.id !== localLane.id);
+    expect(drawing.points).toHaveLength(2);
+    for (const p of drawing.points) {
+      expect(p[2]).toBeCloseTo(-1.7 + shift[2], 6);
+      expect((p[0] - shift[0] - 7) / .55).toBeCloseTo(Math.round((p[0] - shift[0] - 7) / .55), 6);
+      expect((p[1] - shift[1] + 6) / .375).toBeCloseTo(Math.round((p[1] - shift[1] + 6) / .375), 6);
+    }
+  });
+}

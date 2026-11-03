@@ -289,7 +289,7 @@ class LaneCalibrationManager:
             latest_job = next((job for path in jobs if not (job := json.loads(path.read_text())).get("discarded")), None)
             return {"runtime": runtime_status(), "pairing": self.pairing(clip_id, camera_id),
                     "lanes": [v.model_dump(mode="json") for v in scene.vectors if not v.closed],
-                    "latest_job": latest_job,
+                    "latest_job": self.application_status(latest_job) if latest_job else None,
                     "coordinate_info": {"world_lanes": "scene.vectors", "ego_pose": "ego_to_world: ego → world",
                         "camera_mount": "camera_from_ego: ego → camera", "primary_lidar_mount": "lidar_to_ego: primary points → ego",
                         "fused_map": clip.source.startswith("4d-"), "sensor_mount_available": all(
@@ -388,7 +388,16 @@ class LaneCalibrationManager:
     def get_job(self, clip_id, camera_id, job_id):
         path = self.job_path(clip_id, camera_id, job_id) / "job.json"
         if not path.is_file(): raise KeyError("未找到优化任务。")
-        return json.loads(path.read_text())
+        return self.application_status(json.loads(path.read_text()))
+
+    @staticmethod
+    def application_status(job):
+        # Quality metrics inform the user's review, including for older jobs
+        # saved when validation improvement was a mandatory acceptance gate.
+        job["can_apply"] = (job["status"] == "completed" and not job.get("discarded")
+            and job.get("result") is not None and job.get("sensor_lidar_to_ego") is not None
+            and job["request"].get("pose_mode") != "provided" and job["request"].get("mode") != "single")
+        return job
 
     def start(self, clip_id, camera_id, request: OptimizeRequest):
         with self.store.lock:
@@ -425,7 +434,7 @@ class LaneCalibrationManager:
                     self.pairing(job["clip_id"], job["camera_id"]), OptimizeRequest.model_validate(job["request"]))
                 if current != job["source_fingerprint"]: raise ConflictError("求解期间标注、pose、内参或图像已变化；请重新运行。")
                 job.update(status="completed", result={k: v for k, v in result.items() if k != "history"},
-                    can_apply=result["usable"] and mount is not None and job["request"]["pose_mode"] != "provided",
+                    can_apply=problem["mode"] != "single" and mount is not None and job["request"]["pose_mode"] != "provided",
                     apply_block_reason=("外部同步 Pose 尚未写入平台，结果仅供导出，避免应用时使用不同位姿。" if job["request"]["pose_mode"] == "provided"
                         else "缺少真实 LiDAR 安装变换，结果仅供导出。" if mount is None else ""),
                     sensor_lidar_to_ego=mount.tolist() if mount is not None else None)
@@ -450,7 +459,7 @@ class LaneCalibrationManager:
             job = self.get_job(clip_id, camera_id, job_id)
             if job.get("discarded"): raise ConflictError("候选已丢弃，请重新选择配对并优化。")
             if job.get("applied"): return job
-            if job["status"] != "completed" or not job.get("can_apply"): raise ValueError("候选未通过训练/独立验证或仅供调试，不能应用；可导出检查。")
+            if job["status"] != "completed" or not job.get("can_apply"): raise ValueError("候选尚未完成、仅供调试或缺少可应用的坐标变换；可导出检查。")
             _, current, mount = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), OptimizeRequest.model_validate(job["request"]))
             if current != job["source_fingerprint"]: raise ConflictError("数据或配对已变化，禁止应用旧结果。")
             clip = self.store.source_clip(clip_id)

@@ -6,6 +6,7 @@ import { VectorVertexGizmo } from './VectorVertexGizmo';
 import type { Annotations, Box, Frame, PointBuffer, Vec3, Voxel } from '../types';
 import { groundDrawingPoint, intensityBrightness, intensityRange, visiblePointIndices, type PointColorMode } from '../geometry/pointDisplay';
 import {renderOriginForPoints, toRenderPoint} from '../geometry/renderCoordinates';
+import {pointCloudSnapper} from '../geometry/pointSnap';
 
 export interface PointCloudViewProps {
   frame: Frame | null;
@@ -59,6 +60,8 @@ export interface PointCloudViewProps {
   groundBand?: number;
   /** Ground vectors use the drawing plane rather than the first roof/tree hit. */
   drawOnGround?: boolean;
+  snapToCloud?: boolean;
+  snapRadius?: number;
   draftVector?: Vec3[];
   brushRadius?: number;
   /** Fallback drawing plane in LiDAR metres; surface hits retain measured Z. */
@@ -175,6 +178,9 @@ export function PointCloudView(props: PointCloudViewProps) {
   }, [props.autoFitReference ?? props.binaryPoints ?? props.frame?.points]);
   const previousOrigin = useRef<Vec3>([0, 0, 0]);
   const colorMode = props.colorMode ?? (props.semantic ? 'semantic' : 'height');
+  const snapper = useMemo(() => props.snapToCloud ? pointCloudSnapper(props.frame?.points ?? [], props.binaryPoints) : null,
+    [props.snapToCloud, props.frame?.points, props.binaryPoints]);
+  const snapPoint = (point: Vec3) => snapper?.(point, props.snapRadius, props.groundBand) ?? point;
   const pointLabelCount = useMemo(() => Object.keys(props.annotations.point_labels).length, [props.annotations.point_labels]);
   const pointCount = props.binaryPoints ? props.binaryPoints.length / 4 : props.frame?.points.length ?? 0;
   const visibleIndices = useMemo<number[] | null>(() => {
@@ -608,7 +614,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     if (!point) return;
     const coordinates: Vec3 = [point.x, point.y, point.z];
     if (current.tool === 'box') current.onCreateBox?.(coordinates);
-    else if (current.tool === 'vector') current.onAddVectorPoint?.(coordinates);
+    else if (current.tool === 'vector') current.onAddVectorPoint?.(snapPoint(coordinates));
     else if (current.tool === 'brush' && !current.sceneMode) {
       const radius = current.brushRadius ?? 1.5;
       const indices: number[] = [];
@@ -665,7 +671,7 @@ export function PointCloudView(props: PointCloudViewProps) {
       <VectorVertexGizmo key={`${props.selectedId}/${props.activeFrameId ?? props.frame?.id ?? ''}`}
         vector={props.annotations.vectors.find(vector => vector.id === props.selectedId)!} renderOrigin={origin}
         camera={runtime.current.camera} canvas={runtime.current.renderer.domElement} controls={runtime.current.controls}
-        onUpdate={props.onUpdateVectorPoint} onStart={props.onTransformStart} onEnd={props.onTransformEnd}/>}
+        onUpdate={(id, index, point) => props.onUpdateVectorPoint?.(id, index, snapPoint(point))} onStart={props.onTransformStart} onEnd={props.onTransformEnd}/>}
     {error && <div role="alert" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: 24, color: '#f3c2b2', background: '#0b131f', textAlign: 'center' }}>{error}</div>}
     <div style={{ position: 'absolute', right: 14, bottom: 12, pointerEvents: 'none', color: '#8294a9', font: '10px ui-monospace, monospace', display: 'flex', gap: 16 }}>
       {cursor && <span>{cursor}</span>}<span>X 前 · Y 左 · Z 上</span>

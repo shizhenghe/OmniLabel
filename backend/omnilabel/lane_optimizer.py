@@ -245,8 +245,6 @@ def optimize(problem: dict, progress=None, cancelled=lambda: False) -> dict:
         balanced_reduction[split] = float(1 - b["frame_balanced_mean_px"] / max(a["frame_balanced_mean_px"], 1e-9)) if a else None
         if not a:
             if split == "validation": reasons.append("没有独立验证帧；仅供单帧调试，不可应用。")
-        elif min(reduction[split], balanced_reduction[split]) < .005:
-            reasons.append(f'{"训练" if split == "train" else "验证"}帧误差没有改善至少 0.5%。')
     if rank < 6 or condition > 1e8: reasons.append("车道线几何不足以可靠约束六自由度，请增加弯道、左右及近远处特征。")
     if any(row["visibility_retained"] < .98 for row in after["pairs"]): reasons.append("候选丢失了原本可见的车道线点。")
     if problem["mode"] == "single": reasons.append("单帧结果仅供调试。")
