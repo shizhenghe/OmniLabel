@@ -116,7 +116,7 @@ class PoseSample(Model):
 
 class OptimizeRequest(Model):
     pairing_revision: int = Field(ge=0)
-    mode: Literal["multi", "single"] = "multi"
+    mode: Literal["multi", "single", "frame"] = "multi"
     frame_ids: list[Identifier] | None = Field(default=None, max_length=128)
     conventions_confirmed: bool = False
     time_alignment_confirmed: bool = False
@@ -138,6 +138,7 @@ class OptimizeRequest(Model):
 
 class ApplyRequest(Model):
     confirm_shared_update: bool = False
+    confirm_frame_update: bool = False
 
 
 def runtime_status():
@@ -196,6 +197,10 @@ def resolve_geometry(store, clip, camera, frames, request: OptimizeRequest):
     if request.initial_matrix is not None:
         initial = np.asarray(request.initial_matrix)
         if request.initial_direction == "lidar_from_camera": initial = np.linalg.inv(initial)
+    elif request.mode == "frame":
+        from .projection_calibration import document_for
+        effective = np.asarray(document_for(store, clip.id, frames[0].id, camera.id)["effective_matrix"])
+        initial = effective @ np.linalg.inv(np.asarray(frames[0].lidar_to_ego)) @ mounts[0]
     else: initial = np.asarray(camera.camera_from_ego) @ mounts[0]
     return poses, initial, mounts[0] if known_mount else None
 
@@ -226,7 +231,9 @@ def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, req
         if not request.frame_ids or len(set(request.frame_ids)) != len(request.frame_ids): raise ValueError("帧选择为空或重复。")
         if set(request.frame_ids) - {p.frame_id for p in pairs}: raise ValueError("所选帧没有已保存的车道线配对。")
         pairs = [p for p in pairs if p.frame_id in request.frame_ids]
-    if request.mode == "single":
+    if request.mode == "frame" and (request.frame_ids is None or len(request.frame_ids) != 1):
+        raise ValueError("当前帧校准必须明确指定唯一的 frame_ids。")
+    if request.mode in {"single", "frame"}:
         if len({p.frame_id for p in pairs}) != 1: raise ValueError("单帧调试必须显式选择一个已配对帧。")
         pairs = [p.model_copy(update={"split": "train"}) for p in pairs]
     if not pairs: raise ValueError("请先按顺序选择三维真值线和二维图像线，保存至少一组配对。")
@@ -263,7 +270,10 @@ def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, req
             "pose_mode": request.pose_mode, "pose_source": "registered world_from_primary @ inverse(primary_to_ego) @ sensor_to_ego" if request.pose_mode != "provided" else "explicit timestamped pose samples",
             "initial_input_direction": request.initial_direction if request.initial_matrix is not None else "derived camera_from_lidar",
             "pose_interpolation": "SLERP + linear translation" if request.pose_mode == "provided" else "frame association confirmed by user"}}
+    from .projection_calibration import document_for
+    projection_revision = document_for(store, clip_id, frames[0].id, camera_id)["revision"] if request.mode == "frame" else None
     token = _fingerprint({"pairing": pairing, "request": request.model_dump(mode="json"), "camera": camera.model_dump(),
+                          **({"projection_revision": projection_revision} if request.mode == "frame" else {}),
                           "scene": scene.model_dump(), "frames": [f.model_dump(exclude={"points"}) for f in frames],
                           "poses": {k: v.tolist() for k, v in poses.items()}, "images": image_tokens})
     return problem, token, mount
@@ -455,14 +465,29 @@ class LaneCalibrationManager:
 
     def apply(self, clip_id, camera_id, job_id, value: ApplyRequest):
         with self.store.lock:
-            if not value.confirm_shared_update: raise ValueError("请明确确认将共享外参应用到整个 clip 的当前相机。")
             job = self.get_job(clip_id, camera_id, job_id)
+            frame_only = job.get("request", {}).get("mode") == "frame"
+            if frame_only and not value.confirm_frame_update: raise ValueError("请明确确认仅将校准结果应用到该任务的当前帧和当前相机。")
+            if not frame_only and not value.confirm_shared_update: raise ValueError("请明确确认将共享外参应用到整个 clip 的当前相机。")
             if job.get("discarded"): raise ConflictError("候选已丢弃，请重新选择配对并优化。")
             if job.get("applied"): return job
             if job["status"] != "completed" or not job.get("can_apply"): raise ValueError("候选尚未完成、仅供调试或缺少可应用的坐标变换；可导出检查。")
             _, current, mount = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), OptimizeRequest.model_validate(job["request"]))
             if current != job["source_fingerprint"]: raise ConflictError("数据或配对已变化，禁止应用旧结果。")
             clip = self.store.source_clip(clip_id)
+            if frame_only:
+                from .projection_calibration import document_for, ProjectionUpdate, save_projection_calibration
+                frame_id = job["request"]["frame_ids"][0]
+                frame = next(f for f in clip.frames if f.id == frame_id)
+                # Optimizer uses the calibration sensor; the projection store
+                # expects the primary cloud's coordinates, including fused maps.
+                matrix = np.asarray(job["result"]["optimized_matrix"]) @ np.linalg.inv(mount) @ np.asarray(frame.lidar_to_ego)
+                document = document_for(self.store, clip_id, frame_id, camera_id)
+                save_projection_calibration(self.store, clip_id, frame_id, camera_id,
+                    ProjectionUpdate(revision=document["revision"], matrix=matrix.tolist(), method="manual", scope="frame"), source_job_id=job_id)
+                job.update(applied=True, applied_scope="frame", applied_frame_id=frame_id)
+                atomic_json(self.job_path(clip_id, camera_id, job_id) / "job.json", job)
+                return job
             cameras = {c.id: c.camera_from_ego for c in clip.cameras}
             cameras[camera_id] = (np.asarray(job["result"]["optimized_matrix"]) @ np.linalg.inv(mount)).tolist()
             save_calibration(self.store, clip_id, CalibrationUpdate(revision=_revision(clip), cameras=cameras,
