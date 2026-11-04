@@ -68,8 +68,7 @@ export function CameraView(props: CameraViewProps) {
     if (!host.current) return;
     const element = host.current;
     const observer = new ResizeObserver(() => {
-      const rect = element.getBoundingClientRect();
-      setSize({ width: rect.width, height: rect.height });
+      setSize({ width: element.clientWidth, height: element.clientHeight });
     });
     observer.observe(element);
     return () => observer.disconnect();
@@ -196,6 +195,12 @@ export function CameraView(props: CameraViewProps) {
         connected = true;
       }
       ctx.stroke();
+      if (line.vertices) line.points.forEach((point, index) => {
+        if (!point) return;
+        const [x, y] = xy(point);
+        ctx.fillStyle = line.color; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+        ctx.font = '10px sans-serif'; ctx.fillText(String(index + 1), x + 5, y + 10);
+      });
       const anchor = line.points.find(point => point !== null);
       if (anchor) {ctx.fillStyle = line.color; ctx.font = '10px sans-serif'; ctx.fillText(line.label, anchor[0] * scale + 4, anchor[1] * scale - 4);}
     }
@@ -250,11 +255,13 @@ export function CameraView(props: CameraViewProps) {
   }, [props, imageState, displayImage, size, visibleResults, draftModelBox]);
 
   const originalPixel = (clientX: number, clientY: number, clamp = false): Pixel | null => {
-    if (!host.current) return null;
-    const rect = host.current.getBoundingClientRect();
+    if (!canvas.current || !size.width || !size.height) return null;
+    const rect = canvas.current.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
     const { x, y, width, height } = fit.current;
     if (!width || !height) return null;
-    const px = clientX - rect.left - x, py = clientY - rect.top - y;
+    const px = (clientX - rect.left) * size.width / rect.width - x;
+    const py = (clientY - rect.top) * size.height / rect.height - y;
     if (!clamp && (px < 0 || py < 0 || px > width || py > height)) return null;
     return [Math.max(0, Math.min(width, px)) / width * props.camera.width, Math.max(0, Math.min(height, py)) / height * props.camera.height];
   };

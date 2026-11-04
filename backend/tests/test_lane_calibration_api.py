@@ -414,3 +414,77 @@ def test_shared_candidate_can_run_without_three_frame_quality_gate(lane_api):
     assert job['result']['after']['splits']['validation'] is None
     applied = client.post(route+'/jobs/'+job_id+'/apply', json={'confirm_shared_update': True})
     assert applied.status_code == 200, applied.text
+
+
+def test_frame_optimization_applies_only_its_frame_camera_and_converts_sensor_coordinates(lane_api):
+    from omnilabel.projection_calibration import document_for
+    client, store, route, request = lane_api
+    raw = store.source_clip('known').model_dump()
+    primary = np.eye(4); primary[:3, 3] = [.4, -.2, .1]
+    raw['frames'][0]['lidar_to_ego'] = primary.tolist()
+    rear = deepcopy(raw['cameras'][0]); rear.update(id='rear', name='Rear')
+    raw['cameras'].append(rear)
+    for frame in raw['frames']: frame['images']['rear'] = frame['images']['front']
+    atomic_json(store.root/'clips/known.json', raw)
+    source = (store.root/'clips/known.json').read_bytes()
+    scene = (store.root/'scenes/known.json').read_bytes()
+    pairing = client.get(route).json()['pairing']
+    before = {(f, c): document_for(store, 'known', f, c)['effective_matrix']
+              for f in ('f0', 'f1', 'f2', 'f3') for c in ('front', 'rear')}
+    saved_first = None
+    for fid in ('f0', 'f1'):
+        response = client.post(route+'/jobs', json={**request, 'mode': 'frame', 'frame_ids': [fid],
+            'sensor_lidar_to_ego': np.eye(4).tolist(), 'config': {'adam_iterations': 12, 'lbfgs_iterations': 0}})
+        assert response.status_code == 202, response.text
+        job_id = response.json()['id']; deadline = time.monotonic()+40
+        while time.monotonic() < deadline:
+            job = client.get(route+'/jobs/'+job_id).json()
+            if job['status'] in {'completed', 'failed', 'cancelled'}: break
+            time.sleep(.05)
+        assert job['status'] == 'completed', job
+        assert job['can_apply']
+        assert job['result']['before']['splits']['train']['frames'] == 1
+        assert client.post(route+'/jobs/'+job_id+'/apply', json={'confirm_shared_update': True}).status_code == 422
+        applied = client.post(route+'/jobs/'+job_id+'/apply', json={'confirm_frame_update': True})
+        assert applied.status_code == 200, applied.text
+        assert applied.json()['applied_scope'] == 'frame'
+        assert applied.json()['applied_frame_id'] == fid
+        expected = np.asarray(job['result']['optimized_matrix']) @ (primary if fid == 'f0' else np.eye(4))
+        np.testing.assert_allclose(document_for(store, 'known', fid, 'front')['effective_matrix'], expected, atol=1e-10)
+        assert (store.root/'clips/known.json').read_bytes() == source
+        assert (store.root/'scenes/known.json').read_bytes() == scene
+        assert client.get(route).json()['pairing'] == pairing
+        path = store.root/'projection_calibrations/known/f0/front.json'
+        if fid == 'f0':
+            saved_first = path.read_bytes()
+            np.testing.assert_allclose(document_for(store, 'known', 'f1', 'front')['effective_matrix'], before['f1', 'front'])
+        else:
+            assert path.read_bytes() == saved_first
+        for frame in ('f0', 'f1', 'f2', 'f3'):
+            np.testing.assert_allclose(document_for(store, 'known', frame, 'rear')['effective_matrix'], before[frame, 'rear'])
+        for frame in ('f2', 'f3'):
+            np.testing.assert_allclose(document_for(store, 'known', frame, 'front')['effective_matrix'], before[frame, 'front'])
+
+
+def test_frame_optimization_requires_explicit_target_and_uses_saved_frame_initial(lane_api):
+    from omnilabel.lane_calibration import build_problem, OptimizeRequest
+    from omnilabel.projection_calibration import document_for, ProjectionUpdate, save_projection_calibration
+    client, store, route, request = lane_api
+    for frames in (None, ['f0', 'f1']):
+        response = client.post(route+'/jobs', json={**request, 'mode': 'frame', 'frame_ids': frames})
+        assert response.status_code == 422, response.text
+    current = document_for(store, 'known', 'f3', 'front')
+    matrix = np.asarray(current['effective_matrix']); matrix[0, 3] += .12
+    save_projection_calibration(store, 'known', 'f3', 'front', ProjectionUpdate(
+        revision=current['revision'], matrix=matrix.tolist(), method='manual'))
+    settings = OptimizeRequest.model_validate({**request, 'mode': 'frame', 'frame_ids': ['f3'], 'initial_matrix': matrix.tolist()})
+    pairing = client.get(route).json()['pairing']
+    problem, token, _ = build_problem(store, 'known', 'front', pairing, settings)
+    np.testing.assert_allclose(problem['initial_matrix'], matrix)
+    assert all(o['frame_id'] == 'f3' and o['split'] == 'train' for o in problem['observations'])
+    assert pairing['pairs'][-1]['split'] == 'validation'
+    current = document_for(store, 'known', 'f3', 'front')
+    matrix[0, 3] += .1
+    save_projection_calibration(store, 'known', 'f3', 'front', ProjectionUpdate(
+        revision=current['revision'], matrix=matrix.tolist(), method='manual'))
+    assert build_problem(store, 'known', 'front', pairing, settings)[1] != token

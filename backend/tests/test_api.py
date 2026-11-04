@@ -281,6 +281,12 @@ def test_delete_clip_archives_and_preserves_shared_data(client):
     assert client.delete('/api/clips/test-clip').status_code == 409
     assert client.get('/api/clips/test-clip').status_code == 200
     store.save_job({'id': 'pending', 'clip_id': 'test-clip', 'status': 'completed'})
+    lane_job = store.root / 'lane_calibration/test-clip/front/jobs/lane-job/job.json'
+    lane_job.parent.mkdir(parents=True)
+    lane_job.write_text(json.dumps({'id': 'lane-job', 'status': 'running'}))
+    assert client.delete('/api/clips/test-clip').status_code == 409
+    assert client.get('/api/clips/test-clip').status_code == 200
+    lane_job.write_text(json.dumps({'id': 'lane-job', 'status': 'cancelled'}))
     assert client.delete('/api/clips/test-clip').json()['deleted'] is True
     assert client.get('/api/clips').json() == []
     assert client.get('/api/clips/test-clip').status_code == 404
