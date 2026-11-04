@@ -149,18 +149,20 @@ test('two point-cloud lane selections drive a frozen image reference and real op
     await expect(target).toHaveAttribute('data-image-state', 'ready');
     const box = (await target.locator('canvas').boundingBox())!;
     const size = await target.evaluate(element => ({width: element.clientWidth, height: element.clientHeight}));
-    const scale = Math.min(size.width/camera.width, size.height/camera.height);
+    const zoom = Number(await target.getAttribute('data-image-zoom'));
+    const [dx, dy] = (await target.getAttribute('data-image-offset'))!.split(',').map(Number);
+    const scale = Math.min(size.width/camera.width, size.height/camera.height)*zoom;
     await target.evaluate(element => element.addEventListener('click', event => {
       const mouse = event as MouseEvent;
       element.setAttribute('data-test-last-click', JSON.stringify([mouse.clientX, mouse.clientY]));
     }, {once: true}));
-    await page.mouse.click(box.x+((size.width-camera.width*scale)/2+u*scale)*box.width/size.width,
-      box.y+((size.height-camera.height*scale)/2+v*scale)*box.height/size.height);
+    await page.mouse.click(box.x+((size.width-camera.width*scale)/2+dx+u*scale)*box.width/size.width,
+      box.y+((size.height-camera.height*scale)/2+dy+v*scale)*box.height/size.height);
     // Chromium quantizes MouseEvent client coordinates to CSS pixels. Check
     // the delivered click, rather than CDP's requested fractional coordinate.
     const [cx, cy] = JSON.parse((await target.getAttribute('data-test-last-click'))!) as number[];
-    return [((cx-box.x)*size.width/box.width-(size.width-camera.width*scale)/2)/scale,
-      ((cy-box.y)*size.height/box.height-(size.height-camera.height*scale)/2)/scale];
+    return [((cx-box.x)*size.width/box.width-(size.width-camera.width*scale)/2-dx)/scale,
+      ((cy-box.y)*size.height/box.height-(size.height-camera.height*scale)/2-dy)/scale];
   };
   const expectedPixels = [];
   for (const pixel of pixels) expectedPixels.push(await clickPixel(pixel));
@@ -205,6 +207,35 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await page.getByLabel('车道线外参优化', {exact: true}).click();
   await expect(panel).toContainText('#1 f0 / world-lane ↔ image-projected-lane');
   await expect(panel).toContainText('#2 f0 / world-lane ↔ 图像手绘线');
+  await panel.getByLabel('优化三维车道线').selectOption('world-lane');
+  await panel.getByLabel('绘制优化图像车道线').click();
+  await page.getByLabel(`放大 ${camera.name}`, {exact: true}).first().click();
+  const expanded = page.getByTestId('camera-front').last();
+  await expanded.getByLabel('放大图像', {exact: true}).click();
+  await expanded.press('+');
+  await expect(expanded).toHaveAttribute('data-image-zoom', '1.5625');
+  await expect(panel).toContainText('手绘图像线：0 点');
+  const area = (await expanded.locator('canvas').boundingBox())!;
+  await page.mouse.move(area.x+area.width/2, area.y+area.height/2);
+  await page.mouse.wheel(0, -120);
+  await expect.poll(async () => Number(await expanded.getAttribute('data-image-zoom'))).toBeGreaterThan(1.5625);
+  const oldOffset = await expanded.getAttribute('data-image-offset');
+  await page.mouse.down({button: 'right'});
+  await page.mouse.move(area.x+area.width/2+55, area.y+area.height/2-30, {steps: 8});
+  await page.mouse.up({button: 'right'});
+  await expect(expanded).not.toHaveAttribute('data-image-offset', oldOffset!);
+  await expect(panel).toContainText('手绘图像线：0 点');
+  const zoomPixels = [await clickPixel([300, 160]), await clickPixel([340, 180])];
+  await expect(panel).toContainText('手绘图像线：2 点');
+  await expanded.getByLabel('复位图像缩放').click();
+  await expect(expanded).toHaveAttribute('data-image-zoom', '1');
+  await expect(expanded).toHaveAttribute('data-image-offset', '0,0');
+  await expect(panel).toContainText('手绘图像线：2 点');
+  await page.getByLabel(`放大 ${camera.name}`, {exact: true}).last().click();
+  await panel.getByLabel('添加车道线配对').click();
+  await expect(panel).toContainText('#3 f0 / world-lane ↔ 图像手绘线');
+  const zoomSaved = (await (await request.get(endpoint)).json()).pairing.pairs[2].image_points;
+  zoomPixels.forEach((point, i) => point.forEach((value, axis) => expect(zoomSaved[i][axis]).toBeCloseTo(value, 4)));
 });
 
 

@@ -979,7 +979,7 @@ export default function App() {
   };
 
   const cameraCards = (expanded = false) => clip?.cameras.filter(c => !expanded || c.id === expandedCamera).map(camera => <div className={`camera-card ${activeCamera === camera.id ? 'camera-active' : ''}`} key={camera.id}>
-    <CameraView camera={camera} frame={frame} annotations={imageAnnotations} preparedImage={reviewing && preparedFrame?.frameId === frame?.id ? preparedFrame?.images[camera.id] : undefined} projections={projections[camera.id] ?? []}
+    <CameraView zoomable={expanded} camera={camera} frame={frame} annotations={imageAnnotations} preparedImage={reviewing && preparedFrame?.frameId === frame?.id ? preparedFrame?.images[camera.id] : undefined} projections={projections[camera.id] ?? []}
       selected={activeCamera === camera.id} tool={task === 'image' && !projectionOpen && !reviewing && !busy && !jobBusy && !modelPromptMode ? 'polygon' : 'select'}
       calibrationPicking={(projectionOpen && projectionPickMode === '2d' && activeCamera === camera.id) || (laneCalibrationOpen && laneImagePicking && laneCalibrationCamera === camera.id)}
       onCalibrationPixel={pixel => {if (laneCalibrationOpen && laneImagePicking && laneCalibrationCamera === camera.id) setLanePickedPixel(pixel); else if (!projectionBusy) setProjectionPickedPixel(pixel);}}

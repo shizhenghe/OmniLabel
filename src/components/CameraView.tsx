@@ -37,6 +37,7 @@ export interface CameraViewProps {
   calibrationAnchors?: {id: string; point: number[]; pixel: Pixel; label: string; selected?: boolean; enabled?: boolean}[];
   laneCalibrationLines?: LaneCalibrationOverlay[];
   labelDraftPoints?: boolean;
+  zoomable?: boolean;
 }
 
 export function CameraView(props: CameraViewProps) {
@@ -47,6 +48,9 @@ export function CameraView(props: CameraViewProps) {
   const fit = useRef({ x: 0, y: 0, width: 0, height: 0 });
   const [internalImageState, setImageState] = useState<'loading' | 'ready' | 'missing' | 'error'>('loading');
   const [size, setSize] = useState({ width: 0, height: 0 });
+  const [viewport, setViewport] = useState({zoom: 1, x: 0, y: 0});
+  const pan = useRef<{id: number; x: number; y: number; moved: boolean} | null>(null);
+  const suppressClick = useRef(false);
   const modelDrag = useRef<{ start: Pixel; pointerId: number } | null>(null);
   const [draftModelBox, setDraftModelBox] = useState<number[] | null>(null);
   const source = props.frame?.images[props.camera.id];
@@ -61,6 +65,36 @@ export function CameraView(props: CameraViewProps) {
     imagePolygons: props.showAnnotationProjection !== false ? results.imagePolygons : [],
   }), [results, props.showAnnotationProjection, props.showBoxes, props.showVectors]);
   const signature = useMemo(() => projectionSignature(visibleResults), [visibleResults]);
+  const boundViewport = (value: typeof viewport) => {
+    const scale = Math.min(size.width / props.camera.width, size.height / props.camera.height) * value.zoom;
+    const dx = Math.max(0, (props.camera.width * scale-size.width)/2);
+    const dy = Math.max(0, (props.camera.height * scale-size.height)/2);
+    return {...value, x: Math.max(-dx, Math.min(dx, value.x)), y: Math.max(-dy, Math.min(dy, value.y))};
+  };
+  const zoomAt = (factor: number, clientX?: number, clientY?: number) => {
+    if (!props.zoomable || !size.width || !size.height) return;
+    const rect = canvas.current?.getBoundingClientRect();
+    const x = rect && clientX !== undefined ? (clientX-rect.left)*size.width/rect.width : size.width/2;
+    const y = rect && clientY !== undefined ? (clientY-rect.top)*size.height/rect.height : size.height/2;
+    setViewport(previous => {
+      const zoom = Math.max(1, Math.min(16, previous.zoom*factor));
+      const ratio = zoom/previous.zoom;
+      return boundViewport({zoom, x: (x-size.width/2)*(1-ratio)+previous.x*ratio,
+        y: (y-size.height/2)*(1-ratio)+previous.y*ratio});
+    });
+  };
+  useEffect(() => {setViewport({zoom: 1, x: 0, y: 0}); pan.current = null;}, [props.frame?.id, props.camera.id, props.zoomable, source]);
+  useEffect(() => {setViewport(value => boundViewport(value));}, [size.width, size.height]);
+  useEffect(() => {
+    const element = host.current;
+    if (!element || !props.zoomable) return;
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault();
+      if (imageState === 'ready') zoomAt(Math.exp(-Math.max(-250, Math.min(250, event.deltaY))* .002), event.clientX, event.clientY);
+    };
+    element.addEventListener('wheel', wheel, {passive: false});
+    return () => element.removeEventListener('wheel', wheel);
+  }, [props.zoomable, size.width, size.height, props.camera.width, props.camera.height, imageState]);
 
   useEffect(() => { modelDrag.current = null; setDraftModelBox(null); }, [props.modelPromptMode, props.frame?.id, props.camera.id]);
 
@@ -104,11 +138,11 @@ export function CameraView(props: CameraViewProps) {
     ctx.fillStyle = '#0b1420';
     ctx.fillRect(0, 0, size.width, size.height);
     const { width, height } = props.camera;
-    const scale = Math.min(size.width / width, size.height / height);
+    const scale = Math.min(size.width / width, size.height / height) * viewport.zoom;
     const displayWidth = width * scale;
     const displayHeight = height * scale;
-    const offsetX = (size.width - displayWidth) / 2;
-    const offsetY = (size.height - displayHeight) / 2;
+    const offsetX = (size.width - displayWidth) / 2 + viewport.x;
+    const offsetY = (size.height - displayHeight) / 2 + viewport.y;
     fit.current = { x: offsetX, y: offsetY, width: displayWidth, height: displayHeight };
     ctx.save();
     ctx.translate(offsetX, offsetY);
@@ -252,7 +286,7 @@ export function CameraView(props: CameraViewProps) {
       ctx.fillText(anchor.label, x + 7, y - 3);
     }
     ctx.restore();
-  }, [props, imageState, displayImage, size, visibleResults, draftModelBox]);
+  }, [props, imageState, displayImage, size, visibleResults, draftModelBox, viewport]);
 
   const originalPixel = (clientX: number, clientY: number, clamp = false): Pixel | null => {
     if (!canvas.current || !size.width || !size.height) return null;
@@ -271,6 +305,15 @@ export function CameraView(props: CameraViewProps) {
     className={props.className}
     data-testid={`camera-${props.camera.id}`}
     data-image-state={imageState}
+    data-image-zoom={viewport.zoom}
+    data-image-offset={`${viewport.x},${viewport.y}`}
+    tabIndex={props.zoomable ? 0 : undefined}
+    onKeyDown={event => {
+      if (!props.zoomable || imageState !== 'ready') return;
+      if (event.key === '+' || event.key === '=') {event.preventDefault(); zoomAt(1.25);}
+      else if (event.key === '-') {event.preventDefault(); zoomAt(1/1.25);}
+      else if (event.key === '0') {event.preventDefault(); setViewport({zoom: 1, x: 0, y: 0});}
+    }}
     data-active-frame-id={props.frame?.id ?? ''}
     data-rendered-image-frame-id={imageState === 'ready' && displayImage ? props.frame?.id ?? '' : ''}
     data-projected-box-count={visibleResults.boxes.length}
@@ -287,6 +330,14 @@ export function CameraView(props: CameraViewProps) {
     data-lane-calibration-draft-count={props.labelDraftPoints ? props.draftPolygon?.length ?? 0 : 0}
     style={{ position: 'relative', width: '100%', height: '100%', minHeight: 92, overflow: 'hidden', background: '#0b1420', outline: props.selected ? '1px solid #60dbc3' : undefined, outlineOffset: -1, cursor: props.calibrationPicking || props.tool === 'polygon' || props.modelPromptMode ? 'crosshair' : props.onSelect ? 'pointer' : 'default' }}
     onPointerDown={event => {
+      if ((event.target as HTMLElement).closest('button')) return;
+      if (props.zoomable) event.currentTarget.focus({preventScroll: true});
+      if (props.zoomable && (event.button === 2 || event.button === 1)) {
+        event.preventDefault(); suppressClick.current = false;
+        pan.current = {id: event.pointerId, x: event.clientX, y: event.clientY, moved: false};
+        event.currentTarget.setPointerCapture(event.pointerId); return;
+      }
+      suppressClick.current = false;
       if (props.modelPromptMode !== 'box' || event.button !== 0 || imageState !== 'ready') return;
       if (props.onSelect?.() === false) return;
       const point = originalPixel(event.clientX, event.clientY);
@@ -297,6 +348,15 @@ export function CameraView(props: CameraViewProps) {
       setDraftModelBox([...point, ...point]);
     }}
     onPointerMove={event => {
+      if (pan.current?.id === event.pointerId) {
+        const current = pan.current;
+        const rect = canvas.current!.getBoundingClientRect();
+        const dx = (event.clientX-current.x)*size.width/rect.width, dy = (event.clientY-current.y)*size.height/rect.height;
+        current.x = event.clientX; current.y = event.clientY;
+        if (dx || dy) current.moved = true;
+        setViewport(value => boundViewport({...value, x: value.x+dx, y: value.y+dy}));
+        return;
+      }
       if (!modelDrag.current || event.pointerId !== modelDrag.current.pointerId) return;
       const point = originalPixel(event.clientX, event.clientY, true);
       if (!point) return;
@@ -304,6 +364,11 @@ export function CameraView(props: CameraViewProps) {
       setDraftModelBox([Math.min(start[0], point[0]), Math.min(start[1], point[1]), Math.max(start[0], point[0]), Math.max(start[1], point[1])]);
     }}
     onPointerUp={event => {
+      if (pan.current?.id === event.pointerId) {
+        suppressClick.current = pan.current.moved; pan.current = null;
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        return;
+      }
       const drag = modelDrag.current;
       if (!drag || event.pointerId !== drag.pointerId) return;
       const point = originalPixel(event.clientX, event.clientY, true);
@@ -314,8 +379,11 @@ export function CameraView(props: CameraViewProps) {
       const box: [number, number, number, number] = [Math.min(drag.start[0], point[0]), Math.min(drag.start[1], point[1]), Math.max(drag.start[0], point[0]), Math.max(drag.start[1], point[1])];
       if (box[2] - box[0] >= 1 && box[3] - box[1] >= 1) props.onModelBox?.(box);
     }}
-    onPointerCancel={() => { modelDrag.current = null; setDraftModelBox(null); }}
+    onPointerCancel={() => { pan.current = null; modelDrag.current = null; setDraftModelBox(null); }}
+    onLostPointerCapture={() => {pan.current = null;}}
+    onContextMenu={event => {if (props.zoomable) event.preventDefault();}}
     onClick={(event) => {
+      if (event.button !== 0 || suppressClick.current) {suppressClick.current = false; return;}
       if (props.onSelect?.() === false) return;
       if (props.calibrationPicking) {
         if (imageState === 'ready' && event.detail <= 1) {
@@ -338,6 +406,14 @@ export function CameraView(props: CameraViewProps) {
     onDoubleClick={(event) => { event.preventDefault(); if (!props.modelPromptMode && props.tool === 'polygon' && props.selected !== false) props.onFinishPolygon?.(); }}
   >
     <canvas ref={canvas} aria-label={`${props.camera.name} 标注投影`} style={{ width: '100%', height: '100%', display: 'block' }} />
+    {props.zoomable && <div role="group" aria-label="图像缩放" onPointerDown={event => event.stopPropagation()} onClick={event => event.stopPropagation()}
+      style={{position: 'absolute', bottom: 30, left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 8, padding: '5px 10px', background: '#0b192deb', borderRadius: 5, color: '#d2e6f1', fontSize: 12}}>
+      <button type="button" className="button subtle" aria-label="缩小图像" disabled={viewport.zoom <= 1 || imageState !== 'ready'} onClick={() => zoomAt(1/1.25)}>−</button>
+      <span aria-label="图像缩放比例">{Math.round(viewport.zoom*100)}%</span>
+      <button type="button" className="button subtle" aria-label="放大图像" disabled={viewport.zoom >= 16 || imageState !== 'ready'} onClick={() => zoomAt(1.25)}>＋</button>
+      <button type="button" className="button subtle" aria-label="复位图像缩放" onClick={() => setViewport({zoom: 1, x: 0, y: 0})}>适应窗口</button>
+      <span style={{whiteSpace: 'nowrap'}}>滚轮缩放 · 右键拖动</span>
+    </div>}
     <div style={{ position: 'absolute', top: 7, left: 8, display: 'flex', alignItems: 'center', gap: 5, background: '#0a121ec9', padding: '4px 6px', borderRadius: 3, pointerEvents: 'none', font: '9px ui-monospace, monospace', color: props.selected ? '#65dfc8' : '#d2dce7', letterSpacing: '.055em' }}>
       <span style={{ width: 4, height: 4, borderRadius: '50%', background: imageState === 'ready' ? '#63d4b3' : '#e8ac70' }} />
       {props.camera.name || props.camera.id}
