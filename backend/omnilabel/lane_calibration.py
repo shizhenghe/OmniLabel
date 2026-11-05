@@ -141,12 +141,6 @@ class ApplyRequest(Model):
     confirm_frame_update: bool = False
 
 
-class OverlapRequest(Model):
-    optimization: OptimizeRequest
-    max_distance_px: float = Field(default=60, gt=0, le=300)
-    fingerprint: str | None = None
-
-
 def runtime_status():
     available = all(find_spec(name) is not None for name in ("torch", "yaml", "matplotlib"))
     return {"available": available, "detail": "CPU PyTorch 多帧 SE(3) 优化已安装。" if available
@@ -398,34 +392,6 @@ class LaneCalibrationManager:
         return {"initial_matrix": problem["initial_matrix"], "conventions": problem["conventions"],
                 "statistics": statistics(problem, groups, np.asarray(problem["initial_matrix"])), "source_fingerprint": token}
 
-    def match_overlap(self, clip_id, camera_id, value: OverlapRequest):
-        from .lane_overlap import match_overlap
-        with self.store.lock:
-            problem, token, _ = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), value.optimization, validate_split=False)
-            matches = []
-            for observation in problem['observations']:
-                try:
-                    match = match_overlap(observation, problem['camera'], problem['initial_matrix'], value.max_distance_px)
-                except ValueError as exc:
-                    raise ValueError(f"配对 {observation['id']}：{exc}") from exc
-                matches.append(match)
-                observation['world_range'] = match['world_range']
-            fingerprint = _fingerprint({'source': token, 'max_distance_px': value.max_distance_px, 'matches': matches})
-            groups = prepare(problem)
-            return {'matches': matches, 'fingerprint': fingerprint,
-                'statistics': statistics(problem, groups, np.asarray(problem['initial_matrix']))}
-
-    def apply_overlap(self, clip_id, camera_id, value: OverlapRequest):
-        with self.store.lock:
-            if self.active: raise ConflictError('优化运行中，请先取消或等待结束。')
-            proposal = self.match_overlap(clip_id, camera_id, value)
-            if value.fingerprint != proposal['fingerprint']:
-                raise ConflictError('配对、投影参数或数据已变化，请重新自动匹配并确认。')
-            ranges = {match['id']: match['world_range'] for match in proposal['matches']}
-            pairing = self.pairing(clip_id, camera_id)
-            pairs = [{**pair, 'world_range': ranges.get(pair['id'], pair['world_range'])} for pair in pairing['pairs']]
-            return self.save_pairs(clip_id, camera_id, PairUpdate(revision=value.optimization.pairing_revision, pairs=pairs))
-
     def job_path(self, clip_id, camera_id, job_id):
         return self.directory(clip_id, camera_id) / "jobs" / safe_id(job_id)
 
@@ -561,10 +527,9 @@ def mount_lane_calibration_routes(app: FastAPI, manager: LaneCalibrationManager)
     def preview(clip_id: str, camera_id: str, value: OptimizeRequest): return respond(manager.preview, clip_id, camera_id, value)
 
     @app.post(route + "/match-overlap")
-    def match_overlap(clip_id: str, camera_id: str, value: OverlapRequest): return respond(manager.match_overlap, clip_id, camera_id, value)
-
     @app.post(route + "/match-overlap/apply")
-    def apply_overlap(clip_id: str, camera_id: str, value: OverlapRequest): return respond(manager.apply_overlap, clip_id, camera_id, value)
+    def overlap_suspended(clip_id: str, camera_id: str):
+        raise HTTPException(410, "自动匹配重合线段已暂停。请刷新页面，使用手动配对；已采用的裁剪范围可通过恢复完整取样重置。")
 
     @app.post(route + "/discard")
     def discard(clip_id: str, camera_id: str, value: PairUpdate): return respond(manager.discard, clip_id, camera_id, value)
