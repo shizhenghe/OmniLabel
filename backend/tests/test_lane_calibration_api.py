@@ -490,73 +490,23 @@ def test_frame_optimization_requires_explicit_target_and_uses_saved_frame_initia
     assert build_problem(store, 'known', 'front', pairing, settings)[1] != token
 
 
-def test_auto_overlap_preview_and_apply_only_change_selected_pair_ranges(lane_api):
+def test_suspended_overlap_endpoints_cannot_modify_saved_ranges(lane_api):
     client, store, route, request = lane_api
-    document = client.get(route).json()['pairing']
-    for pair in document['pairs']:
-        if pair['frame_id'] == 'f0': pair['image_points'] = pair['image_points'][10:35]
-    response = client.put(route+'/pairs', json=document); assert response.status_code == 200, response.text
-    document = response.json()
-    from test_lane_optimizer import known_problem
-    _, truth = known_problem()
-    payload = {'optimization': {**request, 'pairing_revision': 2, 'mode': 'frame', 'frame_ids': ['f0'], 'initial_matrix': truth.tolist()}}
-    source = (store.root/'clips/known.json').read_bytes()
-    scene = (store.root/'scenes/known.json').read_bytes()
-    preview = client.post(route+'/match-overlap', json=payload)
-    assert preview.status_code == 200, preview.text
-    proposal = preview.json()
-    assert {match['id'] for match in proposal['matches']} == {'p-0-0','p-0-1'}
-    assert all(0 < match['world_range'][0] < match['world_range'][1] < 1 for match in proposal['matches'])
-    assert client.get(route).json()['pairing'] == document  # Read-only until adopted.
-    assert client.post(route+'/match-overlap/apply', json=payload).status_code == 409
-    applied = client.post(route+'/match-overlap/apply', json={**payload, 'fingerprint': proposal['fingerprint']})
-    assert applied.status_code == 200, applied.text
-    updated = applied.json()
-    assert updated['revision'] == 3
-    for old, new in zip(document['pairs'], updated['pairs']):
-        if old['frame_id'] == 'f0':
-            assert new['world_range'] != old['world_range']
-            assert {k:v for k,v in old.items() if k != 'world_range'} == {k:v for k,v in new.items() if k != 'world_range'}
-        else: assert new == old
-    assert (store.root/'clips/known.json').read_bytes() == source
-    assert (store.root/'scenes/known.json').read_bytes() == scene
-    assert client.post(route+'/match-overlap/apply', json={**payload, 'fingerprint': proposal['fingerprint']}).status_code == 409
-
-
-def test_overlap_apply_rejects_changed_extrinsics_even_with_explicit_initial(lane_api):
-    from test_lane_optimizer import known_problem
-    from omnilabel.projection_calibration import document_for, ProjectionUpdate, save_projection_calibration
-    client, store, route, request = lane_api
-    _, truth = known_problem()
-    payload = {'optimization': {**request, 'mode':'frame', 'frame_ids':['f0'], 'initial_matrix': truth.tolist()}}
-    before = client.get(route).json()['pairing']
-    preview = client.post(route+'/match-overlap', json=payload)
-    assert preview.status_code == 200, preview.text
-    current = document_for(store, 'known', 'f0', 'front')
-    matrix = np.asarray(current['effective_matrix']); matrix[0,3] += .05
-    save_projection_calibration(store, 'known', 'f0', 'front', ProjectionUpdate(revision=current['revision'], matrix=matrix.tolist(), method='manual'))
-    response = client.post(route+'/match-overlap/apply', json={**payload, 'fingerprint': preview.json()['fingerprint']})
-    assert response.status_code == 409, response.text
-    assert client.get(route).json()['pairing'] == before
-
-
-def test_cloud_selected_image_line_automatches_without_changing_its_frozen_reference(lane_api):
-    client, store, route, request = lane_api
-    client.put(route+'/pairs', json={'revision':1,'pairs':[]}).raise_for_status()
-    image_id = _image_derived_lane(store, 'f0', 'lane0')
-    selection = {'revision':2,'id':'cloud-partial','frame_id':'f0','lane_id':'lane0',
-        'image_lane_id':image_id,'image_world_range':[.2,.7]}
-    response = client.post(route+'/pairs/from-lanes', json=selection)
+    pairing = client.get(route).json()['pairing']
+    pairing['pairs'][0]['world_range'] = [.1,.4]
+    response = client.put(route+'/pairs', json=pairing)
     assert response.status_code == 200, response.text
-    original = response.json()['pairs'][0]
-    _, truth = known_problem()
-    payload = {'optimization':{**request,'pairing_revision':3,'mode':'frame','frame_ids':['f0'],'initial_matrix':truth.tolist()}}
-    preview = client.post(route+'/match-overlap', json=payload)
-    assert preview.status_code == 200, preview.text
-    response = client.post(route+'/match-overlap/apply', json={**payload,'fingerprint':preview.json()['fingerprint']})
+    saved = response.json()
+    for path in ('/match-overlap', '/match-overlap/apply'):
+        response = client.post(route+path, json={'optimization':request, 'fingerprint':'old-preview'})
+        assert response.status_code == 410, response.text
+        assert '已暂停' in response.text
+        assert client.get(route).json()['pairing'] == saved
+    # Normal pairing remains available and can explicitly restore full sampling.
+    restored = deepcopy(saved)
+    restored['pairs'][0]['world_range'] = [0,1]
+    response = client.put(route+'/pairs', json=restored)
     assert response.status_code == 200, response.text
-    updated = response.json()['pairs'][0]
-    np.testing.assert_allclose(updated['world_range'], [.2,.7], atol=.002)
-    assert updated['image_reference'] == original['image_reference']
-    assert updated['image_points'] == original['image_points']
-    assert updated['image_world_range'] == original['image_world_range']
+    assert response.json()['pairs'][0]['world_range'] == [0,1]
+    for before, after in zip(saved['pairs'], response.json()['pairs']):
+        assert before['image_points'] == after['image_points']
