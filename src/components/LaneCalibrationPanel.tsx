@@ -17,24 +17,49 @@ interface Statistics {
   pairs: {id: string; mean_px: number; rmse_px: number; p95_px: number}[];
   overlays: {id: string; frame_id: string; pixels: ([number, number] | null)[]}[];
 }
+interface MatchingReport {
+  pairs: {id: string; frame_id: string; lane_id: string; matched_samples: number; total_samples: number;
+    matched_fraction: number; image_coverage: number; matched_world_range: number[];
+    mean_distance_px: number; direction: 'forward' | 'reverse'}[];
+  matched_samples: number; pair_count: number;
+}
+interface Observability {
+  rank: number; condition: number; weak_directions?: string[];
+  requested_dof_mode?: string; effective_dof_mode?: string;
+}
+interface Preview {
+  statistics: Statistics; matching?: MatchingReport; observability?: Observability;
+  initial_projection_matrices?: Record<string, number[][]>;
+  projection_matrices?: Record<string, number[][]>;
+}
 interface Result {
   initial_matrix: number[][]; optimized_matrix: number[][];
   before: Statistics; after: Statistics; usable: boolean; rejection_reasons: string[];
   error_reduction: {train: number | null; validation: number | null};
+  matching?: MatchingReport; observability?: Observability;
+  optimization?: {requested_dof_mode: string; effective_dof_mode: string; update_convention: string};
+  initial_projection_matrices?: Record<string, number[][]>;
+  projection_matrices?: Record<string, number[][]>;
 }
 interface Job {
   id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   iteration: number; loss?: number; error?: string; can_apply?: boolean; applied?: boolean; result: Result | null;
   apply_block_reason?: string;
-  request: {pairing_revision: number; mode?: string; frame_ids?: string[]};
+  preview_valid?: boolean; preview_invalid_reason?: string;
+  request: {pairing_revision: number; mode?: string; frame_ids?: string[]; pose_mode?: string;
+    conventions_confirmed?: boolean; time_alignment_confirmed?: boolean; config?: {
+      matching_mode?: 'overlap' | 'full'; dof_mode?: 'auto' | 'rotation' | 'se3';
+      max_match_distance_px?: number; max_match_angle_degrees?: number; adam_iterations?: number;
+    }};
 }
 interface State {
-  runtime: {available: boolean; detail: string}; pairing: Pairing; lanes: Vector[]; latest_job: Job | null;
+  runtime: {available: boolean; legacy_available?: boolean; detail: string}; pairing: Pairing; lanes: Vector[]; latest_job: Job | null;
   coordinate_info: {fused_map: boolean; sensor_mount_available: boolean};
 }
 interface Props {
   clipId: string; camera: Camera; frame: Frame; selectedId: string | null; disabled: boolean;
   onSelectLane: (id: string) => void; onOverlays: (lines: LaneCalibrationOverlay[]) => void;
+  onPreview: (matrix: number[][] | null) => void;
   onBusy: (busy: boolean) => void; onApplied: () => Promise<void>; onClose: () => void;
   pickedPixel: [number, number] | null;
   onPickModeChange: (enabled: boolean) => void;
@@ -43,13 +68,16 @@ interface Props {
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const running = (job: Job | null) => job?.status === 'queued' || job?.status === 'running';
 const metric = (value: number | undefined) => value === undefined ? '—' : `${value.toFixed(2)} px`;
+const percentage = (value: number) => `${(value * 100).toFixed(1)}%`;
 
 export function LaneCalibrationPanel(props: Props) {
   const [state, setState] = useState<State | null>(null);
   const [pairing, setPairing] = useState<Pairing>({revision: 0, pairs: []});
   const [job, setJob] = useState<Job | null>(null);
   const [before, setBefore] = useState<Statistics | null>(null);
+  const [matchPreview, setMatchPreview] = useState<Preview | null>(null);
   const [showResult, setShowResult] = useState(true);
+  const [previewTarget, setPreviewTarget] = useState<'saved' | 'initial' | 'optimized'>('saved');
   const [chosenLane, setChosenLane] = useState('');
   const [chosenImageLane, setChosenImageLane] = useState('');
   const [sourceMode, setSourceMode] = useState<'cloud' | 'image'>('image');
@@ -64,6 +92,10 @@ export function LaneCalibrationPanel(props: Props) {
   const [synchronized, setSynchronized] = useState(false);
   const [advanced, setAdvanced] = useState('');
   const [iterations, setIterations] = useState(180);
+  const [matchingMode, setMatchingMode] = useState<'overlap' | 'full'>('overlap');
+  const [dofMode, setDofMode] = useState<'auto' | 'rotation' | 'se3'>('auto');
+  const [matchDistance, setMatchDistance] = useState(60);
+  const [matchAngle, setMatchAngle] = useState(30);
   const [loading, setLoading] = useState(true);
   const [operation, setOperation] = useState('');
   const [error, setError] = useState('');
@@ -76,17 +108,43 @@ export function LaneCalibrationPanel(props: Props) {
   const jobFrame = job?.request.mode === 'frame' ? job.request.frame_ids?.[0] : null;
   const hasPairs = mode === 'multi' ? pairing.pairs.length > 0 : pairing.pairs.some(pair => pair.frame_id === props.frame.id);
   const result = showResult && job?.request.pairing_revision === pairing.revision ? job.result : null;
+  const matching = result?.matching ?? matchPreview?.matching;
+  const observability = result?.observability ?? matchPreview?.observability;
+  const initialProjections = result?.initial_projection_matrices
+    ?? matchPreview?.initial_projection_matrices ?? matchPreview?.projection_matrices;
+  const currentCandidate = job?.preview_valid === false ? undefined : result?.projection_matrices?.[props.frame.id];
+  const currentInitial = result && job?.preview_valid === false ? undefined : initialProjections?.[props.frame.id];
+  const previewMatrix = previewTarget === 'optimized' && !job?.applied ? currentCandidate : previewTarget === 'initial' ? currentInitial : null;
+  const invalidatePreview = () => {
+    setBefore(null); setMatchPreview(null); setShowResult(false); setPreviewTarget('saved');
+    latest.current.onPreview(null);
+  };
 
   useEffect(() => {
     let alive = true; const controller = new AbortController();
     setLoading(true); setError('');
     request<State>(endpoint, {signal: controller.signal}).then(value => {
-      if (alive) {setState(value); setPairing(value.pairing); setJob(value.latest_job);}
+      if (alive) {
+        setState(value); setPairing(value.pairing); setJob(value.latest_job); setShowResult(true);
+        const saved = value.latest_job?.request;
+        if (saved) {
+          if (saved.mode) setMode(saved.mode);
+          if (saved.pose_mode) setPoseMode(saved.pose_mode);
+          setConfirmed(saved.conventions_confirmed ?? false); setSynchronized(saved.time_alignment_confirmed ?? false);
+          setMatchingMode(saved.config?.matching_mode ?? 'full'); setDofMode(saved.config?.dof_mode ?? 'auto');
+          setMatchDistance(saved.config?.max_match_distance_px ?? 60); setMatchAngle(saved.config?.max_match_angle_degrees ?? 30);
+          setIterations(saved.config?.adam_iterations ?? 180);
+        }
+      }
     }).catch(cause => {if (alive) setError(errorText(cause));}).finally(() => {if (alive) setLoading(false);});
     return () => {alive = false; controller.abort();};
   }, [endpoint]);
   useEffect(() => {latest.current.onBusy(loading || Boolean(operation));}, [loading, operation]);
-  useEffect(() => () => {latest.current.onBusy(false); latest.current.onOverlays([]); latest.current.onPickModeChange(false); latest.current.onConsumedPick();}, []);
+  useEffect(() => () => {latest.current.onBusy(false); latest.current.onOverlays([]); latest.current.onPreview(null); latest.current.onPickModeChange(false); latest.current.onConsumedPick();}, []);
+  useEffect(() => {latest.current.onPreview(previewMatrix ?? null);}, [previewMatrix, props.frame.id, endpoint]);
+  useEffect(() => {
+    if (showResult && job?.status === 'completed' && !job.applied && currentCandidate) setPreviewTarget('optimized');
+  }, [job?.id, job?.status, job?.applied, showResult]);
   useEffect(() => {latest.current.onPickModeChange(sourceMode === 'image' && drawing && Boolean(chosenLane) && !locked && !active);}, [sourceMode, drawing, chosenLane, locked, active]);
   useEffect(() => {
     const point = props.pickedPixel;
@@ -101,6 +159,7 @@ export function LaneCalibrationPanel(props: Props) {
   useEffect(() => {
     setChosenLane(''); setChosenImageLane(''); setRange([0, 100]); setImageRange([0, 100]);
     setImagePoints([]); setDrawing(false);
+    setBefore(null); setMatchPreview(null); setPreviewTarget('saved'); latest.current.onPreview(null);
     setRole(pairing.pairs.find(pair => pair.frame_id === props.frame.id)?.split ?? 'train');
   }, [props.frame.id]);
   useEffect(() => {
@@ -134,7 +193,7 @@ export function LaneCalibrationPanel(props: Props) {
     setOperation('pairs'); setError('');
     try {
       const value = await jsonRequest<Pairing>(`${endpoint}/pairs`, {revision: pairing.revision, pairs}, 'PUT');
-      setPairing(value); setBefore(null); setShowResult(false); return true;
+      setPairing(value); invalidatePreview(); return true;
     } catch (cause) {setError(errorText(cause)); return false;}
     finally {setOperation('');}
   };
@@ -156,22 +215,37 @@ export function LaneCalibrationPanel(props: Props) {
         lane_id: chosenLane, image_lane_id: chosenImageLane, world_range: range.map(v => v / 100),
         image_world_range: imageRange.map(v => v / 100), split: role, weight: 1,
       });
-      setPairing(value); setBefore(null); setShowResult(false); setChosenImageLane('');
+      setPairing(value); invalidatePreview(); setChosenImageLane('');
     } catch (cause) {setError(errorText(cause));} finally {setOperation('');}
   };
   const settings = () => {
     const extra = advanced.trim() ? JSON.parse(advanced) as Record<string, unknown> : {};
     return {...extra, pairing_revision: pairing.revision, mode, ...(['single', 'frame'].includes(mode) ? {frame_ids: [props.frame.id]} : {}), pose_mode: poseMode,
       conventions_confirmed: confirmed, time_alignment_confirmed: synchronized,
-      config: {...(extra.config as Record<string, unknown> ?? {}), adam_iterations: iterations}};
+      config: {...(extra.config as Record<string, unknown> ?? {}), adam_iterations: iterations,
+        matching_mode: matchingMode, dof_mode: dofMode, max_match_distance_px: matchDistance,
+        max_match_angle_degrees: matchAngle}};
   };
   const calculate = async (preview: boolean) => {
+    invalidatePreview();
     setOperation(preview ? 'preview' : 'start'); setError('');
     try {
       if (preview) {
-        const value = await jsonRequest<{statistics: Statistics}>(`${endpoint}/preview`, settings());
-        setBefore(value.statistics); setShowResult(false);
-      } else {setJob(await jsonRequest<Job>(`${endpoint}/jobs`, settings())); setShowResult(true);}
+        const value = await jsonRequest<Preview>(`${endpoint}/preview`, settings());
+        setBefore(value.statistics); setMatchPreview(value); setShowResult(false); setPreviewTarget('initial');
+      } else {
+        latest.current.onPreview(null); setPreviewTarget('saved'); setMatchPreview(null); setBefore(null);
+        setJob(await jsonRequest<Job>(`${endpoint}/jobs`, settings())); setShowResult(true);
+      }
+    } catch (cause) {setError(errorText(cause));}
+    finally {setOperation('');}
+  };
+  const previewMatching = async () => {
+    invalidatePreview();
+    setOperation('matching'); setError('');
+    try {
+      const value = await jsonRequest<Preview>(`${endpoint}/match-preview`, settings());
+      setMatchPreview(value); setBefore(value.statistics); setShowResult(false); setPreviewTarget('initial');
     } catch (cause) {setError(errorText(cause));}
     finally {setOperation('');}
   };
@@ -183,7 +257,10 @@ export function LaneCalibrationPanel(props: Props) {
   const apply = async () => {
     if (!job || (jobFrame && jobFrame !== props.frame.id) || !window.confirm(jobFrame ? `仅将校准结果保存到帧 ${jobFrame} 的 ${props.camera.name}？共享外参、其他帧和其他相机保持不变。` : `将优化外参应用于整个 clip 的 ${props.camera.name}，替换该相机已有的逐帧投影修正？原始安装外参及导入修正会备份，其他相机保持不变。`)) return;
     setOperation('apply'); setError('');
-    try {setJob(await jsonRequest<Job>(`${endpoint}/jobs/${job.id}/apply`, jobFrame ? {confirm_frame_update: true} : {confirm_shared_update: true})); await props.onApplied();}
+    try {
+      const applied = await jsonRequest<Job>(`${endpoint}/jobs/${job.id}/apply`, jobFrame ? {confirm_frame_update: true} : {confirm_shared_update: true});
+      setJob(applied); setPreviewTarget('saved'); latest.current.onPreview(null); await props.onApplied();
+    }
     catch (cause) {setError(errorText(cause));} finally {setOperation('');}
   };
   const discard = async () => {
@@ -191,7 +268,7 @@ export function LaneCalibrationPanel(props: Props) {
     setOperation('discard'); setError('');
     try {
       const value = await jsonRequest<State>(`${endpoint}/discard`, {revision: pairing.revision, pairs: []});
-      setState(value); setPairing(value.pairing); setJob(null); setBefore(null); setShowResult(false);
+      setState(value); setPairing(value.pairing); setJob(null); invalidatePreview();
       setChosenLane(''); setChosenImageLane(''); setRange([0, 100]); setImageRange([0, 100]); setRole('train');
       setImagePoints([]); setDrawing(false);
       props.onSelectLane(''); props.onOverlays([]);
@@ -216,7 +293,7 @@ export function LaneCalibrationPanel(props: Props) {
         <label className="field-label">已选图像投影线 / 按 ID 选择<select aria-label="优化图像投影车道线" value={chosenImageLane} disabled={locked || active || !chosenLane} onChange={e => {setChosenImageLane(e.target.value); props.onSelectLane(e.target.value);}}>
           <option value="">请选择点云中的图像投影线</option>{state.lanes.filter(lane => lane.id !== chosenLane).map(lane => <option key={lane.id} value={lane.id} disabled={imageUnavailable(lane.id)}>{lane.id} · {lane.label} · {lane.points.length} 顶点{imageUnavailable(lane.id) ? ' · 已配对' : ''}</option>)}</select></label>
         <div className="lane-calibration-range">图像投影线取样范围（%）{imageRange.map((value, axis) => <input key={axis} aria-label={axis ? '图像投影线范围终点' : '图像投影线范围起点'} type="number" min="0" max="100" value={value} disabled={locked || active} onChange={e => setImageRange(imageRange.map((v, i) => i === axis ? Number(e.target.value) : v))}/>)}</div>
-        <p>保存配对时按当前已保存的投影参数固定图像位置，绿色叠加可供核对。若当初使用了其他帧或标定，请先恢复对应参考。</p>
+        <p>第二条线必须独立来自真实图像。保存时按当前参考参数固定其原图像素，绿色叠加可供核对。若来自其他帧或标定，请先恢复对应参考；任意两条点云线不能替代图像观测。</p>
         <p role="status">{chosenLane && chosenImageLane ? `待添加：${chosenLane} ↔ ${chosenImageLane}` : '请选择两条不同的线。'}</p>
         </> : <>
           <p>在当前帧 {props.frame.id}、相机 {props.camera.name} 的原图上沿对应车道线依次点击，至少两个不同点，最多 512 点。缩放后的显示会换算为原图像素，不修改原始图像标注。</p>
@@ -230,7 +307,7 @@ export function LaneCalibrationPanel(props: Props) {
         <p>一条真值线可对应多条图像投影线；每条图像投影线只能归属一条真值线，同帧不能重复添加。</p>
       </section>
       <section><h3>已保存配对（{pairing.pairs.length}）</h3><p>{mode === 'frame' ? '当前帧校准使用本帧全部配对，不要求划分验证集；保存的训练/验证标记保持不变。' : '同一帧的所有线共用训练/验证用途，防止验证泄漏。至少需要一组训练配对；建议增加训练帧和独立验证帧，是否采纳由你决定。'}</p>
-        <p>自动匹配重合线段已暂停。若之前采用过自动裁剪，可恢复当前帧的完整三维取样；图像线、原始地图和已保存外参保持不变。</p>
+        <p>重合匹配在每次求解中选择实际可见对应段，不改写配对范围。若之前采用过旧版自动裁剪，可恢复当前帧完整三维取样后预览匹配；图像线、原始地图和已保存外参保持不变。</p>
         <button className="button subtle full-width" aria-label="恢复当前帧完整取样" disabled={locked || active || !pairing.pairs.some(pair => pair.frame_id === props.frame.id && (pair.world_range[0] !== 0 || pair.world_range[1] !== 1))} onClick={() => {
           if (window.confirm(`将帧 ${props.frame.id} 的全部配对恢复为 0–100% 三维取样？图像约束、其他帧、原始标注和已保存外参保持不变。`)) {
             void persist(pairing.pairs.map(pair => pair.frame_id === props.frame.id ? {...pair, world_range: [0, 1]} : pair));
@@ -248,25 +325,58 @@ export function LaneCalibrationPanel(props: Props) {
         {state.coordinate_info.fused_map && (state.coordinate_info.sensor_mount_available
           ? <p>已读取全局地图和真实 LiDAR 安装矩阵；自动模式按每帧车辆位姿恢复雷达 pose。</p>
           : <p className="lane-calibration-warning">这是全局地图导入。单位地图注册矩阵不是车辆 pose；自动模式需要真实 LiDAR 安装变换。</p>)}
-        <label className="field-label">Pose 来源<select aria-label="车道线优化Pose来源" value={poseMode} disabled={locked || active} onChange={e => {setPoseMode(e.target.value); setBefore(null);}}><option value="auto">已有真实传感器 / 注册位姿</option><option value="ego">已确认 LiDAR 坐标与 ego 重合</option><option value="provided">外部带时间戳 Pose（高级配置）</option></select></label>
-        <label><input type="checkbox" aria-label="确认车道线坐标约定" checked={confirmed} disabled={locked || active} onChange={e => setConfirmed(e.target.checked)}/>已确认世界坐标、变换方向、原图分辨率与畸变状态</label>
-        <label><input type="checkbox" aria-label="确认图像Pose同步" checked={synchronized} disabled={locked || active} onChange={e => setSynchronized(e.target.checked)}/>已确认每帧图像与 Pose 时间对齐</label>
-        <details><summary>外参、时间戳与约束高级配置</summary><p>可提供 initial_matrix / initial_direction、sensor_lidar_to_ego，或 pose_samples、pose_direction、image_timestamps；不允许时间外推。</p><textarea aria-label="车道线优化高级配置" value={advanced} placeholder="JSON 配置（可留空）" disabled={locked || active} onChange={e => setAdvanced(e.target.value)}/></details>
+        <label className="field-label">Pose 来源<select aria-label="车道线优化Pose来源" value={poseMode} disabled={locked || active} onChange={e => {setPoseMode(e.target.value); invalidatePreview();}}><option value="auto">已有真实传感器 / 注册位姿</option><option value="ego">已确认 LiDAR 坐标与 ego 重合</option><option value="provided">外部带时间戳 Pose（高级配置）</option></select></label>
+        <label><input type="checkbox" aria-label="确认车道线坐标约定" checked={confirmed} disabled={locked || active} onChange={e => {setConfirmed(e.target.checked); invalidatePreview();}}/>已确认世界坐标、变换方向、原图分辨率与畸变状态</label>
+        <label><input type="checkbox" aria-label="确认图像Pose同步" checked={synchronized} disabled={locked || active} onChange={e => {setSynchronized(e.target.checked); invalidatePreview();}}/>已确认每帧图像与 Pose 时间对齐</label>
+        <details><summary>外参、时间戳与约束高级配置</summary><p>可提供 initial_matrix / initial_direction、sensor_lidar_to_ego，或 pose_samples、pose_direction、image_timestamps；不允许时间外推。</p><textarea aria-label="车道线优化高级配置" value={advanced} placeholder="JSON 配置（可留空）" disabled={locked || active} onChange={e => {setAdvanced(e.target.value); invalidatePreview();}}/></details>
       </section>
       <section><h3>4. 预览与优化</h3><p>{state.runtime.detail}</p>
         <button className="button ghost full-width" aria-label="丢弃当前优化并重新选择" disabled={locked || active} onClick={() => void discard()}>丢弃当前优化并重新选择</button>
         <p>清空当前相机所有帧的配对与候选，保留已保存外参和原始标注。{active ? '请先取消优化，等待结束后再丢弃。' : ''}</p>
-        <label className="field-label">优化模式<select aria-label="车道线优化模式" value={mode} disabled={locked || active} onChange={e => setMode(e.target.value)}><option value="frame">当前帧校准（仅应用当前帧）</option><option value="multi">多帧共享外参（应用整段）</option><option value="single">单帧调试（只导出，不应用）</option></select></label>
+        <label className="field-label">优化模式<select aria-label="车道线优化模式" value={mode} disabled={locked || active} onChange={e => {setMode(e.target.value); invalidatePreview();}}><option value="frame">当前帧校准（仅应用当前帧）</option><option value="multi">多帧共享外参（应用整段）</option><option value="single">单帧调试（只导出，不应用）</option></select></label>
         {mode === 'frame' && <p>仅使用当前帧 {props.frame.id} 的配对，保存到当前相机的逐帧修正。共享外参和其他帧保持不变。{!hasPairs ? '请先为当前帧添加配对。' : ''}</p>}
-        <label className="field-label">Adam 迭代次数<input type="number" aria-label="车道线优化迭代次数" min="1" max="1000" value={iterations} disabled={locked || active} onChange={e => setIterations(Number(e.target.value))}/></label>
+        <label className="field-label">匹配方式<select aria-label="外参匹配方式" value={matchingMode} disabled={locked || active} onChange={e => {setMatchingMode(e.target.value as typeof matchingMode); invalidatePreview();}}><option value="overlap">重合段匹配 · 稳健优化</option><option value="full" disabled={state.runtime.legacy_available === false}>完整范围 · 旧版 Chamfer</option></select></label>
+        {matchingMode === 'overlap' && <>
+          <p>按距离、方向和连续重合段筛选对应，再交替优化外参。未观测长线端点不参与吸附；三维线和固定图像线保持不变。</p>
+          <label className="field-label">自由度<select aria-label="外参优化自由度" value={dofMode} disabled={locked || active} onChange={e => {setDofMode(e.target.value as typeof dofMode); invalidatePreview();}}><option value="auto">自动判断 · 约束不足时仅优化旋转</option><option value="rotation">仅优化旋转 · 保持相机中心</option><option value="se3">六自由度 · 平移与旋转</option></select></label>
+          <div className="lane-calibration-matching-controls"><label>最大距离 · 像素<input aria-label="匹配最大距离" type="number" min="5" max="500" step="5" value={matchDistance} disabled={locked || active} onChange={e => {setMatchDistance(Number(e.target.value)); invalidatePreview();}}/></label>
+            <label>最大方向差 · 度<input aria-label="匹配最大方向差" type="number" min="1" max="89" step="1" value={matchAngle} disabled={locked || active} onChange={e => {setMatchAngle(Number(e.target.value)); invalidatePreview();}}/></label></div>
+          <button className="button subtle full-width" aria-label="预览重合匹配" disabled={locked || active || !hasPairs || !confirmed || !synchronized} onClick={() => void previewMatching()}>{operation === 'matching' ? '正在匹配…' : '预览重合匹配'}</button>
+        </>}
+        <label className="field-label">{matchingMode === 'overlap' ? '求解预算' : 'Adam 迭代次数'}<input type="number" aria-label="车道线优化迭代次数" min="1" max="1000" value={iterations} disabled={locked || active} onChange={e => {setIterations(Number(e.target.value)); invalidatePreview();}}/></label>
         <button className="button subtle full-width" aria-label="预览车道线投影误差" disabled={locked || active || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(true)}>预览当前投影与误差</button>
-        <button className="button primary full-width" aria-label="运行车道线外参优化" disabled={locked || active || !state.runtime.available || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(false)}>{operation === 'start' ? '正在提交…' : mode === 'frame' ? '运行当前帧校准' : '运行共享外参优化'}</button>
+        <button className="button primary full-width" aria-label="运行车道线外参优化" disabled={locked || active || !state.runtime.available || (matchingMode === 'full' && state.runtime.legacy_available === false) || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(false)}>{operation === 'start' ? '正在提交…' : mode === 'frame' ? '运行当前帧校准' : '运行共享外参优化'}</button>
         <p className="lane-calibration-legend"><span style={{color:'#4ade80'}}>● 固定图像线</span><span style={{color:'#fb923c'}}>● 优化前</span><span style={{color:'#38bdf8'}}>● 优化后</span></p>
       </section>
     </>}
+    {matching && <section aria-label="重合段匹配报告"><h3>重合匹配 · {matching.pair_count} 组 / {matching.matched_samples} 个点</h3>
+      <p>覆盖率对应固定图像观测，匹配范围是本轮使用的地图弧长；不会裁剪或移动原始车道线。</p>
+      <ul className="lane-calibration-matches">{matching.pairs.map(pair => {
+        const lane = state?.lanes.find(item => item.id === pair.lane_id);
+        const length = lane?.points.reduce((total, point, index, points) => index
+          ? total + Math.hypot(...point.map((value, axis) => value - points[index - 1][axis])) : total, 0);
+        return <li key={pair.id}><strong>{pair.frame_id} · {pair.lane_id}</strong>
+          <span>{pair.matched_samples}/{pair.total_samples} 点 · 图像覆盖 {percentage(pair.image_coverage)}</span>
+          <span>三维范围 {pair.matched_world_range.map(percentage).join(' – ')}{length === undefined ? '' : `（${pair.matched_world_range.map(value => `${(value * length).toFixed(2)}m`).join(' – ')}）`}</span>
+          <span>匹配距离 {metric(pair.mean_distance_px)} · {pair.direction === 'reverse' ? '反向点序' : '同向点序'}</span>
+        </li>;
+      })}</ul>
+    </section>}
+    {observability && <section aria-label="外参可观测性"><h3>几何约束 · 秩 {observability.rank}/6</h3>
+      <p>当前求解：{(result?.optimization?.effective_dof_mode ?? observability.effective_dof_mode) === 'rotation' ? '仅旋转，相机中心保持不变' : '六自由度'}。</p>
+      {(result?.optimization?.effective_dof_mode ?? observability.effective_dof_mode) === 'rotation' && dofMode === 'auto' && <p className="lane-calibration-warning">当前线段不足以可靠约束六自由度，已自动固定平移。可加入停止线、虚线端点或不同方向的特征后再检查。</p>}
+      {!!observability.weak_directions?.length && <p>弱约束方向：{observability.weak_directions.join('、')}</p>}
+    </section>}
+    {(currentInitial || currentCandidate) && <section aria-label="点云候选预览"><h3>图像与点云投影预览</h3><p>仅临时切换图像投影矩阵；保存仍需点击下方应用按钮。</p>
+      <div className="lane-calibration-preview-buttons"><button className={`button ${previewTarget === 'saved' ? 'primary' : 'subtle'}`} aria-label="恢复已保存投影" aria-pressed={previewTarget === 'saved'} disabled={locked || active} onClick={() => setPreviewTarget('saved')}>已保存</button>
+        <button className={`button ${previewTarget === 'initial' ? 'primary' : 'subtle'}`} aria-label="预览优化前点云" aria-pressed={previewTarget === 'initial'} disabled={locked || active || !currentInitial} onClick={() => setPreviewTarget('initial')}>优化前</button>
+        <button className={`button ${previewTarget === 'optimized' ? 'primary' : 'subtle'}`} aria-label="预览优化后点云" aria-pressed={previewTarget === 'optimized'} disabled={locked || active || !currentCandidate || job?.applied} onClick={() => setPreviewTarget('optimized')}>优化后</button></div>
+      {previewTarget !== 'saved' && <p role="status">正在预览{previewTarget === 'initial' ? '优化前' : '优化后'}矩阵 · {props.frame.id} · 未写入外参</p>}
+    </section>}
     {job && <section aria-label="车道线优化任务"><h3>任务：{job.status}</h3><p role="status">迭代 {job.iteration} {job.loss === undefined ? '' : `· 损失 ${job.loss.toFixed(4)}`}</p>
       {active && <button className="button ghost" disabled={locked} onClick={() => void cancel()}>取消优化</button>}
       {job.error && <p role="alert">{job.error}</p>}
+      {job.preview_invalid_reason && <p role="status">候选已过期：{job.preview_invalid_reason}</p>}
       {job.status === 'completed' && <a className="button subtle" aria-label="下载车道线优化结果" href={`/api${endpoint}/jobs/${job.id}/download`}>下载矩阵、对比图、损失曲线与误差报告</a>}
     </section>}
     {(before || result) && <section><h3>像素误差（前 → 后）</h3>{(['train', 'validation'] as const).map(split => {

@@ -6,9 +6,10 @@ import pytest
 from importlib.util import find_spec
 from scipy.linalg import expm
 from scipy.spatial.transform import Rotation
-if any(find_spec(name) is None for name in ('torch', 'yaml', 'matplotlib')):
-    pytest.skip('Install optional lane calibration dependencies to run numerical tests.', allow_module_level=True)
-import torch
+_missing_optional = any(find_spec(name) is None for name in ('torch', 'yaml', 'matplotlib'))
+pytestmark = pytest.mark.skipif(_missing_optional, reason='Install optional lane calibration dependencies to run legacy numerical tests.')
+if not _missing_optional:
+    import torch
 
 from omnilabel.lane_calibration import OptimizerConfig
 from omnilabel.lane_optimizer import (closest_segments, optimize, prepare, project, resample,

@@ -255,11 +255,6 @@ def optimize(problem: dict, progress=None, cancelled=lambda: False) -> dict:
 
 
 def write_outputs(problem: dict, result: dict, directory: Path):
-    import yaml
-    os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "omnilabel-matplotlib"))
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     directory.mkdir(parents=True, exist_ok=True)
     np.save(directory / "initial_extrinsic.npy", result["initial_matrix"])
     np.save(directory / "initial_input_extrinsic.npy", problem.get("initial_input_matrix", result["initial_matrix"]))
@@ -267,16 +262,38 @@ def write_outputs(problem: dict, result: dict, directory: Path):
     np.save(directory / "optimized_extrinsic.npy", result["optimized_matrix"])
     np.savetxt(directory / "optimized_extrinsic.txt", result["optimized_matrix"], fmt="%.12g")
     (directory / "input_snapshot.json").write_text(json.dumps(problem, ensure_ascii=False, indent=2))
-    (directory / "optimization_config.yaml").write_text(yaml.safe_dump({"camera_id": problem["camera"]["id"],
-        "conventions": problem["conventions"], "mode": problem["mode"], "request": problem.get("request"), **problem["config"]}, allow_unicode=True))
+    configuration = {"camera_id": problem["camera"]["id"], "conventions": problem["conventions"],
+                     "mode": problem["mode"], "request": problem.get("request"), **problem["config"]}
+    try:
+        import yaml
+    except ImportError:
+        # JSON is valid YAML 1.2. The base SciPy solver does not require the
+        # optional PyTorch/YAML/Matplotlib runtime merely to export a result.
+        config_text = json.dumps(configuration, ensure_ascii=False, indent=2)
+    else:
+        config_text = yaml.safe_dump(configuration, allow_unicode=True)
+    (directory / "optimization_config.yaml").write_text(config_text)
     (directory / "error_statistics.json").write_text(json.dumps({k: v for k, v in result.items() if k != "history"}, ensure_ascii=False, indent=2))
     with (directory / "optimization_log.csv").open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(result["history"][0])); writer.writeheader(); writer.writerows(result["history"])
-    figure, axis = plt.subplots(figsize=(7, 4)); axis.plot([r["iteration"] for r in result["history"]], [r["loss"] for r in result["history"]])
-    axis.set(xlabel="Iteration", ylabel="Training objective", title="Shared camera-LiDAR extrinsic optimization")
-    figure.tight_layout(); figure.savefig(directory / "loss_curve.png", dpi=160); plt.close(figure)
+        fields = list(dict.fromkeys(key for row in result["history"] for key in row))
+        writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader(); writer.writerows(result["history"])
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "omnilabel-matplotlib"))
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _write_loss_curve(result["history"], directory / "loss_curve.png")
+    else:
+        figure, axis = plt.subplots(figsize=(7, 4)); axis.plot([r["iteration"] for r in result["history"]], [r["loss"] for r in result["history"]])
+        axis.set(xlabel="Iteration", ylabel="Training objective", title="Camera-LiDAR extrinsic optimization")
+        figure.tight_layout(); figure.savefig(directory / "loss_curve.png", dpi=160); plt.close(figure)
     output = directory / "before_after"; output.mkdir(exist_ok=True)
-    groups = prepare(problem)
+    # Render the exact sampled support that produced each metric. Re-preparing
+    # full lines here would hide the fact that a matching job used only the
+    # actual overlap, and can fail for long lines with a short visible span.
+    groups = [{**observation, "pixels": np.asarray(observation["image_points"])}
+              for observation in problem["observations"]]
     for frame_id in sorted({g["frame_id"] for g in groups}):
         selected = [g for g in groups if g["frame_id"] == frame_id]
         for name, matrix in (("before", result["initial_matrix"]), ("after", result["optimized_matrix"])):
@@ -284,10 +301,36 @@ def write_outputs(problem: dict, result: dict, directory: Path):
             draw = ImageDraw.Draw(image)
             for number, group in enumerate(selected, 1):
                 draw.line([tuple(p) for p in group["pixels"]], fill="#4ade80", width=3)
-                uv, valid = project(problem, group, np.asarray(matrix))
-                for i in range(len(uv)-1):
-                    if valid[i] and valid[i+1]: draw.line([tuple(uv[i]), tuple(uv[i+1])], fill="#fb923c" if name == "before" else "#38bdf8", width=3)
+                overlay = next(row for row in result[name]["overlays"] if row["id"] == group["id"])
+                pixels = overlay["pixels"]
+                for a, b in zip(pixels, pixels[1:]):
+                    if a is not None and b is not None:
+                        draw.line([tuple(a), tuple(b)], fill="#fb923c" if name == "before" else "#38bdf8", width=3)
             rows = [r for r in result[name]["pairs"] if r["frame_id"] == frame_id]
             draw.rectangle((0, 0, image.width, 26), fill="black")
             draw.text((7, 7), f'{name}: mean {np.mean([r["mean_px"] for r in rows]):.2f}px | image reference green | projection {"orange" if name == "before" else "cyan"}', fill="white")
             image.save(output / f"{frame_id}-{name}.png")
+
+
+def _write_loss_curve(history: list[dict], path: Path):
+    """Export actual losses with Pillow when optional Matplotlib is absent."""
+    image = Image.new("RGB", (840, 480), "white"); draw = ImageDraw.Draw(image)
+    left, top, right, bottom = 70, 45, 810, 420
+    draw.line([(left, top), (left, bottom), (right, bottom)], fill="black", width=2)
+    draw.text((left, 12), "Camera-LiDAR matching objective", fill="black")
+    draw.text((right - 75, bottom + 22), "Iteration", fill="black")
+    xs = np.asarray([row["iteration"] for row in history], dtype=float)
+    ys = np.asarray([row["loss"] for row in history], dtype=float)
+    finite = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[finite], ys[finite]
+    if len(xs):
+        low, high = float(ys.min()), float(ys.max())
+        scale = max(high - low, 1e-9)
+        points = list(zip((left + (xs-xs.min()) / max(float(xs.max()-xs.min()), 1) * (right-left)).tolist(),
+                          (bottom - (ys-low) / scale * (bottom-top)).tolist()))
+        if len(points) > 1: draw.line(points, fill="#168ac0", width=2)
+        else:
+            x, y = points[0]; draw.ellipse((x-2, y-2, x+2, y+2), fill="#168ac0")
+        draw.text((4, top), f"{high:.5g}", fill="black")
+        draw.text((4, bottom-12), f"{low:.5g}", fill="black")
+    image.save(path)

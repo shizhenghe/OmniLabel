@@ -47,6 +47,9 @@ tests/e2e/*
 !backend/tests/test_clip_projection_calibration.py
 !docs/lane-calibration.md
 !backend/tests/test_lane_optimizer.py
+!backend/tests/test_lane_matching.py
+!backend/tests/test_lane_matching_api.py
+!tests/e2e/lane-matching.spec.ts
 !backend/tests/test_lane_calibration_api.py
 !tests/e2e/lane-calibration.spec.ts
 !tests/e2e/point-snap.spec.ts
