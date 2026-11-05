@@ -32,6 +32,11 @@ interface State {
   runtime: {available: boolean; detail: string}; pairing: Pairing; lanes: Vector[]; latest_job: Job | null;
   coordinate_info: {fused_map: boolean; sensor_mount_available: boolean};
 }
+interface OverlapProposal {
+  matches: {id: string; world_range: number[]; start_m: number; end_m: number; length_m: number; total_length_m: number; mean_distance_px: number}[];
+  fingerprint: string; statistics: Statistics;
+  request: {optimization: Record<string, unknown>; max_distance_px: number};
+}
 interface Props {
   clipId: string; camera: Camera; frame: Frame; selectedId: string | null; disabled: boolean;
   onSelectLane: (id: string) => void; onOverlays: (lines: LaneCalibrationOverlay[]) => void;
@@ -64,6 +69,8 @@ export function LaneCalibrationPanel(props: Props) {
   const [synchronized, setSynchronized] = useState(false);
   const [advanced, setAdvanced] = useState('');
   const [iterations, setIterations] = useState(180);
+  const [overlap, setOverlap] = useState<OverlapProposal | null>(null);
+  const [matchDistance, setMatchDistance] = useState(60);
   const [loading, setLoading] = useState(true);
   const [operation, setOperation] = useState('');
   const [error, setError] = useState('');
@@ -100,9 +107,11 @@ export function LaneCalibrationPanel(props: Props) {
   }, [props.pickedPixel]);
   useEffect(() => {
     setChosenLane(''); setChosenImageLane(''); setRange([0, 100]); setImageRange([0, 100]);
+    setOverlap(null); setBefore(null);
     setImagePoints([]); setDrawing(false);
     setRole(pairing.pairs.find(pair => pair.frame_id === props.frame.id)?.split ?? 'train');
   }, [props.frame.id]);
+  useEffect(() => {setOverlap(null); setBefore(null);}, [mode, poseMode, advanced, iterations, confirmed, synchronized, matchDistance]);
   useEffect(() => {
     let alive = true; let timer: ReturnType<typeof setTimeout>;
     if (!job || !running(job)) return;
@@ -134,7 +143,7 @@ export function LaneCalibrationPanel(props: Props) {
     setOperation('pairs'); setError('');
     try {
       const value = await jsonRequest<Pairing>(`${endpoint}/pairs`, {revision: pairing.revision, pairs}, 'PUT');
-      setPairing(value); setBefore(null); setShowResult(false); return true;
+      setPairing(value); setBefore(null); setOverlap(null); setShowResult(false); return true;
     } catch (cause) {setError(errorText(cause)); return false;}
     finally {setOperation('');}
   };
@@ -156,7 +165,7 @@ export function LaneCalibrationPanel(props: Props) {
         lane_id: chosenLane, image_lane_id: chosenImageLane, world_range: range.map(v => v / 100),
         image_world_range: imageRange.map(v => v / 100), split: role, weight: 1,
       });
-      setPairing(value); setBefore(null); setShowResult(false); setChosenImageLane('');
+      setPairing(value); setBefore(null); setOverlap(null); setShowResult(false); setChosenImageLane('');
     } catch (cause) {setError(errorText(cause));} finally {setOperation('');}
   };
   const settings = () => {
@@ -166,12 +175,31 @@ export function LaneCalibrationPanel(props: Props) {
       config: {...(extra.config as Record<string, unknown> ?? {}), adam_iterations: iterations}};
   };
   const calculate = async (preview: boolean) => {
+    if (overlap) {setError('请先采用或取消自动匹配范围，再运行预览或优化。'); return;}
     setOperation(preview ? 'preview' : 'start'); setError('');
     try {
       if (preview) {
         const value = await jsonRequest<{statistics: Statistics}>(`${endpoint}/preview`, settings());
         setBefore(value.statistics); setShowResult(false);
       } else {setJob(await jsonRequest<Job>(`${endpoint}/jobs`, settings())); setShowResult(true);}
+    } catch (cause) {setError(errorText(cause));}
+    finally {setOperation('');}
+  };
+  const matchOverlap = async () => {
+    setOperation('match'); setError('');
+    try {
+      const payload = {optimization: settings(), max_distance_px: matchDistance};
+      const value = await jsonRequest<Omit<OverlapProposal, 'request'>>(`${endpoint}/match-overlap`, payload);
+      setOverlap({...value, request: payload}); setBefore(value.statistics); setShowResult(false);
+    } catch (cause) {setError(errorText(cause));}
+    finally {setOperation('');}
+  };
+  const adoptOverlap = async () => {
+    if (!overlap) return;
+    setOperation('match-apply'); setError('');
+    try {
+      const value = await jsonRequest<Pairing>(`${endpoint}/match-overlap/apply`, {...overlap.request, fingerprint: overlap.fingerprint});
+      setPairing(value); setOverlap(null); setBefore(null); setShowResult(false);
     } catch (cause) {setError(errorText(cause));}
     finally {setOperation('');}
   };
@@ -194,6 +222,7 @@ export function LaneCalibrationPanel(props: Props) {
       setState(value); setPairing(value.pairing); setJob(null); setBefore(null); setShowResult(false);
       setChosenLane(''); setChosenImageLane(''); setRange([0, 100]); setImageRange([0, 100]); setRole('train');
       setImagePoints([]); setDrawing(false);
+      setOverlap(null);
       props.onSelectLane(''); props.onOverlays([]);
     } catch (cause) {setError(errorText(cause));} finally {setOperation('');}
   };
@@ -227,10 +256,12 @@ export function LaneCalibrationPanel(props: Props) {
         </>}
         <label className="field-label">本帧用途<select aria-label="优化当前帧用途" value={role} disabled={locked || active} onChange={e => setRole(e.target.value as typeof role)}><option value="train">训练帧</option><option value="validation">独立验证帧</option></select></label>
         <button className="button primary full-width" aria-label="添加车道线配对" disabled={locked || active || !chosenLane || (sourceMode === 'image' ? imagePoints.length < 2 : !chosenImageLane || chosenLane === chosenImageLane || imageUnavailable(chosenImageLane)) || !props.frame.images[props.camera.id]} onClick={() => void addPair()}>添加配对 #{pairing.pairs.length + 1}</button>
+        <p>长三维线对应短图像线时，添加配对后点击下方「自动匹配重合线段」，无需手动估计裁剪百分比。</p>
         <p>一条真值线可对应多条图像投影线；每条图像投影线只能归属一条真值线，同帧不能重复添加。</p>
       </section>
       <section><h3>已保存配对（{pairing.pairs.length}）</h3><p>{mode === 'frame' ? '当前帧校准使用本帧全部配对，不要求划分验证集；保存的训练/验证标记保持不变。' : '同一帧的所有线共用训练/验证用途，防止验证泄漏。至少需要一组训练配对；建议增加训练帧和独立验证帧，是否采纳由你决定。'}</p>
         <ol className="lane-calibration-pairs">{pairing.pairs.map((pair, index) => <li key={pair.id}><strong>#{index + 1} {pair.frame_id} / {pair.lane_id} ↔ {pair.image_lane_id ?? '图像手绘线'}</strong>
+          <span className="lane-calibration-pair-error">优化取样：{(pair.world_range[0]*100).toFixed(2)}%–{(pair.world_range[1]*100).toFixed(2)}%（原线保持完整）</span>
           <select aria-label={`配对${index + 1}用途`} value={pair.split} disabled={locked || active} onChange={e => void persist(pairing.pairs.map(p => p.frame_id === pair.frame_id ? {...p, split: e.target.value as Pair['split']} : p))}><option value="train">训练</option><option value="validation">验证</option></select>
           <button aria-label={`上移配对${index + 1}`} disabled={locked || active || index === 0} onClick={() => {const next = [...pairing.pairs]; [next[index-1], next[index]] = [next[index], next[index-1]]; void persist(next);}}>↑</button>
           <button aria-label={`删除配对${index + 1}`} disabled={locked || active} onClick={() => void persist(pairing.pairs.filter(p => p.id !== pair.id))}>×</button>
@@ -251,9 +282,16 @@ export function LaneCalibrationPanel(props: Props) {
         <p>清空当前相机所有帧的配对与候选，保留已保存外参和原始标注。{active ? '请先取消优化，等待结束后再丢弃。' : ''}</p>
         <label className="field-label">优化模式<select aria-label="车道线优化模式" value={mode} disabled={locked || active} onChange={e => setMode(e.target.value)}><option value="frame">当前帧校准（仅应用当前帧）</option><option value="multi">多帧共享外参（应用整段）</option><option value="single">单帧调试（只导出，不应用）</option></select></label>
         {mode === 'frame' && <p>仅使用当前帧 {props.frame.id} 的配对，保存到当前相机的逐帧修正。共享外参和其他帧保持不变。{!hasPairs ? '请先为当前帧添加配对。' : ''}</p>}
+        <button className="button subtle full-width" aria-label="自动匹配重合线段" disabled={locked || active || !hasPairs || !confirmed || !synchronized} onClick={() => void matchOverlap()}>自动匹配重合线段</button>
+        <details><summary>自动匹配距离设置</summary><label>最大匹配距离 · 像素<input type="number" aria-label="自动匹配最大像素距离" value={matchDistance} min="1" max="300" disabled={locked || active} onChange={e => {if (Number.isFinite(e.target.valueAsNumber) && e.target.valueAsNumber >= 1 && e.target.valueAsNumber <= 300) setMatchDistance(e.target.valueAsNumber);}}/></label></details>
+        {overlap && <div role="region" aria-label="重合线段匹配预览"><p>橙色为自动估计的三维对应段，绿色为图像观测。确认后仅保存配对取样范围，原始地图长线保持完整。</p>
+          {overlap.matches.map(match => <p key={match.id}>配对 #{pairing.pairs.findIndex(pair => pair.id === match.id)+1}：整线 {match.total_length_m.toFixed(1)} m → {match.start_m.toFixed(1)}–{match.end_m.toFixed(1)} m，重合段 {match.length_m.toFixed(1)} m；初始匹配误差 {match.mean_distance_px.toFixed(2)} px</p>)}
+          <button className="button primary" aria-label="采用自动匹配范围" disabled={locked || active} onClick={() => void adoptOverlap()}>采用匹配范围</button>
+          <button className="button ghost" aria-label="取消自动匹配范围" disabled={locked} onClick={() => {setOverlap(null); setBefore(null);}}>取消匹配预览</button>
+        </div>}
         <label className="field-label">Adam 迭代次数<input type="number" aria-label="车道线优化迭代次数" min="1" max="1000" value={iterations} disabled={locked || active} onChange={e => setIterations(Number(e.target.value))}/></label>
-        <button className="button subtle full-width" aria-label="预览车道线投影误差" disabled={locked || active || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(true)}>预览当前投影与误差</button>
-        <button className="button primary full-width" aria-label="运行车道线外参优化" disabled={locked || active || !state.runtime.available || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(false)}>{operation === 'start' ? '正在提交…' : mode === 'frame' ? '运行当前帧校准' : '运行共享外参优化'}</button>
+        <button className="button subtle full-width" aria-label="预览车道线投影误差" disabled={locked || active || Boolean(overlap) || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(true)}>预览当前投影与误差</button>
+        <button className="button primary full-width" aria-label="运行车道线外参优化" disabled={locked || active || Boolean(overlap) || !state.runtime.available || !hasPairs || !confirmed || !synchronized} onClick={() => void calculate(false)}>{operation === 'start' ? '正在提交…' : mode === 'frame' ? '运行当前帧校准' : '运行共享外参优化'}</button>
         <p className="lane-calibration-legend"><span style={{color:'#4ade80'}}>● 固定图像线</span><span style={{color:'#fb923c'}}>● 优化前</span><span style={{color:'#38bdf8'}}>● 优化后</span></p>
       </section>
     </>}

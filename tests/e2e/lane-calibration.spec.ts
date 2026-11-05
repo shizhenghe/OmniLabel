@@ -305,3 +305,55 @@ test('frame-only lane calibration applies successive frames without overwriting 
     } else expect(frame0).toEqual(firstSaved);
   }
 });
+
+
+test('automatically match the observed 80m of a 300m map lane without editing the original', async ({page, request}) => {
+  const id = 'lane-partial-overlap-ui';
+  const demo = await (await request.get('/api/clips/demo')).json();
+  const identity = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]];
+  const optical = [[0,-1,0,0],[0,0,-1,0],[1,0,0,0],[0,0,0,1]];
+  const camera: Camera = {id:'front', name:'Front', width:640, height:360, intrinsics:[[500,0,320],[0,500,180],[0,0,1]], camera_from_ego:optical, distortion:[]};
+  const frame = {id:'f0', timestamp:0, ego_to_world:identity, lidar_to_ego:identity,
+    points:Array.from({length:400}, (_,i) => [8+i%20,-5+Math.floor(i/20)*.5,-1.6,.5]), images:{front:demo.frames[0].images.front}};
+  const imported = await request.post('/api/clips/import', {multipart:{file:{name:id+'.json', mimeType:'application/json', buffer:Buffer.from(JSON.stringify({
+    clip:{id,name:id,fps:10,cameras:[camera],frames:[frame]},
+    scene_annotations:{revision:0,coordinate_frame:'world',tracks:[],vectors:[{id:'long-road',label:'lane',closed:false,points:[[1,2,-1.6],[301,2,-1.6]]}]}
+  }))}}});
+  expect(imported.ok()).toBe(true);
+  const endpoint = `/api/clips/${id}/lane-calibration/front`;
+  const pixels = [20,100].map(x => projectLidarPoint([x,2,-1.6], camera, {...frame,point_count:400} as Frame)!.slice(0,2));
+  const pair = {id:'partial',frame_id:'f0',lane_id:'long-road',image_points:pixels,image_size:[640,360],world_range:[0,1],split:'train',weight:1};
+  const savedPair = await request.put(endpoint+'/pairs', {data:{revision:0,pairs:[pair]}});
+  expect(savedPair.ok(), await savedPair.text()).toBe(true);
+  await page.goto(`/?clip=${id}`);
+  await expect(page.getByLabel('重建整个场景', {exact:true})).toBeEnabled();
+  const original = await (await request.get(`/api/clips/${id}/scene/annotations`)).json();
+  const calibration = await (await request.get(`/api/clips/${id}/calibration`)).json();
+  await page.getByLabel('车道线外参优化', {exact:true}).click();
+  const panel = page.getByTestId('lane-calibration-panel');
+  await panel.getByLabel('确认车道线坐标约定').check();
+  await panel.getByLabel('确认图像Pose同步').check();
+  await panel.getByLabel('自动匹配重合线段', {exact:true}).click();
+  const preview = panel.getByRole('region', {name:'重合线段匹配预览'});
+  await expect(preview).toContainText('整线 300.0 m');
+  await expect(preview).toContainText('重合段 80.0 m');
+  await expect(panel.getByLabel('运行车道线外参优化')).toBeDisabled();
+  expect((await (await request.get(endpoint)).json()).pairing.pairs[0].world_range).toEqual([0,1]);
+  await panel.getByLabel('取消自动匹配范围').click();
+  await expect(preview).toHaveCount(0);
+  expect((await (await request.get(endpoint)).json()).pairing.pairs[0].world_range).toEqual([0,1]);
+  await panel.getByLabel('自动匹配重合线段', {exact:true}).click();
+  await expect(preview).toBeVisible();
+  await panel.getByLabel('采用自动匹配范围').click();
+  await expect(preview).toHaveCount(0);
+  const saved = (await (await request.get(endpoint)).json()).pairing;
+  expect(saved.revision).toBe(2);
+  expect(saved.pairs[0].world_range[0]).toBeCloseTo(19/300, 4);
+  expect(saved.pairs[0].world_range[1]).toBeCloseTo(99/300, 4);
+  expect(saved.pairs[0].image_points).toEqual(pixels);
+  expect(await (await request.get(`/api/clips/${id}/scene/annotations`)).json()).toEqual(original);
+  expect(await (await request.get(`/api/clips/${id}/calibration`)).json()).toEqual(calibration);
+  await panel.getByLabel('车道线优化迭代次数').fill('2');
+  await panel.getByLabel('运行车道线外参优化').click();
+  await expect(panel.getByText('任务：completed', {exact:true})).toBeVisible({timeout:40_000});
+});
