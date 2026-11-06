@@ -58,3 +58,5 @@ tests/e2e/*
 !tests/e2e/camera-focus.spec.ts
 
 !tests/e2e/lane-join.spec.ts
+
+!tests/e2e/frame-segmentation.spec.ts

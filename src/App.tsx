@@ -36,7 +36,7 @@ const vectorClasses = [{id: 'lane', name: '车道线', color: '#f7d16a'}, {id: '
 const modelNames: Record<string, string> = {sam2: 'SAM2 · 图像分割', latr: 'LATR · 三维车道线', mmdetection3d: 'MMDetection3D · 三维检测', openoccupancy: 'OpenOccupancy · 语义占用'};
 type Tool = 'select' | 'box' | 'vector' | 'brush';
 type JobView = {id: string; kind: string; status: string; error?: string; result?: Record<string, unknown>};
-type Proposal = {annotations: Annotations; frameId: string; clipId: string; revision: number; sceneRevision: number; sceneMode: boolean; model: string; weightVariant?: string; occupancy?: {voxels: Voxel[]; voxel_size: number; voxel_dimensions?: Vec3}; warnings?: string[]};
+type Proposal = {annotations: Annotations; frameId: string; clipId: string; revision: number; sceneRevision: number; sceneMode: boolean; model: string; imageCameraId?: string; weightVariant?: string; occupancy?: {voxels: Voxel[]; voxel_size: number; voxel_dimensions?: Vec3}; warnings?: string[]};
 type LanePreview = {scopeKey: string; source: Vector[]; result: LaneMergeResult};
 type LaneMergeUndo = {scopeKey: string; before: Vector[]; after: Vector[]};
 const NO_VECTORS: Vector[] = [];
@@ -763,14 +763,15 @@ export default function App() {
     if (!clip || draftVector.length || draftPolygon.length) {flash('请完成或取消绘制后再导出', true); return;}
     void exportFile(`/clips/${clip.id}/export.zip`, `${clip.id}-dataset.zip`);
   };
-  const runJob = async (kind: string) => {
+  const runJob = async (kind: string, segmentCurrentFrame = false) => {
+    if (segmentCurrentFrame && (workerModel !== 'sam2' || !activeCamera || !frame?.images[activeCamera])) {flash('请选择有图像的相机后分割当前帧。', true); return;}
     if (reviewing || !clip || !frame || runningJob.current || busy || reconstructing || !(await save())) return;
     if (kind === 'propagate' && !clip.frames[frameIndex + 1]) {flash('当前是最后一帧', true); return;}
     runningJob.current = true; setPlaying(false); setJob({id: '', kind, status: 'queued'});
     const key = currentKey, clipId = clip.id, frameId = frame.id, initialSceneRevision = scene?.revision ?? 0;
     try {
       let next = await jsonRequest<JobView>(`/clips/${clip.id}/jobs`, {kind, frame_id: frame.id, voxel_size: voxelSize,
-        ...(kind === 'prelabel' ? {model_id: workerModel, prompt: workerLabel, scene_mode: sceneMode, options: {camera_id: activeCamera, label: workerLabel, points: modelPoints, point_labels: modelPointLabels, ...(modelBox ? {box: modelBox} : {}), score_threshold: scoreThreshold, ...(workerModel === 'latr' ? {weight_variant: latrWeight} : {})}} : {}),
+        ...(kind === 'prelabel' ? {model_id: workerModel, prompt: workerLabel, scene_mode: sceneMode, options: {camera_id: activeCamera, label: workerLabel, points: segmentCurrentFrame ? [] : modelPoints, point_labels: segmentCurrentFrame ? [] : modelPointLabels, ...(!segmentCurrentFrame && modelBox ? {box: modelBox} : {}), score_threshold: scoreThreshold, ...(workerModel === 'latr' ? {weight_variant: latrWeight} : {})}} : {}),
         ...(kind === 'propagate' ? {target_frame_id: clip.frames[frameIndex + 1].id} : {})});
       setJob(next);
       for (let attempts = 0; next.status === 'queued' || next.status === 'running'; attempts++) {
@@ -782,7 +783,7 @@ export default function App() {
       if (kind === 'occupancy') setOccupancy({frameId, voxels: (next.result?.voxels ?? []) as Voxel[], size: Number(next.result?.voxel_size ?? voxelSize)});
       else if (kind === 'prelabel') setProposal({annotations: next.result?.proposal as Annotations, frameId, clipId,
         revision: Number((next.result?.proposal as Annotations)?.revision), sceneRevision: Number(next.result?.scene_revision ?? initialSceneRevision), sceneMode,
-        model: String(next.result?.model_id ?? workerModel), weightVariant: next.result?.weight_variant as string | undefined, occupancy: next.result?.occupancy as Proposal['occupancy'], warnings: next.result?.warnings as string[]});
+        model: String(next.result?.model_id ?? workerModel), ...(segmentCurrentFrame ? {imageCameraId: activeCamera} : {}), weightVariant: next.result?.weight_variant as string | undefined, occupancy: next.result?.occupancy as Proposal['occupancy'], warnings: next.result?.warnings as string[]});
       else if (!frameDirtyRef.current) {
         const before = editGeneration.current;
         const saved = await request<Annotations>(`/clips/${clipId}/frames/${frameId}/annotations`);
@@ -797,7 +798,7 @@ export default function App() {
     if (!proposal || !clip || !frame || proposal.clipId !== clip.id || proposal.frameId !== frame.id || dirty || proposal.sceneMode !== sceneMode || proposal.revision !== annotations.revision || (sceneMode && proposal.sceneRevision !== scene?.revision)) {flash('候选已过期或标注存在修改，请保存后重新生成', true); return;}
     const isLatr = proposal.model === 'latr';
     const mergeLatr = isLatr && (mergeOverride ?? autoMergeLatr);
-    if (!window.confirm(isLatr ? `将 LATR 候选加入${sceneMode ? '世界场景' : '当前帧'}${mergeLatr ? '并融合重叠车道线' : ''}，保留其他任务标注。应用后请审核并保存。继续？` : sceneMode ? '将候选三维目标加入当前时刻关键帧，保留其他时刻轨迹；图像与点级结果替换当前帧对应标注。应用后仍需审核和保存。继续？' : '将候选应用为当前帧未保存标注，人工审核后再保存。继续？')) return;
+    if (!window.confirm(proposal.imageCameraId ? `将当前帧 ${frame.id}、相机 ${proposal.imageCameraId} 的分割候选应用为草稿，检查后保存。继续？` : isLatr ? `将 LATR 候选加入${sceneMode ? '世界场景' : '当前帧'}${mergeLatr ? '并融合重叠车道线' : ''}，保留其他任务标注。应用后请审核并保存。继续？` : sceneMode ? '将候选三维目标加入当前时刻关键帧，保留其他时刻轨迹；图像与点级结果替换当前帧对应标注。应用后仍需审核和保存。继续？' : '将候选应用为当前帧未保存标注，人工审核后再保存。继续？')) return;
     const key = currentKey, generation = editGeneration.current;
     let mergedCount = 0;
     setProposalApplying(true);
@@ -827,7 +828,13 @@ export default function App() {
           || laneScope.current.source !== laneVectors || proposalRef.current !== proposal) {
         flash('标注上下文已改变，候选未应用，请重新检查。', true); return;
       }
-      if (sceneMode) {
+      if (proposal.imageCameraId) {
+        const cameraId = proposal.imageCameraId;
+        editFrame(value => ({...value, image_polygons: [
+          ...value.image_polygons.filter(polygon => polygon.camera_id !== cameraId),
+          ...proposal.annotations.image_polygons.filter(polygon => polygon.camera_id === cameraId),
+        ]}));
+      } else if (sceneMode) {
         editScene(value => {
           const tracks = [...value.tracks];
           if (!isLatr) for (const predicted of proposal.annotations.boxes) {
@@ -842,7 +849,8 @@ export default function App() {
       } else if (isLatr) editFrame(value => ({...value, vectors: nextVectors}));
       else editFrame(() => ({...proposal.annotations, revision: annotations.revision}));
       if (isLatr && mergedCount) setLaneMergeUndo({scopeKey: laneScopeKey, before: beforeFusion, after: nextVectors});
-      if (proposal.occupancy) {setOccupancy({frameId: frame.id, voxels: proposal.occupancy.voxels, size: proposal.occupancy.voxel_size, dimensions: proposal.occupancy.voxel_dimensions}); setTask('occupancy'); setSceneMode(false);}
+      if (!proposal.imageCameraId && proposal.occupancy) {setOccupancy({frameId: frame.id, voxels: proposal.occupancy.voxels, size: proposal.occupancy.voxel_size, dimensions: proposal.occupancy.voxel_dimensions}); setTask('occupancy'); setSceneMode(false);}
+      if (proposal.imageCameraId) {setTask('image'); setAnnotationProjection(true); setTool('select');}
       if (isLatr) {setTask('lane'); setShowVectors(true); setTool('select'); setSelectedId(null); setLaneMergeOpen(false);}
       setProposal(null); setModal(null); setModelPromptMode(null);
       flash(isLatr ? `LATR 候选已应用${mergedCount ? `，融合 ${mergedCount} 条重复线` : ''}，请核验后保存` : '候选已应用为未保存修改，请核验后保存');
@@ -1018,6 +1026,7 @@ export default function App() {
     <div className={`model-readiness ${selectedModel?.available ? 'ready' : ''}`}><span className="status-dot"/>{modelStatus(selectedModel)}</div>
     <label className="field-label">候选类别<input aria-label="候选类别" value={workerLabel} maxLength={80} onChange={e => setWorkerLabel(e.target.value)}/></label>
     {workerModel === 'sam2' ? <><p className="micro-copy">在左侧所选相机添加正/负提示点或拖出提示框。无提示时执行自动掩码生成；类别名称不会触发文本识别。</p><div className="prompt-tools"><button className={`button subtle ${modelPromptMode === 'point' && !negativePrompt ? 'active' : ''}`} aria-label="SAM2正提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(false);}}>＋ 正点</button><button className={`button subtle ${modelPromptMode === 'point' && negativePrompt ? 'active' : ''}`} aria-label="SAM2负提示点" onClick={() => {setModelPromptMode('point'); setNegativePrompt(true);}}>− 负点</button><button className={`button subtle ${modelPromptMode === 'box' ? 'active' : ''}`} aria-label="SAM2提示框" onClick={() => setModelPromptMode('box')}>提示框</button><button className="button ghost" onClick={() => {setModelPromptMode(null); setModelPoints([]); setModelPointLabels([]); setModelBox(undefined);}}>清除</button></div><p className="micro-copy">{modelPoints.length} 个提示点 · {modelBox ? '已选提示框' : '未选提示框'} · {activeCamera}</p></> : <>{workerModel === 'latr' && <><p className="micro-copy">请选择当前帧的前视相机。LATR 使用图像与真实标定生成 LiDAR 坐标三维车道折线。</p><label className="closed-field"><input type="checkbox" aria-label="应用LATR时融合重复车道线" checked={autoMergeLatr} disabled={busy || jobBusy} onChange={e => setAutoMergeLatr(e.target.checked)}/>单帧候选应用时融合重复车道线</label><label className="field-label">LATR 推理权重<select aria-label="LATR推理权重" value={latrWeight} onChange={e => setLatrWeight(e.target.value as 'once' | 'openlane')}><option value="once">ONCE · once.pth</option><option value="openlane">OpenLane · openlane.pth</option></select></label></>}<label className="field-label">置信度阈值<input type="number" aria-label="模型置信度阈值" min="0" max="1" step="0.05" value={scoreThreshold} onChange={e => {if (Number.isFinite(e.target.valueAsNumber)) setScoreThreshold(Math.min(1, Math.max(0, e.target.valueAsNumber)));}}/></label></>}
+    {workerModel === 'sam2' && <><p className="micro-copy">当前帧 {frame?.id ?? '—'} · 相机 {activeCamera || '—'}。整图分割会忽略点、框提示；类别需人工审核。</p><button className="button primary full-width" aria-label="分割当前帧" disabled={!clip || !frame?.images[activeCamera] || reviewing || busy || jobBusy || reconstructing || !workerLabel.trim() || !selectedModel?.available} onClick={() => void runJob('prelabel', true)}><Icon name="image" size={15}/>{jobBusy ? '分割处理中…' : '分割当前帧 · 当前相机'}</button></>}
     <button className="button primary full-width" aria-label="生成候选标注" disabled={!clip || busy || jobBusy || reconstructing || !workerLabel.trim() || !selectedModel?.available} onClick={() => void runJob('prelabel')}><Icon name="model" size={15}/>{jobBusy ? '模型推理中…' : workerModel === 'latr' ? '运行当前帧预标注' : '运行模型预标注'}</button>
     {workerModel === 'latr' && <button className="button subtle full-width" aria-label="LATR批量预标注" disabled={!clip || !activeCamera || busy || jobBusy || reconstructing || reviewing} onClick={() => void openLatrBatch()}><Icon name="layers" size={15}/>当前相机 · 批量预标注</button>}
     <button className="button ghost full-width" onClick={() => void openModels()}>配置 / 检查模型服务</button>
