@@ -16,9 +16,11 @@ test('PJLab input check reads actual data, explains missing mask and refreshes a
  await panel.getByLabel('检查当前帧标定输入',{exact:true}).click();
  await expect(panel.getByTestId('calibration-input-image')).toHaveAttribute('data-status','ready');
  await expect(panel.getByTestId('calibration-input-intrinsics')).toHaveAttribute('data-status','ready');
+ await expect(panel.getByTestId('calibration-input-initial')).toHaveAttribute('data-status','ready');
  await expect(panel.getByTestId('calibration-input-mask')).toHaveAttribute('data-status','missing');
  await expect(panel.getByTestId('calibration-input-intensity')).toHaveAttribute('data-status','ready');
  await expect(panel.getByTestId('calibration-input-synchronization')).toHaveAttribute('data-status','warning');
+ await expect(panel.getByTestId('calibration-input-synchronization')).toContainText('使用提示（非缺失项）');
  await expect(panel.getByTestId('calibration-input-mask')).toContainText('SAM2');
  const data=await page.evaluate(({width,height})=>{
   const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;

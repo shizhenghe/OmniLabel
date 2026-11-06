@@ -787,7 +787,7 @@ def test_pjlab_input_check_sync_scan_and_uploaded_mask_still_do_not_certify_phys
     assert report['ready_to_run'] and report['input_source'] == 'synchronized_sensor_scan'
     assert report['nominal_time_delta_ms'] == 0
     assert checks['scan']['status'] == 'ready' and checks['mask']['status'] == 'ready'
-    assert checks['initial']['status'] == 'warning' and checks['synchronization']['status'] == 'warning'
+    assert checks['initial']['status'] == 'ready' and checks['synchronization']['status'] == 'warning'
     assert '不能证明物理同步' in checks['synchronization']['action']
     # A new original image invalidates its existing mask immediately.
     image = store.root / 'assets/batch/f0-front.png'; image.write_bytes(image.read_bytes())
@@ -813,3 +813,43 @@ def test_pjlab_input_check_explains_blocking_inputs(calibration_api, monkeypatch
 def test_pjlab_input_check_rejects_unknown_pair(calibration_api):
     client, _, _ = calibration_api
     assert client.get(ROUTE + '/inputs/f0/unknown').status_code == 404
+
+
+def test_readiness_distinguishes_supplied_zero_distortion_from_missing_parameters(calibration_api, monkeypatch):
+    client, store, _ = calibration_api
+    clip = store.source_clip('batch')
+    clip.cameras[0].distortion = [0]*5
+    atomic_json(store.root / 'clips/batch.json', clip.model_dump())
+    checks = {v['key']: v for v in client.get(ROUTE + '/inputs/f0/front').json()['checks']}
+    assert checks['distortion']['status'] == 'ready'
+    assert '矫正后内参' in checks['distortion']['action']
+    assert checks['initial']['status'] == 'ready'
+
+
+def test_readiness_does_not_subtract_relative_frame_and_absolute_scan_times():
+    from types import SimpleNamespace
+    from omnilabel.calibration_readiness import inspect_time_basis
+    origin = 1786176313.200745
+    frames = [SimpleNamespace(timestamp=0.,calibration_timestamp=origin,calibration_pointcloud_file='raw0.npy'),
+              SimpleNamespace(timestamp=.500028,calibration_timestamp=1786176313.700773,calibration_pointcloud_file='raw1.npy')]
+    clip = SimpleNamespace(source='4d-clip-import',frames=frames)
+    assert inspect_time_basis(clip,frames[0],True)['relative_interval_residual_ms'] is None
+    result = inspect_time_basis(clip,frames[1],True)
+    assert result['time_basis'] == 'clip_relative_vs_scan_epoch'
+    assert result['nominal_time_delta_ms'] is None
+    assert abs(result['relative_interval_residual_ms']) < .001
+    assert '不能直接相减' in result['detail'] and '不证明曝光同步' in result['detail']
+    # A shifted later scan remains visible in the interval check; never relabel as synchronized.
+    frames[1].calibration_timestamp += .08
+    result = inspect_time_basis(clip,frames[1],True)
+    assert abs(result['relative_interval_residual_ms']-80) < .001
+    assert result['status'] == 'warning' and result['nominal_time_delta_ms'] is None
+
+
+def test_unknown_mixed_clocks_are_not_assigned_an_invented_origin():
+    from types import SimpleNamespace
+    from omnilabel.calibration_readiness import inspect_time_basis
+    frame = SimpleNamespace(timestamp=.5,calibration_timestamp=1786176313.7,calibration_pointcloud_file='raw.npy')
+    result = inspect_time_basis(SimpleNamespace(source='import',frames=[frame]),frame,True)
+    assert result['time_basis'] == 'incomparable'
+    assert result['nominal_time_delta_ms'] is None and result['relative_interval_residual_ms'] is None
