@@ -1,7 +1,8 @@
-import {useEffect, useId, useRef, useState} from 'react';
+import {useCallback, useEffect, useId, useRef, useState} from 'react';
 import {download, jsonRequest, request} from '../api';
 import type {Clip} from '../types';
 import './AutomaticCalibrationPanel.css';
+import {SAM2LineMaskPanel} from './SAM2LineMaskPanel';
 
 type EngineId = 'koide' | 'direct_nid' | 'pjlab';
 type JobStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed';
@@ -76,7 +77,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
   const [calibrationScope, setCalibrationScope] = useState<'pair' | 'camera' | 'all'>('pair');
   const [overwrite, setOverwrite] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [operation, setOperation] = useState<'start' | 'cancel' | 'save' | 'export' | 'inspect' | 'mask' | null>(null);
+  const [operation, setOperation] = useState<'start' | 'cancel' | 'save' | 'export' | 'inspect' | 'mask' | 'sam2mask' | null>(null);
   const [error, setError] = useState('');
   const [pollError, setPollError] = useState('');
   const [status, setStatus] = useState('');
@@ -87,6 +88,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
   const closeButton = useRef<HTMLButtonElement>(null);
   const latest = useRef({operation, onClose});
   latest.current = {operation, onClose};
+  const maskBusy = useCallback((busy: boolean) => setOperation(busy ? 'sam2mask' : null), []);
   const titleId = useId();
   const scope = useRef(clip.id);
   scope.current = clip.id;
@@ -250,8 +252,9 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
       </div>
       <div className="automatic-calibration-body">
         <p className="automatic-calibration-intro">逐帧、逐相机独立求解并保存外参，适用于震动引起的逐帧偏差，不会用一组结果覆盖整个 clip。保存后同步用于点云和三维标注投影。若数据包含同步单帧扫描，求解器优先使用它。自动结果需通过质量检查；请复核不同距离的静态物体与道路标线。</p>
-        {engine === 'pjlab' && <section className="automatic-calibration-help"><p>PJLab CRLF 需要道路标线/杆体的线特征掩码（原图尺寸 PNG、黑色背景），不可上传原图代替。可配置自动线特征提取，或选中对应帧相机后上传；批量任务会逐项检查掩码。</p>
+        {engine === 'pjlab' && <section className="automatic-calibration-help"><p>PJLab CRLF 需要道路标线/杆体的线特征掩码（原图尺寸 PNG、黑色背景），不可上传原图代替。可配置自动线特征提取，或使用下方 SAM2 生成并选择线区域；也可选中对应帧相机后上传。批量任务会逐项检查掩码。</p>
           <label>当前帧 {frameId} · 相机 {cameraId} 的线特征掩码<input type="file" accept="image/png" aria-label="上传当前帧PJLab线特征掩码" disabled={locked || running || !frameId || !cameraId} onChange={event => {const file = event.target.files?.[0]; event.target.value = ''; if (file) void uploadMask(file);}}/></label>
+          {frameId && cameraId && selectedCamera && <SAM2LineMaskPanel key={`${clip.id}/${frameId}/${cameraId}`} clip={clip} frameId={frameId} cameraId={cameraId} disabled={Boolean(disabled || loading || running || (operation && operation !== 'sam2mask'))} onBusy={maskBusy}/>}
         </section>}
         {loading ? <p className="automatic-calibration-status" role="status">正在检查配准引擎与已有参数…</p> : overview && <>
           <div className="automatic-calibration-summary"><span>图像 / 点云组合<strong>{overview.total_pairs.toLocaleString()}</strong></span><span>已有参数<strong>{overview.saved_pairs.toLocaleString()}</strong></span><span>本次处理<strong>{selectionCount.toLocaleString()} 组</strong></span></div>

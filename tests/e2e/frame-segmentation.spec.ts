@@ -1,0 +1,50 @@
+import {expect,test} from '@playwright/test';
+
+for (const world of [true,false]) test(`automatic current-frame segmentation preserves other tasks in ${world?'world':'frame'} mode`,async({page,request})=>{
+ const clip=await(await request.get('/api/clips/demo')).json();
+ const frameId=clip.frames[0].id, cameraId='front';
+ const otherCamera=clip.cameras.find((c:{id:string})=>c.id!==cameraId).id;
+ const path=`/api/clips/demo/frames/${frameId}/annotations`;
+ let before=await(await request.get(path)).json();
+ const preserved={id:`preserved-${world}`,camera_id:otherCamera,label:'road',points:[[10,10],[50,10],[50,50]]};
+ expect((await request.put(path,{data:{...before,image_polygons:[...before.image_polygons,preserved]}})).ok()).toBeTruthy();
+ before=await(await request.get(path)).json();
+ const nextPath=`/api/clips/demo/frames/${clip.frames[1].id}/annotations`;
+ const nextBefore=await(await request.get(nextPath)).json();
+ const region={id:`segment-${world}`,camera_id:cameraId,label:'road',points:[[100,100],[180,100],[180,180]]};
+ const submitted:any[]=[];
+ await page.route('**/api/models',route=>route.fulfill({json:{models:[{id:'sam2',available:true,tasks:['image-segmentation'],name:'SAM2 fixture'}]}}));
+ await page.route('**/api/clips/demo/jobs',async route=>{
+  const body=route.request().postDataJSON();if(body.kind!=='prelabel')return route.continue();
+  submitted.push(body);
+  const scene=await(await request.get('/api/clips/demo/scene/annotations')).json();
+  // Deliberately return unrelated changes: this action must apply image regions only.
+  const candidate={...structuredClone(before),boxes:[],vectors:[],point_labels:{},image_polygons:[region]};
+  return route.fulfill({status:202,json:{id:'frame-segmentation',kind:'prelabel',status:'completed',result:{proposal:candidate,model_id:'sam2',scene_revision:scene.revision}}});
+ });
+ await page.goto('/');
+ await expect(page.getByLabel('重建整个场景',{exact:true})).toBeEnabled({timeout:60000});
+ if(!world)await page.getByLabel('单帧点云',{exact:true}).click();
+ await page.locator('.task-button').filter({hasText:'图像语义分割'}).click();
+ await page.getByTestId('camera-front').click();
+ await page.getByLabel('SAM2正提示点',{exact:true}).click();
+ const image=page.getByTestId('camera-front');
+ await image.click({position:{x:120,y:100}});
+ await expect(image).toHaveAttribute('data-model-point-count','1');
+ await page.getByLabel('分割当前帧',{exact:true}).click();
+ await expect(page.getByRole('button',{name:'应用候选标注',exact:true})).toBeVisible();
+ expect(submitted).toHaveLength(1);
+ expect(submitted[0]).toMatchObject({frame_id:frameId,model_id:'sam2',options:{camera_id:cameraId,points:[],point_labels:[]}});
+ expect(submitted[0].options.box).toBeUndefined();
+ expect(await(await request.get(path)).json()).toEqual(before);
+ page.once('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'应用候选标注',exact:true}).click();
+ await expect(image).toHaveAttribute('data-projected-polygon-count','1');
+ expect(await(await request.get(path)).json()).toEqual(before);
+ const saved=page.waitForResponse(r=>r.request().method()==='PUT'&&r.url().endsWith(`/frames/${frameId}/annotations`));
+ await page.getByLabel('保存标注',{exact:true}).click();expect((await saved).ok()).toBeTruthy();
+ const after=await(await request.get(path)).json();
+ expect(after.boxes).toEqual(before.boxes);expect(after.vectors).toEqual(before.vectors);expect(after.point_labels).toEqual(before.point_labels);
+ expect(after.image_polygons).toEqual([...before.image_polygons.filter((p:{camera_id:string})=>p.camera_id!==cameraId),region]);
+ expect(await(await request.get(nextPath)).json()).toEqual(nextBefore);
+});

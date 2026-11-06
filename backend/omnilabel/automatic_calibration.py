@@ -9,6 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+from io import BytesIO
 import logging
 from pathlib import Path
 import threading
@@ -18,9 +19,11 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 import numpy as np
+from PIL import Image, ImageDraw
+from pydantic import Field
 
 from .calibration_input import calibration_input
-from .models import Identifier, Model
+from .models import Annotations, Identifier, Model
 from .projection_calibration import (
     ProjectionUpdate, _check_revision, _fingerprint, _image_path, _read_record,
     document_for, save_projection_calibration,
@@ -42,6 +45,11 @@ class AutomaticCalibrationRequest(Model):
     camera_ids: list[Identifier] | None = None
 
 
+class SAM2MaskRequest(Model):
+    job_id: Identifier
+    polygon_ids: list[Identifier] = Field(min_length=1, max_length=20000)
+
+
 def engines() -> list[dict]:
     from .automatic_projection import automatic_status
     from .koide_runtime import koide_status
@@ -54,6 +62,12 @@ def engines() -> list[dict]:
 def _stat(path: Path) -> dict:
     stat = path.stat()
     return {"path": str(path), "inode": stat.st_ino, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def mask_image_token(store: Store, frame, camera) -> str:
+    """Masks belong to original pixels, independently of changing extrinsics."""
+    return _fingerprint({"image": _stat(_image_path(store, frame, camera.id)),
+                         "width": camera.width, "height": camera.height})
 
 
 def input_fingerprint(store: Store, frame, camera) -> str:
@@ -167,6 +181,47 @@ class AutomaticCalibrationManager:
             temporary.replace(path)
             atomic_json(path.with_suffix(".json"), {"image": image})
             return {"frame_id": frame_id, "camera_id": camera_id, "status": "saved"}
+
+    def mask_from_sam2(self, clip_id: str, frame_id: str, camera_id: str, value: SAM2MaskRequest):
+        # Geometry is read from a validated, completed server job, never accepted
+        # from arbitrary client polygons. Recheck the image before publication.
+        with self.store.lock:
+            clip = self.store.source_clip(clip_id)
+            frame = next((f for f in clip.frames if f.id == frame_id), None)
+            camera = next((c for c in clip.cameras if c.id == camera_id), None)
+            if frame is None or camera is None:
+                raise KeyError("未找到帧或相机。")
+            job = self.store.job(value.job_id)
+            parameters, result = job.get("parameters", {}), job.get("result", {})
+            if (job.get("clip_id") != clip_id or job.get("kind") != "prelabel"
+                    or job.get("status") != "completed" or parameters.get("model_id") != "sam2"
+                    or result.get("model_id") != "sam2" or result.get("frame_id") != frame_id
+                    or result.get("source_camera_id") != camera_id):
+                raise ValueError("请选择当前帧、当前相机已完成的 SAM2 候选。")
+            if result.get("source_image_token") != mask_image_token(self.store, frame, camera):
+                raise ConflictError("原图已变化或候选缺少图像版本，请重新生成 SAM2 候选。")
+            ids = set(value.polygon_ids)
+            allowed = set(result.get("sam2_candidate_ids", []))
+            if len(ids) != len(value.polygon_ids) or not ids.issubset(allowed):
+                raise ValueError("请选择本次 SAM2 生成的不同候选区域。")
+            proposal = Annotations.model_validate(result["proposal"])
+            polygons = [p for p in proposal.image_polygons if p.id in ids and p.camera_id == camera_id]
+            if len(polygons) != len(ids):
+                raise ValueError("选定区域不存在或属于其他相机。")
+            mask = Image.new("L", (camera.width, camera.height), 0)
+            draw = ImageDraw.Draw(mask)
+            for polygon in polygons:
+                if any(not 0 <= x <= camera.width or not 0 <= y <= camera.height for x, y in polygon.points):
+                    raise ValueError("候选坐标超出原图范围。")
+                draw.polygon([tuple(p) for p in polygon.points], fill=255)
+            output = BytesIO()
+            mask.save(output, format="PNG")
+            saved = self.upload_mask(clip_id, frame_id, camera_id, output.getvalue())
+            metadata_path = self._mask_path(clip_id, frame_id, camera_id).with_suffix(".json")
+            metadata = json.loads(metadata_path.read_text())
+            atomic_json(metadata_path, {**metadata, "source": "sam2", "job_id": value.job_id,
+                                        "polygon_ids": value.polygon_ids})
+            return {**saved, "selected_count": len(ids), "width": camera.width, "height": camera.height}
 
     def _save(self, job: dict):
         items = job["items"]
@@ -470,6 +525,10 @@ def mount_automatic_calibration_routes(app: FastAPI, manager: AutomaticCalibrati
             if len(content) > 16 * 1024 * 1024:
                 raise HTTPException(413, "掩码文件不能超过 16 MiB。")
         return respond(manager.upload_mask, clip_id, frame_id, camera_id, bytes(content))
+
+    @app.post(route + "/masks/{frame_id}/{camera_id}/from-sam2")
+    def save_sam2_mask(clip_id: str, frame_id: str, camera_id: str, value: SAM2MaskRequest):
+        return respond(manager.mask_from_sam2, clip_id, frame_id, camera_id, value)
 
     @app.get(route + "/jobs/{job_id}")
     def read_job(clip_id: str, job_id: str):

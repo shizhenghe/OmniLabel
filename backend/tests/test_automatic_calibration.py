@@ -497,3 +497,100 @@ def test_invalid_scope_engine_and_unavailable_runtime_are_clear_errors(calibrati
     monkeypatch.setattr(batch, "engines", lambda: [{"id": "koide", "available": False, "detail": "Koide unavailable"}])
     response = client.post(ROUTE + "/jobs", json={"engine": "koide"})
     assert response.status_code == 422 and "Koide unavailable" in response.json()["detail"]
+
+
+def sam2_job(store):
+    clip = store.source_clip('batch')
+    proposal = store.annotations('batch', 'f0').model_dump()
+    proposal['image_polygons'] = [
+        {'id': 'stripe', 'camera_id': 'front', 'label': 'lane', 'points': [[10, 20], [85, 20], [85, 24], [10, 24]]},
+        {'id': 'road', 'camera_id': 'front', 'label': 'lane', 'points': [[0, 30], [99, 30], [99, 99], [0, 99]]},
+        {'id': 'side', 'camera_id': 'side', 'label': 'lane', 'points': [[5, 5], [10, 5], [10, 10]]},
+    ]
+    value = {'id': 'sam-mask', 'clip_id': 'batch', 'kind': 'prelabel', 'status': 'completed',
+             'parameters': {'model_id': 'sam2'}, 'result': {'model_id': 'sam2', 'frame_id': 'f0',
+                'source_camera_id': 'front', 'source_image_token': batch.mask_image_token(store, clip.frames[0], clip.cameras[0]),
+                'sam2_candidate_ids': ['stripe', 'road', 'side'], 'proposal': proposal}}
+    store.save_job(value)
+    return value
+
+
+def test_selected_sam2_regions_create_original_size_binary_mask_only(calibration_api):
+    client, store, manager = calibration_api
+    sam2_job(store)
+    original = store.annotations('batch', 'f0').model_dump()
+    response = client.post(ROUTE + '/masks/f0/front/from-sam2', json={'job_id': 'sam-mask', 'polygon_ids': ['stripe']})
+    assert response.status_code == 200, response.text
+    assert response.json()['selected_count'] == 1
+    path = manager._mask_path('batch', 'f0', 'front')
+    with Image.open(path) as mask:
+        assert mask.size == (100, 100)
+        pixels = np.asarray(mask.convert('L'))
+    assert set(np.unique(pixels)) == {0, 255}
+    assert pixels[22, 40] == 255 and pixels[60, 40] == 0
+    assert store.annotations('batch', 'f0').model_dump() == original
+    assert not manager._mask_path('batch', 'f1', 'front').exists()
+    assert not manager._mask_path('batch', 'f0', 'side').exists()
+    assert json.loads(path.with_suffix('.json').read_text())['source'] == 'sam2'
+    clip = store.source_clip('batch')
+    assert manager._pair_fingerprint('batch', clip.frames[0], clip.cameras[0], 'pjlab')
+
+
+@pytest.mark.parametrize('ids', [[], ['missing'], ['stripe', 'stripe'], ['side']])
+def test_sam2_mask_rejects_empty_unknown_duplicate_and_other_camera(calibration_api, ids):
+    client, store, manager = calibration_api
+    sam2_job(store)
+    response = client.post(ROUTE + '/masks/f0/front/from-sam2', json={'job_id': 'sam-mask', 'polygon_ids': ids})
+    assert response.status_code == 422
+    assert not manager._mask_path('batch', 'f0', 'front').exists()
+
+
+@pytest.mark.parametrize('change', ['image', 'pair', 'clip', 'model', 'unfinished', 'busy', 'no_token'])
+def test_sam2_mask_rejects_stale_or_incompatible_job(calibration_api, change):
+    client, store, manager = calibration_api
+    job = sam2_job(store)
+    expected = 422
+    if change == 'image':
+        image = store.root / 'assets/batch/f0-front.png'
+        image.write_bytes(image.read_bytes())
+        expected = 409
+    elif change == 'pair': job['result']['frame_id'] = 'f1'
+    elif change == 'clip': job['clip_id'] = 'other'
+    elif change == 'model': job['parameters']['model_id'] = 'latr'
+    elif change == 'unfinished': job['status'] = 'running'
+    elif change == 'no_token':
+        del job['result']['source_image_token']
+        expected = 409
+    elif change == 'busy':
+        manager._active.add('running'); expected = 409
+    store.save_job(job)
+    response = client.post(ROUTE + '/masks/f0/front/from-sam2', json={'job_id': 'sam-mask', 'polygon_ids': ['stripe']})
+    assert response.status_code == expected, response.text
+    assert not manager._mask_path('batch', 'f0', 'front').exists()
+    manager._active.clear()
+
+
+def test_sam2_job_records_source_version_and_new_regions_without_loading_cloud(calibration_api, monkeypatch):
+    from omnilabel import inference
+    client, store, _ = calibration_api
+    monkeypatch.setenv('OMNILABEL_SAM2_URL', 'http://127.0.0.1:9101/predict')
+    def worker(clip, frame, annotations, *args, **kwargs):
+        proposed = json.loads(json.dumps(annotations))
+        proposed['image_polygons'].append({'id': 'generated', 'camera_id': 'front', 'label': 'lane',
+                                          'points': [[10, 20], [80, 20], [80, 23], [10, 23]]})
+        return {'model_id': 'sam2', 'proposal': proposed}
+    monkeypatch.setattr(inference, 'infer_proposal', worker)
+    monkeypatch.setattr(store, 'materialize_frame', lambda *a: pytest.fail('Image-only SAM2 must not load LiDAR'))
+    response = client.post('/api/clips/batch/jobs', json={'kind': 'prelabel', 'frame_id': 'f0', 'model_id': 'sam2',
+                                                       'options': {'camera_id': 'front', 'label': 'lane'}})
+    assert response.status_code == 202, response.text
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        job = client.get('/api/jobs/' + response.json()['id']).json()
+        if job['status'] not in ('queued', 'running'): break
+        time.sleep(.01)
+    assert job['status'] == 'completed', job
+    assert job['result']['sam2_candidate_ids'] == ['generated']
+    assert job['result']['source_image_token']
+    saved = client.post(ROUTE + '/masks/f0/front/from-sam2', json={'job_id': job['id'], 'polygon_ids': ['generated']})
+    assert saved.status_code == 200, saved.text
