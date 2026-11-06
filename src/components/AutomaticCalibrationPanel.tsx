@@ -15,6 +15,7 @@ interface CalibrationItem {
   reason?: string;
   metrics?: Record<string, unknown>;
   matrix?: number[][];
+  manual_applied?: boolean;
 }
 interface CalibrationJob {
   id: string;
@@ -273,11 +274,12 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
         {job && <section className="automatic-calibration-job" aria-label="自动标定任务进度">
           <div className="automatic-calibration-job-heading"><h3>{job.cancel_requested && running ? '正在取消' : jobLabels[job.status]}</h3><span>{engineName(job.engine)} · {job.processed.toLocaleString()} / {job.total.toLocaleString()}</span>{running && <button className="button ghost" disabled={locked || job.cancel_requested} onClick={() => void cancel()}>{operation === 'cancel' || job.cancel_requested ? '正在取消…' : '取消任务'}</button>}</div>
           <div className="automatic-calibration-progress" role="progressbar" aria-label="图像点云配准进度" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}><span style={{width: `${progress}%`}}/></div>
-          <div className="automatic-calibration-counts" role="status"><span>通过 <strong>{job.accepted}</strong></span><span>已保存 <strong>{job.saved}</strong></span><span>未通过 <strong>{job.rejected}</strong></span><span>失败 <strong>{job.failed}</strong></span><span>跳过 <strong>{job.skipped}</strong></span></div>
+          <div className="automatic-calibration-counts" role="status"><span>通过 <strong>{job.accepted}</strong></span><span>已保存 <strong>{job.saved}</strong></span>{job.items.some(item => item.manual_applied) && <span>人工应用 <strong>{job.items.filter(item => item.manual_applied).length}</strong></span>}<span>未通过 <strong>{job.rejected}</strong></span><span>失败 <strong>{job.failed}</strong></span><span>跳过 <strong>{job.skipped}</strong></span></div>
           <div className="automatic-calibration-results-heading"><label>逐项结果<select aria-label="筛选自动标定结果" value={filter} onChange={event => {setFilter(event.target.value as typeof filter); setPage(0);}}><option value="all">全部（{job.items.length}）</option><option value="attention">未通过 / 失败 / 跳过</option><option value="passed">通过 / 已保存</option></select></label><span>帧 / 相机</span></div>
           <ol className="automatic-calibration-results" aria-label="逐帧逐相机标定结果">{visibleItems.map(item => <li key={`${item.frame_id}/${item.camera_id}`} className={`automatic-calibration-item ${item.status}`}>
             <div><strong>{item.frame_id}</strong><span>{clip.cameras.find(value => value.id === item.camera_id)?.name ?? item.camera_id}</span><em>{itemLabels[item.status]}</em></div>
             <p>{item.reason || (item.status === 'accepted' ? '质量检查通过，等待保存。' : item.status === 'saved' ? '已保存并用于投影。' : item.status === 'pending' ? '等待处理。' : item.status === 'running' ? '正在求解与验证。' : '未返回详细原因。')}</p>
+            {item.manual_applied && <p>已按人工确认应用到本帧本相机；原自动评估仍保留为未通过。</p>}
             {itemMetric(item) && <small>{itemMetric(item)}</small>}
             {onInspect && <button className="automatic-calibration-inspect" disabled={locked || running} onClick={() => void inspect(item)}>{item.matrix && ['accepted', 'rejected', 'saved'].includes(item.status) ? '查看本次结果 / 手动校准' : '查看该帧 / 手动校准'}</button>}
           </li>)}</ol>

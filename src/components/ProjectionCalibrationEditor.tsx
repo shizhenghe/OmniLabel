@@ -66,6 +66,8 @@ interface AutomaticCandidatePreview extends ProjectionCalibrationSolveResult {
   candidate_status: 'accepted' | 'rejected' | 'saved';
   comparison_matrix: Matrix4;
   comparison_source: 'solver_initial' | 'current_saved';
+  manual_applied?: boolean;
+  already_applied?: boolean;
 }
 export interface ProjectionCalibrationEditorProps {
   clipId: string;
@@ -108,6 +110,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const [pickMode, setPickMode] = useState<ProjectionPickMode>(null);
   const [pickingId, setPickingId] = useState<string | null>(null);
   const [candidate, setCandidate] = useState<Matrix4 | null>(null);
+  const [acknowledgedRejected, setAcknowledgedRejected] = useState(false);
   const [automaticReview, setAutomaticReview] = useState<AutomaticCandidatePreview | null>(null);
   const [candidateMethod, setCandidateMethod] = useState<string>('correspondences');
   const [metrics, setMetrics] = useState<ProjectionCalibrationMetrics | null>(null);
@@ -144,7 +147,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     setLoading(true); setBaseline(null); setAnchors([]); setCandidate(null); setAutomaticReview(null); setMetrics(null);
     setPendingPoint(null); setPickMode(null); setPickingId(null); setSelectedId(null);
     setShowCandidate(false); setError(''); setStatus(''); setOperation(null);
-    setSaveScope('frame');
+    setSaveScope('frame'); setAcknowledgedRejected(false);
     latest.current.onPreview(null); latest.current.onPickModeChange(null); latest.current.onConsumedPick();
     request<ProjectionCalibrationDocument>(endpoint).then(async value => {
       if (!active || !unchangedScope(token, scope)) return;
@@ -300,6 +303,33 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     } catch (cause) {if (unchangedScope(token, startScope)) reportFailure(cause, reset ? '清除修正失败' : '保存修正失败');}
     finally {if (unchangedScope(token, startScope)) setOperation(null);}
   };
+  const applyAutomaticCandidate = async () => {
+    if (!baseline || !automaticReview || previewLocked || !showCandidate || automaticReview.already_applied
+        || (!automaticReview.usable && !acknowledgedRejected)) return;
+    const token = sequence.current, startScope = scope;
+    setOperation('save'); setError('');
+    let committed = false;
+    try {
+      const document = await jsonRequest<ProjectionCalibrationDocument>(`/clips/${encodeURIComponent(props.clipId)}/automatic-calibration/jobs/${encodeURIComponent(automaticReview.job_id)}/apply-reviewed/${encodeURIComponent(props.frameId)}/${encodeURIComponent(props.cameraId)}`, {
+        revision: baseline.revision, acknowledge_rejected: !automaticReview.usable && acknowledgedRejected,
+      });
+      committed = true;
+      if (!unchangedScope(token, startScope)) return;
+      setBaseline(document); setCandidate(null); setAutomaticReview(null); setShowCandidate(false);
+      setMetrics(document.metrics ?? null); setMetricsKind('saved');
+      await props.onSaved(document);
+      props.onPreview(null); props.onAutomaticCandidateExit?.();
+      setStatus('外参已应用并保存，仅影响当前帧和当前相机。');
+    } catch (cause) {
+      if (unchangedScope(token, startScope)) {
+        if (committed) {
+          setError(`外参已写入，但界面刷新失败：${errorMessage(cause)}。请重新加载场景。`);
+          props.onError?.(`外参已写入，但界面刷新失败：${errorMessage(cause)}`);
+          props.onPreview(null); props.onAutomaticCandidateExit?.();
+        } else reportFailure(cause, '应用外参失败');
+      }
+    } finally {if (unchangedScope(token, startScope)) setOperation(null);}
+  };
   const close = () => {
     if (operation || (dirty && !window.confirm('当前对应点或候选修正尚未保存，确定放弃并关闭？'))) return;
     props.onPreview(null); props.onPickModeChange(null); props.onClose();
@@ -322,19 +352,25 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     <div className="projection-calibration-heading"><div><h2>投影校正</h2><p>每帧、每路相机独立保存外参，以修正震动造成的投影偏差；三维标注坐标保持不变。</p></div>
       <button className="icon-button" aria-label="关闭投影校正" disabled={Boolean(operation)} onClick={close}>×</button></div>
     <div className="projection-calibration-scope"><span>帧 <strong title={props.frameId}>{props.frameId}</strong></span>{baseline?.saved_matrix && <span className="projection-saved-tag">{baseline.stale ? '修正待重算' : '已有修正'}</span>}</div>
+    {baseline?.metrics?.manual_override === true && <p className="projection-calibration-notice" role="status">当前外参已按人工确认应用，自动检查未通过的原因和评分保留在标定记录中。</p>}
     {baseline?.status_reason && <p className="projection-calibration-notice" role="status">{baseline.status_reason}</p>}
     <label className="field-label">当前相机<select aria-label="投影校正相机" value={props.cameraId} disabled={locked} onChange={event => chooseCamera(event.target.value)}>
       {props.cameras.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}
     </select></label>
     {loading ? <p className="projection-progress" role="status">正在读取当前帧投影…</p> : baseline && <>
       {automaticReview && <section className="projection-calibration-section" data-testid="automatic-candidate-review" data-candidate-status={automaticReview.candidate_status}>
-        <h3>本次自动标定结果 · {automaticReview.candidate_status === 'saved' ? '已保存' : automaticReview.usable ? '通过' : '未通过'} · 只读预览</h3>
-        <p className="projection-help">{automaticReview.candidate_status === 'saved' ? '此结果已保存。当前仅对比任务结果与初值，不会再次写入标定。' : automaticReview.usable ? '检查修正前后投影，返回自动标定任务保存通过结果。' : '此候选未通过自动质量检查，可以查看实际投影，但不能直接保存或作为手动微调初值。'}</p>
+        <h3>本次自动标定结果 · {automaticReview.manual_applied ? '人工已应用' : automaticReview.already_applied || automaticReview.candidate_status === 'saved' ? '已保存' : automaticReview.usable ? '通过' : '未通过'} · 候选复核</h3>
+        <p className="projection-help">{automaticReview.already_applied ? '此结果已保存。当前仅对比任务结果与初值。' : automaticReview.usable ? '检查修正前后投影后，可直接应用到当前帧和当前相机。' : '此候选未通过自动检查。确认投影正确后，可按人工确认结果应用；原来的拒绝原因会保留。'}</p>
         {automaticReview.rejection_reasons?.map((reason, i) => <p className="projection-calibration-notice" key={i}>{reason}</p>)}
         <p>位移 {score(automaticReview.metrics?.translation_delta_m as number)} 米 · 旋转 {score(automaticReview.metrics?.rotation_delta_degrees as number)} 度</p>
         {typeof automaticReview.metrics?.line_overlap_before === 'number' && <p>线特征匹配 {score(automaticReview.metrics.line_overlap_before)} → {score(automaticReview.metrics.line_overlap_after as number)}（拟合评分，需人工复核）</p>}
         <div className="projection-preview-toggle" role="group" aria-label="修正前后预览"><button className={!showCandidate ? 'active' : ''} aria-pressed={!showCandidate} disabled={previewLocked} onClick={() => preview(false)}>修正前</button><button className={showCandidate ? 'active' : ''} aria-pressed={showCandidate} disabled={previewLocked} onClick={() => preview(true)}>候选修正</button></div>
         <p className="projection-help">当前显示：{showCandidate ? '本次求解候选' : automaticReview.comparison_source === 'solver_initial' ? '本次求解初值' : '当前已保存外参'}。图像上的点云和三维标注投影同步切换，标注坐标不变。</p>
+        {!automaticReview.already_applied && <>
+          {!automaticReview.usable && <label className="closed-field"><input type="checkbox" aria-label="确认人工复核超限外参" checked={acknowledgedRejected} disabled={previewLocked} onChange={event => setAcknowledgedRejected(event.target.checked)}/>我已核对近远处投影，接受未通过自动检查的结果，并仅应用到当前帧、当前相机。</label>}
+          <button className="button primary full-width" aria-label="应用本次外参到当前帧当前相机" disabled={previewLocked || !showCandidate || (!automaticReview.usable && !acknowledgedRejected)} onClick={() => void applyAutomaticCandidate()}>{operation === 'save' ? '正在应用…' : automaticReview.usable ? '应用并保存当前帧外参' : '按人工确认应用当前帧外参'}</button>
+          {!showCandidate && <p className="projection-help">请先切换到「候选修正」，检查后应用。</p>}
+        </>}
         <button className="button subtle full-width" aria-label="退出候选预览并手动校准" disabled={previewLocked} onClick={discardCandidate}>退出预览，手动调整已保存初值</button>
         {props.onReturnToAutomatic && <button className="button ghost full-width" disabled={previewLocked} onClick={props.onReturnToAutomatic}>返回自动标定任务</button>}
       </section>}
