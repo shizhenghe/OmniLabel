@@ -7,7 +7,7 @@ interface InputReport {
   ready_to_run: boolean; checks: Check[]; note: string;
 }
 interface Props {clipId: string; frameId: string; cameraId: string; disabled: boolean; refreshKey: number;}
-const labels = {ready: '已具备', warning: '需核对', missing: '待处理'};
+const labels = {ready: '已具备', warning: '使用提示（非缺失项）', missing: '待处理'};
 export function CalibrationInputChecklist({clipId, frameId, cameraId, disabled, refreshKey}: Props) {
   const [report, setReport] = useState<InputReport | null>(null);
   const [checking, setChecking] = useState(false);
@@ -31,7 +31,7 @@ export function CalibrationInputChecklist({clipId, frameId, cameraId, disabled, 
     <button className="button subtle" aria-label="检查当前帧标定输入" disabled={disabled || checking} onClick={() => void inspect()}>{checking ? '正在读取并检查完整扫描…' : '检查当前帧标定输入'}</button>
     {checking && <p role="status">检查完整点云，无点数截断；大扫描可能需要一些时间。</p>}
     {report && <div data-testid="calibration-input-report">
-      <p role="status">{report.ready_to_run ? '输入可开始试运行，仍需核对下列提示并复核求解效果。' : '请先处理以下「待处理」项目，再启动 PJLab。'}</p>
+      <p role="status">{report.ready_to_run ? '必要输入已具备，可开始试运行；使用提示不是数据缺失，仍需复核求解效果。' : '请先处理以下「待处理」项目，再启动 PJLab。'}</p>
       <ul className="calibration-input-checks">{report.checks.map(item => <li key={item.key} data-testid={`calibration-input-${item.key}`} data-status={item.status}>
         <strong><span>{labels[item.status]}</span> · {item.title}</strong><p>{item.detail}</p>{item.action && <p className="calibration-input-action">{item.action}</p>}
       </li>)}</ul><p>{report.note}</p>
