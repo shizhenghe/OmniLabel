@@ -96,6 +96,13 @@ class PairUpdate(Model):
 
 
 class OptimizerConfig(Model):
+    matching_mode: Literal["overlap", "full"] = "overlap"
+    dof_mode: Literal["auto", "rotation", "se3"] = "auto"
+    max_match_distance_px: float = Field(default=60, ge=5, le=500)
+    max_match_angle_degrees: float = Field(default=30, ge=1, le=89)
+    min_match_length_px: float = Field(default=20, ge=2, le=1000)
+    outer_iterations: int = Field(default=6, ge=1, le=20)
+    matching_samples: int = Field(default=512, ge=64, le=2048)
     samples_per_lane: int = Field(default=48, ge=10, le=128)
     adam_iterations: int = Field(default=180, ge=1, le=1000)
     lbfgs_iterations: int = Field(default=25, ge=0, le=100)
@@ -142,9 +149,26 @@ class ApplyRequest(Model):
 
 
 def runtime_status():
-    available = all(find_spec(name) is not None for name in ("torch", "yaml", "matplotlib"))
-    return {"available": available, "detail": "CPU PyTorch 多帧 SE(3) 优化已安装。" if available
-            else "请运行 bash scripts/setup-lane-calibration.sh 安装优化依赖。"}
+    available = find_spec("scipy") is not None
+    legacy = find_spec("torch") is not None
+    return {"available": available, "legacy_available": legacy,
+            "detail": "CPU 匹配外参优化可用；逐轮匹配实际重合段，并检查可观测自由度。" if available
+            else "请运行 bash scripts/setup.sh 安装 SciPy 优化依赖。"}
+
+
+def projection_matrices(problem: dict, matrix) -> dict:
+    """Map original point coordinates to camera using the job's exact poses.
+
+    In particular, a supplied map's primary coordinates are world coordinates,
+    not the physical calibration LiDAR. External timestamped sensor poses may
+    also differ from the registered primary pose, so the preview must compose
+    both saved transforms rather than assume a shared sensor mount.
+    """
+    camera_from_sensor = np.asarray(matrix, dtype=np.float64)
+    return {observation["frame_id"]: (camera_from_sensor
+            @ np.linalg.inv(np.asarray(observation["world_from_lidar"], dtype=np.float64))
+            @ np.asarray(observation.get("world_from_primary", observation["world_from_lidar"]), dtype=np.float64)).tolist()
+            for observation in problem["observations"]}
 
 
 def _interpolate(request: OptimizeRequest, frames):
@@ -246,6 +270,7 @@ def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, req
     if validate_split and request.mode == "single" and len(train) != 1: raise ValueError("单帧调试必须只选择一个训练帧。")
     poses, initial, mount = resolve_geometry(store, clip, camera, frames, request)
     observations, image_tokens = [], []
+    primary_poses = registered_poses(store, clip)
     for pair in pairs:
         if pair.lane_id not in lanes: raise ValueError(f"未找到世界坐标车道线 {pair.lane_id}；请先保存三维标注。")
         _validate_image_lane(pair, lanes, camera)
@@ -260,13 +285,15 @@ def build_problem(store: Store, clip_id: str, camera_id: str, pairing: dict, req
         stat = image.stat(); image_tokens.append([str(image), stat.st_size, stat.st_mtime_ns])
         observations.append({**pair.model_dump(mode="json"), "world_points": lanes[pair.lane_id].model_dump(mode="json")["points"],
             "world_from_lidar": poses[frame.id].tolist(), "image_path": str(image.resolve()),
+            "world_from_primary": primary_poses[frame.id].tolist(),
             "image_timestamp": request.image_timestamps.get(frame.id, frame.timestamp)})
     problem = {"clip_id": clip_id, "camera": camera.model_dump(mode="json"), "initial_matrix": initial.tolist(),
         "initial_input_matrix": request.initial_matrix if request.initial_matrix is not None else initial.tolist(),
         "request": request.model_dump(mode="json"),
         "mode": request.mode, "config": request.config.model_dump(), "observations": observations,
         "conventions": {"points": "world", "pose": "world_from_lidar", "extrinsic": "camera_from_lidar",
-            "update": "T0 @ Exp(xi^)", "pixels": "original raw image; Brown-Conrady distortion",
+            "update": "Exp(camera_xi^) @ T0" if request.config.matching_mode == "overlap" else "T0 @ Exp(xi^)",
+            "pixels": "original raw image; Brown-Conrady distortion",
             "pose_mode": request.pose_mode, "pose_source": "registered world_from_primary @ inverse(primary_to_ego) @ sensor_to_ego" if request.pose_mode != "provided" else "explicit timestamped pose samples",
             "initial_input_direction": request.initial_direction if request.initial_matrix is not None else "derived camera_from_lidar",
             "pose_interpolation": "SLERP + linear translation" if request.pose_mode == "provided" else "frame association confirmed by user"}}
@@ -299,7 +326,7 @@ class LaneCalibrationManager:
             latest_job = next((job for path in jobs if not (job := json.loads(path.read_text())).get("discarded")), None)
             return {"runtime": runtime_status(), "pairing": self.pairing(clip_id, camera_id),
                     "lanes": [v.model_dump(mode="json") for v in scene.vectors if not v.closed],
-                    "latest_job": self.application_status(latest_job) if latest_job else None,
+                    "latest_job": self._preview_status(latest_job) if latest_job else None,
                     "coordinate_info": {"world_lanes": "scene.vectors", "ego_pose": "ego_to_world: ego → world",
                         "camera_mount": "camera_from_ego: ego → camera", "primary_lidar_mount": "lidar_to_ego: primary points → ego",
                         "fused_map": clip.source.startswith("4d-"), "sensor_mount_available": all(
@@ -388,9 +415,16 @@ class LaneCalibrationManager:
     def preview(self, clip_id, camera_id, request: OptimizeRequest):
         with self.store.lock:
             problem, token, _ = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), request, validate_split=False)
-        groups = prepare(problem)
+        if request.config.matching_mode == "overlap":
+            from .lane_matching import preview_matched
+            preview = preview_matched(problem)
+        else:
+            groups = prepare(problem)
+            preview = {"statistics": statistics(problem, groups, np.asarray(problem["initial_matrix"]))}
+        matrices = projection_matrices(problem, problem["initial_matrix"])
         return {"initial_matrix": problem["initial_matrix"], "conventions": problem["conventions"],
-                "statistics": statistics(problem, groups, np.asarray(problem["initial_matrix"])), "source_fingerprint": token}
+                **preview, "projection_matrices": matrices, "initial_projection_matrices": matrices,
+                "source_fingerprint": token}
 
     def job_path(self, clip_id, camera_id, job_id):
         return self.directory(clip_id, camera_id) / "jobs" / safe_id(job_id)
@@ -398,7 +432,7 @@ class LaneCalibrationManager:
     def get_job(self, clip_id, camera_id, job_id):
         path = self.job_path(clip_id, camera_id, job_id) / "job.json"
         if not path.is_file(): raise KeyError("未找到优化任务。")
-        return self.application_status(json.loads(path.read_text()))
+        return self._preview_status(json.loads(path.read_text()))
 
     @staticmethod
     def application_status(job):
@@ -407,14 +441,34 @@ class LaneCalibrationManager:
         job["can_apply"] = (job["status"] == "completed" and not job.get("discarded")
             and job.get("result") is not None and job.get("sensor_lidar_to_ego") is not None
             and job["request"].get("pose_mode") != "provided" and job["request"].get("mode") != "single")
+        job["preview_valid"] = bool(job["status"] == "completed" and job.get("result") and not job.get("discarded"))
+        return job
+
+    def _preview_status(self, job):
+        job = self.application_status(job)
+        if job["preview_valid"] and not job.get("applied"):
+            try:
+                with self.store.lock:
+                    _, current, _ = build_problem(self.store, job["clip_id"], job["camera_id"],
+                        self.pairing(job["clip_id"], job["camera_id"]), OptimizeRequest.model_validate(job["request"]))
+                    if current != job["source_fingerprint"]:
+                        raise ConflictError("数据或配对已变化，请重新匹配并优化。")
+            except (KeyError, ValueError, ConflictError, OSError) as exc:
+                job.update(preview_valid=False, can_apply=False, preview_invalid_reason=str(exc))
         return job
 
     def start(self, clip_id, camera_id, request: OptimizeRequest):
         with self.store.lock:
             if not runtime_status()["available"]: raise ValueError(runtime_status()["detail"])
+            if request.config.matching_mode == "full" and not runtime_status()["legacy_available"]:
+                raise ValueError("旧版完整线优化需要 PyTorch；请安装 scripts/setup-lane-calibration.sh，或选择重合段匹配优化。")
             if self.active: raise ConflictError("已有车道线优化任务正在运行。")
             problem, token, mount = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), request)
-            prepare(problem)
+            if request.config.matching_mode == "overlap":
+                from .lane_matching import prepare_matched
+                prepare_matched(problem)
+            else:
+                prepare(problem)
             job_id = uuid.uuid4().hex; directory = self.job_path(clip_id, camera_id, job_id)
             job = {"id": job_id, "clip_id": clip_id, "camera_id": camera_id, "status": "queued", "iteration": 0,
                 "created_at": datetime.now(timezone.utc).isoformat(), "source_fingerprint": token,
@@ -435,7 +489,13 @@ class LaneCalibrationManager:
             def progress(row):
                 if row["iteration"] % 10 == 0:
                     with self.store.lock: job.update(iteration=row["iteration"], loss=row["loss"]); save()
-            result = optimize(problem, progress, self.events[job["id"]].is_set)
+            if problem["config"].get("matching_mode", "full") == "overlap":
+                from .lane_matching import optimize_matched
+                result = optimize_matched(problem, progress, self.events[job["id"]].is_set)
+            else:
+                result = optimize(problem, progress, self.events[job["id"]].is_set)
+            result["projection_matrices"] = projection_matrices(problem, result["optimized_matrix"])
+            result["initial_projection_matrices"] = projection_matrices(problem, result["initial_matrix"])
             if self.events[job["id"]].is_set(): raise OptimizationCancelled()
             write_outputs(problem, result, directory)
             with self.store.lock:
@@ -471,6 +531,8 @@ class LaneCalibrationManager:
             if not frame_only and not value.confirm_shared_update: raise ValueError("请明确确认将共享外参应用到整个 clip 的当前相机。")
             if job.get("discarded"): raise ConflictError("候选已丢弃，请重新选择配对并优化。")
             if job.get("applied"): return job
+            if job.get("preview_valid") is False and job.get("result"):
+                raise ConflictError(job.get("preview_invalid_reason", "数据已变化，请重新匹配并优化。"))
             if job["status"] != "completed" or not job.get("can_apply"): raise ValueError("候选尚未完成、仅供调试或缺少可应用的坐标变换；可导出检查。")
             _, current, mount = build_problem(self.store, clip_id, camera_id, self.pairing(clip_id, camera_id), OptimizeRequest.model_validate(job["request"]))
             if current != job["source_fingerprint"]: raise ConflictError("数据或配对已变化，禁止应用旧结果。")
@@ -481,7 +543,9 @@ class LaneCalibrationManager:
                 frame = next(f for f in clip.frames if f.id == frame_id)
                 # Optimizer uses the calibration sensor; the projection store
                 # expects the primary cloud's coordinates, including fused maps.
-                matrix = np.asarray(job["result"]["optimized_matrix"]) @ np.linalg.inv(mount) @ np.asarray(frame.lidar_to_ego)
+                preview = job["result"].get("projection_matrices", {}).get(frame_id)
+                matrix = (np.asarray(preview) if preview is not None else
+                          np.asarray(job["result"]["optimized_matrix"]) @ np.linalg.inv(mount) @ np.asarray(frame.lidar_to_ego))
                 document = document_for(self.store, clip_id, frame_id, camera_id)
                 save_projection_calibration(self.store, clip_id, frame_id, camera_id,
                     ProjectionUpdate(revision=document["revision"], matrix=matrix.tolist(), method="manual", scope="frame"), source_job_id=job_id)
@@ -525,6 +589,13 @@ def mount_lane_calibration_routes(app: FastAPI, manager: LaneCalibrationManager)
 
     @app.post(route + "/preview")
     def preview(clip_id: str, camera_id: str, value: OptimizeRequest): return respond(manager.preview, clip_id, camera_id, value)
+
+    @app.post(route + "/match-preview")
+    def match_preview(clip_id: str, camera_id: str, value: OptimizeRequest):
+        # Match only for inspection; neither pairing ranges nor source geometry
+        # are rewritten. Optimization repeats matching around each estimate.
+        value = value.model_copy(update={"config": value.config.model_copy(update={"matching_mode": "overlap"})})
+        return respond(manager.preview, clip_id, camera_id, value)
 
     @app.post(route + "/match-overlap")
     @app.post(route + "/match-overlap/apply")

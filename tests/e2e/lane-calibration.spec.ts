@@ -143,7 +143,10 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await panel.getByLabel('图像上手动选线', {exact: true}).click();
   await panel.getByLabel('绘制优化图像车道线').click();
   await expect(image).toHaveAttribute('data-calibration-picking', 'true');
-  const pixels: [number, number][] = [[210, 275], [300, 235], [390, 205]];
+  // Keep the picking/zoom assertions while using a physically corresponding
+  // image line, so it also passes the new association direction gate.
+  const pixels: [number, number][] = lane.map(point => projectLidarPoint(point, camera,
+    {...frames[0], point_count: 400} as Frame)!.slice(0, 2) as [number, number]);
   const clickPixel = async ([u, v]: [number, number]) => {
     const target = page.getByTestId('camera-front').last();
     await expect(target).toHaveAttribute('data-image-state', 'ready');
@@ -264,13 +267,22 @@ test('frame-only lane calibration applies successive frames without overwriting 
   await expect(panel.getByLabel('绘制优化图像车道线')).toBeVisible();
   let firstSaved: unknown;
   for (const fid of ['f0','f1']) {
+    await expect(page.getByTestId('camera-front')).toHaveAttribute('data-active-frame-id', fid);
     await panel.getByLabel('优化三维车道线').selectOption('truth');
     await panel.getByLabel('绘制优化图像车道线').click();
     const image = page.getByTestId('camera-front');
     await expect(image).toHaveAttribute('data-calibration-picking', 'true');
     const box = (await image.locator('canvas').boundingBox())!;
-    await page.mouse.click(box.x+box.width*.45, box.y+box.height*.65);
-    await page.mouse.click(box.x+box.width*.6, box.y+box.height*.55);
+    const size = await image.evaluate(element => ({width: element.clientWidth, height: element.clientHeight}));
+    const scale = Math.min(size.width/camera.width, size.height/camera.height);
+    // Use corresponding image evidence; arbitrary screen clicks are correctly
+    // rejected by the new distance/direction association gates.
+    for (const point of [[10,-2,-1.6],[30,-2,-1.6]]) {
+      const uv = projectLidarPoint(point, camera, {id: fid, timestamp: 0, ego_to_world: identity,
+        lidar_to_ego: identity, points: [], point_count: 0, images: {}})!;
+      await page.mouse.click(box.x+(size.width-camera.width*scale)/2+uv[0]*scale,
+        box.y+(size.height-camera.height*scale)/2+uv[1]*scale);
+    }
     await panel.getByLabel('添加车道线配对').click();
     await expect(panel).toContainText(`${fid} / truth ↔ 图像手绘线`);
     await panel.getByLabel('确认车道线坐标约定').check();
@@ -307,7 +319,7 @@ test('frame-only lane calibration applies successive frames without overwriting 
 });
 
 
-test('automatic overlap is suspended and saved crops can be restored per frame', async ({page, request}) => {
+test('old crop mutation stays suspended while matching preview and frame range restore coexist', async ({page, request}) => {
   const id = 'lane-overlap-suspended';
   const demo = await (await request.get('/api/clips/demo')).json();
   const camera = demo.cameras.find((c: Camera) => c.id === 'front');
@@ -327,7 +339,8 @@ test('automatic overlap is suspended and saved crops can be restored per frame',
   const calibration = await (await request.get(`/api/clips/${id}/calibration`)).json();
   await page.getByLabel('车道线外参优化',{exact:true}).click();
   const panel = page.getByTestId('lane-calibration-panel');
-  await expect(panel).toContainText('自动匹配重合线段已暂停');
+  await expect(panel).toContainText('重合匹配在每次求解中选择实际可见对应段，不改写配对范围');
+  await expect(panel.getByLabel('预览重合匹配', {exact: true})).toBeVisible();
   await expect(panel.getByLabel('自动匹配重合线段',{exact:true})).toHaveCount(0);
   page.once('dialog', dialog=>dialog.dismiss());
   await panel.getByLabel('恢复当前帧完整取样',{exact:true}).click();

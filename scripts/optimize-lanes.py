@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
-from omnilabel.lane_calibration import OptimizeRequest, OptimizerConfig, build_problem
+from omnilabel.lane_calibration import OptimizeRequest, OptimizerConfig, build_problem, projection_matrices
 from omnilabel.lane_optimizer import optimize, write_outputs
 from omnilabel.storage import Store
 
@@ -24,22 +24,38 @@ def main():
     try:
         if args.snapshot:
             problem = json.loads(args.snapshot.read_text())
+            # Snapshots written before matching was introduced used the full
+            # Chamfer objective. Replaying one must preserve that objective.
+            problem['config'].setdefault('matching_mode', 'full')
             problem['config'] = OptimizerConfig.model_validate(problem['config']).model_dump()
             if problem['conventions']['pose'] != 'world_from_lidar' or problem['conventions']['extrinsic'] != 'camera_from_lidar':
                 raise ValueError('Snapshot must explicitly use world_from_lidar and camera_from_lidar.')
         else:
             if not all([args.data_dir, args.clip, args.camera, args.settings]):
                 parser.error('Provide --snapshot, or --data-dir --clip --camera --settings.')
-            import yaml
             store = Store(args.data_dir)
             path = args.pairing or args.data_dir / 'lane_calibration' / args.clip / args.camera / 'pairs.json'
             pairing = json.loads(path.read_text())
-            settings = yaml.safe_load(args.settings.read_text())
+            text = args.settings.read_text()
+            try:
+                settings = json.loads(text)
+            except json.JSONDecodeError:
+                try:
+                    import yaml
+                except ImportError as exc:
+                    raise ValueError('YAML settings require PyYAML; JSON settings work with the base runtime.') from exc
+                settings = yaml.safe_load(text)
             if not isinstance(settings, dict): raise ValueError('Settings must contain a JSON/YAML mapping.')
             settings.setdefault('pairing_revision', pairing['revision'])
             problem, _, _ = build_problem(store, args.clip, args.camera, pairing, OptimizeRequest.model_validate(settings))
         args.output.mkdir(parents=True, exist_ok=False)
-        result = optimize(problem)
+        if problem['config']['matching_mode'] == 'overlap':
+            from omnilabel.lane_matching import optimize_matched
+            result = optimize_matched(problem)
+        else:
+            result = optimize(problem)
+        result['projection_matrices'] = projection_matrices(problem, result['optimized_matrix'])
+        result['initial_projection_matrices'] = projection_matrices(problem, result['initial_matrix'])
         write_outputs(problem, result, args.output)
         print(json.dumps({'output':str(args.output.resolve()),'usable':result['usable'],
             'error_reduction':result['error_reduction'],'rejection_reasons':result['rejection_reasons']},ensure_ascii=False))
