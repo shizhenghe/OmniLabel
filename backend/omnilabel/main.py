@@ -371,11 +371,25 @@ def create_app(data_dir: str | Path | None = None, seed_demo: bool = True) -> Fa
                         current_annotations = evaluate_scene(store, clip, source.id, scene)
                         scene_revision = scene.revision
                 endpoint, _ = model_connections.endpoint(request.model_id)
-                inference_source = source if request.model_id == "latr" else store.materialize_frame(source)
+                mask_camera = None
+                if (request.model_id == "sam2" and request.options and request.options.camera_id
+                        and source.images.get(request.options.camera_id, "").startswith("/api/assets/")):
+                    from .automatic_calibration import mask_image_token
+                    mask_camera = next(c for c in clip.cameras if c.id == request.options.camera_id)
+                    image_token = mask_image_token(store, source, mask_camera)
+                inference_source = source if request.model_id in ("latr", "sam2") else store.materialize_frame(source)
                 result = infer_proposal(clip_data, inference_source.model_dump(), current_annotations,
                                         request.model_id, request.prompt, assets_root=store.root / "assets",
                                         options=request.options.model_dump(exclude_none=True) if request.options else None,
                                         endpoint=endpoint, token=model_connections.token(request.model_id))
+                if mask_camera is not None:
+                    # A replaced image must never inherit an old inference mask.
+                    if mask_image_token(store, source, mask_camera) != image_token:
+                        raise ConflictError("SAM2 推理期间原图已变化，请重新生成候选。")
+                    existing = {p["id"] for p in current_annotations.get("image_polygons", [])}
+                    result.update(source_image_token=image_token, source_camera_id=mask_camera.id,
+                                  sam2_candidate_ids=[p["id"] for p in result["proposal"]["image_polygons"]
+                                                      if p["id"] not in existing and p["camera_id"] == mask_camera.id])
                 result.update(frame_id=source.id, clip_id=clip.id)
                 if scene_revision is not None:
                     result["scene_revision"] = scene_revision
