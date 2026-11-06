@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
+import {focusProjection, type CameraFocus} from '../geometry/cameraFocus';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { BoxTransformGizmo, type BoxTransformMode } from './BoxTransformGizmo';
 import { VectorVertexGizmo } from './VectorVertexGizmo';
@@ -10,6 +11,7 @@ import {pointCloudSnapper} from '../geometry/pointSnap';
 
 export interface PointCloudViewProps {
   frame: Frame | null;
+  cameraFocus?: CameraFocus | null;
   /** Flat XYZI rows loaded directly from NPY for very large clouds. */
   binaryPoints?: PointBuffer;
   cloudBounds?: {min: Vec3; max: Vec3};
@@ -158,6 +160,14 @@ interface Runtime {
   cloud: THREE.Points | null;
   grid: THREE.GridHelper;
   needsRender: boolean;
+  cameraFocus?: CameraFocus;
+}
+
+function applyFocusProjection(rt: Runtime, width: number, height: number) {
+  if (!rt.cameraFocus || width <= 0 || height <= 0) return;
+  const rows = focusProjection(rt.cameraFocus, width, height, rt.camera.near, rt.camera.far);
+  rt.camera.projectionMatrix.set(...rows.flat() as [number,number,number,number,number,number,number,number,number,number,number,number,number,number,number,number]);
+  rt.camera.projectionMatrixInverse.copy(rt.camera.projectionMatrix).invert();
 }
 
 export function PointCloudView(props: PointCloudViewProps) {
@@ -253,6 +263,7 @@ export function PointCloudView(props: PointCloudViewProps) {
         rt.camera.left = -halfHeight * width / height; rt.camera.right = halfHeight * width / height;
       }
       rt.camera.updateProjectionMatrix();
+      if (rt.cameraFocus) applyFocusProjection(rt, width, height);
       rt.needsRender = true;
     };
     const observer = new ResizeObserver(resize);
@@ -560,6 +571,7 @@ export function PointCloudView(props: PointCloudViewProps) {
       rt.controls.addEventListener('change', rt.invalidate);
       cameraChanged = true;
     };
+    rt.cameraFocus = undefined;
     if (props.view === 'top') {
       if (!(rt.camera instanceof THREE.OrthographicCamera)) {
         const halfHeight = distance * Math.tan(THREE.MathUtils.degToRad(rt.camera.fov / 2));
@@ -591,6 +603,29 @@ export function PointCloudView(props: PointCloudViewProps) {
     rt.needsRender = true;
     if (cameraChanged) setCameraVersion(value => value + 1);
   }, [ready, props.view, props.sceneMode]);
+
+  useEffect(() => {
+    const rt = runtime.current, focus = props.cameraFocus;
+    if (!rt || !focus) return;
+    const previous = rt.controls;
+    previous.enableDamping = false; previous.update();
+    previous.removeEventListener('change', rt.invalidate); previous.dispose();
+    const camera = new THREE.PerspectiveCamera(47, 1, .05, 4000);
+    const pose = focus.worldFromCamera;
+    camera.position.set(pose[0][3]-origin[0], pose[1][3]-origin[1], pose[2][3]-origin[2]);
+    camera.up.set(-pose[0][1], -pose[1][1], -pose[2][1]).normalize();
+    const target = camera.position.clone().add(new THREE.Vector3(pose[0][2], pose[1][2], pose[2][2]).multiplyScalar(20));
+    camera.lookAt(target); camera.updateMatrixWorld();
+    rt.camera = camera; rt.cameraFocus = focus;
+    rt.controls = new OrbitControls(camera, rt.renderer.domElement);
+    rt.controls.target.copy(target); rt.controls.enableDamping = true;
+    rt.controls.dampingFactor = previous.dampingFactor;
+    rt.controls.minDistance = previous.minDistance; rt.controls.maxDistance = previous.maxDistance;
+    rt.controls.maxPolarAngle = Math.PI;
+    rt.controls.addEventListener('change', rt.invalidate); rt.controls.update();
+    applyFocusProjection(rt, rt.renderer.domElement.clientWidth, rt.renderer.domElement.clientHeight);
+    rt.needsRender = true; setCameraVersion(value => value+1);
+  }, [ready, props.cameraFocus, origin]);
 
   useEffect(() => {
     const rt = runtime.current;
@@ -708,6 +743,8 @@ export function PointCloudView(props: PointCloudViewProps) {
     ref={container}
     className={props.className}
     data-testid="point-cloud-view"
+    data-focused-camera={props.cameraFocus?.cameraId ?? ''}
+    data-focus-request={props.cameraFocus?.request ?? 0}
     data-projection={props.view === 'top' ? 'orthographic' : 'perspective'}
     data-coordinate-frame={props.sceneMode ? 'world' : 'lidar'}
     data-projection-mode={props.view === 'top' ? 'orthographic' : 'perspective'}
