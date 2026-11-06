@@ -654,7 +654,8 @@ def _automatic_options(store: Store, clip: Clip, frame: Frame) -> dict:
 def save_projection_calibration(store: Store, clip_id: str, frame_id: str, camera_id: str,
                                 value: ProjectionUpdate, *, context=None,
                                 source_job_id: str | None = None,
-                                source_input_fingerprint: str | None = None) -> dict:
+                                source_input_fingerprint: str | None = None,
+                                manual_review: dict | None = None) -> dict:
     # Keep the comparison, validation and one-file publication under a single
     # lock. Heavy automatic solve itself runs outside this lock in its route.
     with store.lock:
@@ -700,6 +701,8 @@ def save_projection_calibration(store: Store, clip_id: str, frame_id: str, camer
                 if value.scope != "frame":
                     raise ValueError("手动微调仅保存当前帧和当前相机，避免覆盖震动引起的逐帧差异。")
                 assessment = {"usable": True, "metrics": {"validation": "manual_review", "requires_visual_review": True}}
+                if manual_review is not None:
+                    assessment["metrics"].update(manual_override=True, automatic_review=manual_review)
             else:
                 raise ValueError("未知的投影修正方式，请重新求解后保存。")
             if not assessment["usable"]:

@@ -64,3 +64,5 @@ tests/e2e/*
 !tests/e2e/sam2-calibration-mask.spec.ts
 
 !tests/e2e/automatic-preview.spec.ts
+
+!tests/e2e/calibration-inputs.spec.ts

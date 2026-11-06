@@ -673,3 +673,143 @@ def test_older_task_without_initial_matrix_can_preview_current_saved_baseline(ca
     value = response.json()
     assert value['comparison_source'] == 'current_saved'
     assert value['comparison_matrix'] == value['effective_matrix']
+
+
+def test_reviewed_rejected_candidate_requires_ack_and_preserves_automatic_verdict(calibration_api, monkeypatch):
+    client, store, _ = calibration_api
+    def solve(*args, **kwargs):
+        result = accepted(args[4], usable=False)
+        result['matrix'][0][3] += 1
+        result['rejection_reasons'] = ['修正超过 0.75 米或 3 度']
+        result['metrics'].update(translation_delta_m=1.1, line_overlap_before=.8321, line_overlap_after=.8841)
+        return result
+    monkeypatch.setattr(batch, 'solve_pair', solve)
+    projection = '/api/clips/batch/frames/f0/projection-calibration/front'
+    other = '/api/clips/batch/frames/f1/projection-calibration/front'
+    side = '/api/clips/batch/frames/f0/projection-calibration/side'
+    original = client.get(projection).json()
+    unrelated = [client.get(other).json(), client.get(side).json(), store.annotations('batch', 'f0').model_dump()]
+    job = finished(client, start(client, frame_ids=['f0'], camera_ids=['front'])['id'])
+    route = ROUTE + f"/jobs/{job['id']}/apply-reviewed/f0/front"
+    assert client.post(route, json={'revision': original['revision']}).status_code == 422
+    assert client.get(projection).json() == original
+    assert client.post(route, json={'revision': 'stale', 'acknowledge_rejected': True}).status_code == 409
+    response = client.post(route, json={'revision': original['revision'], 'acknowledge_rejected': True})
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved['saved_matrix'] == job['items'][0]['matrix'] and saved['method'] == 'manual'
+    assert saved['metrics']['validation'] == 'manual_review' and saved['metrics']['manual_override']
+    audit = saved['metrics']['automatic_review']
+    assert audit['job_id'] == job['id'] and audit['automatic_status'] == 'rejected'
+    assert audit['automatic_usable'] is False and audit['rejection_reasons'] == ['修正超过 0.75 米或 3 度']
+    assert audit['automatic_metrics']['line_overlap_after'] == .8841 and audit['confirmed_at']
+    updated_job = client.get(ROUTE + f"/jobs/{job['id']}").json()
+    assert updated_job['rejected'] == 1 and updated_job['accepted'] == 0 and updated_job['saved'] == 0
+    assert updated_job['items'][0]['manual_applied']
+    preview = client.get(ROUTE + f"/jobs/{job['id']}/preview/f0/front").json()
+    assert not preview['usable'] and preview['manual_applied'] and preview['already_applied']
+    # Refresh and repeated application cannot silently replace a newer revision.
+    assert client.post(route, json={'revision': original['revision'], 'acknowledge_rejected': True}).status_code == 409
+    assert client.get(projection).json() == saved
+    assert client.get(other).json() == unrelated[0] and client.get(side).json() == unrelated[1]
+    assert store.annotations('batch', 'f0').model_dump() == unrelated[2]
+    assert store.clip('batch').frames[0].projection_camera_from_lidar['front'] == saved['saved_matrix']
+
+
+def test_reviewed_accepted_candidate_applies_only_one_pair(calibration_api):
+    client, _, _ = calibration_api
+    job = finished(client, start(client, frame_ids=['f0', 'f1'], camera_ids=['front'])['id'])
+    assert job['accepted'] == 2
+    doc = client.get('/api/clips/batch/frames/f0/projection-calibration/front').json()
+    route = ROUTE + f"/jobs/{job['id']}/apply-reviewed/f0/front"
+    response = client.post(route, json={'revision': doc['revision']})
+    assert response.status_code == 200, response.text
+    assert response.json()['saved_matrix'] == job['items'][0]['matrix']
+    assert response.json()['method'] == 'koide'
+    assert not response.json()['metrics'].get('manual_override')
+    current = client.get(ROUTE + f"/jobs/{job['id']}").json()
+    assert current['saved'] == 1 and current['accepted'] == 1
+    assert client.get('/api/clips/batch/frames/f1/projection-calibration/front').json()['saved_matrix'] is None
+
+
+@pytest.mark.parametrize('change', ['image', 'busy', 'matrix_injection'])
+def test_reviewed_apply_cannot_bypass_source_or_operation_checks(calibration_api, change):
+    client, store, manager = calibration_api
+    job = finished(client, start(client, frame_ids=['f0'], camera_ids=['front'])['id'])
+    doc = client.get('/api/clips/batch/frames/f0/projection-calibration/front').json()
+    payload = {'revision': doc['revision'], 'acknowledge_rejected': True}
+    expected = 409
+    if change == 'image':
+        image = store.root / 'assets/batch/f0-front.png'; image.write_bytes(image.read_bytes())
+    elif change == 'busy': manager._active.add('running')
+    else: payload['matrix'] = np.eye(4).tolist(); expected = 422
+    response = client.post(ROUTE + f"/jobs/{job['id']}/apply-reviewed/f0/front", json=payload)
+    assert response.status_code == expected, response.text
+    assert client.get('/api/clips/batch/frames/f0/projection-calibration/front').json()['saved_matrix'] is None
+    manager._active.clear()
+
+
+def test_pjlab_input_check_reports_real_sources_missing_mask_and_unverified_sync(calibration_api, monkeypatch):
+    from omnilabel import calibration_readiness
+    client, store, _ = calibration_api
+    monkeypatch.setattr(calibration_readiness, 'pjlab_status', lambda: {'available': True, 'detail': 'CLI fixture'})
+    monkeypatch.setattr(calibration_readiness, 'mask_command', lambda: None)
+    original = store.annotations('batch', 'f0').model_dump()
+    response = client.get(ROUTE + '/inputs/f0/front')
+    assert response.status_code == 200, response.text
+    report = response.json(); checks = {v['key']: v for v in report['checks']}
+    assert report['input_source'] == 'primary_point_cloud' and report['point_count'] == 2
+    assert checks['image']['status'] == 'ready' and checks['intrinsics']['status'] == 'ready'
+    assert checks['distortion']['status'] == 'warning'
+    assert checks['scan']['status'] == 'warning' and checks['intensity']['status'] == 'ready'
+    assert checks['mask']['status'] == 'missing' and not report['ready_to_run']
+    assert checks['synchronization']['status'] == 'warning'
+    assert store.annotations('batch', 'f0').model_dump() == original
+
+
+def test_pjlab_input_check_sync_scan_and_uploaded_mask_still_do_not_certify_physical_sync(calibration_api, monkeypatch):
+    from io import BytesIO
+    from omnilabel import calibration_readiness
+    client, store, _ = calibration_api
+    monkeypatch.setattr(calibration_readiness, 'pjlab_status', lambda: {'available': True, 'detail': 'CLI fixture'})
+    raw = store.root / 'pointclouds/batch/raw.npy'
+    np.save(raw, np.array([[0, 0, 5, .1], [1, 0, 6, .9]], dtype=np.float32))
+    clip = store.source_clip('batch')
+    clip.frames[0].calibration_pointcloud_file = 'batch/raw.npy'
+    clip.frames[0].calibration_point_count = 2
+    clip.frames[0].calibration_lidar_to_ego = np.eye(4).tolist()
+    clip.frames[0].calibration_timestamp = clip.frames[0].timestamp
+    atomic_json(store.root / 'clips/batch.json', clip.model_dump())
+    pixels = np.zeros((100, 100), dtype=np.uint8); pixels[20:24, 10:80] = 255
+    content = BytesIO(); Image.fromarray(pixels).save(content, format='PNG')
+    assert client.put(ROUTE + '/masks/f0/front', content=content.getvalue()).status_code == 200
+    report = client.get(ROUTE + '/inputs/f0/front').json(); checks = {v['key']: v for v in report['checks']}
+    assert report['ready_to_run'] and report['input_source'] == 'synchronized_sensor_scan'
+    assert report['nominal_time_delta_ms'] == 0
+    assert checks['scan']['status'] == 'ready' and checks['mask']['status'] == 'ready'
+    assert checks['initial']['status'] == 'warning' and checks['synchronization']['status'] == 'warning'
+    assert '不能证明物理同步' in checks['synchronization']['action']
+    # A new original image invalidates its existing mask immediately.
+    image = store.root / 'assets/batch/f0-front.png'; image.write_bytes(image.read_bytes())
+    current = client.get(ROUTE + '/inputs/f0/front').json()
+    assert next(v for v in current['checks'] if v['key']=='mask')['status'] == 'missing'
+
+
+@pytest.mark.parametrize('failure', ['intensity', 'image', 'runtime'])
+def test_pjlab_input_check_explains_blocking_inputs(calibration_api, monkeypatch, failure):
+    from omnilabel import calibration_readiness
+    client, store, _ = calibration_api
+    monkeypatch.setattr(calibration_readiness, 'pjlab_status', lambda: {'available': failure!='runtime', 'detail': 'runtime fixture'})
+    if failure == 'intensity':
+        np.save(store.root / 'pointclouds/batch/f0.npy', np.array([[0,0,5,.5],[1,0,6,.5]],dtype=np.float32))
+    elif failure == 'image':
+        Image.new('RGB', (80, 60)).save(store.root / 'assets/batch/f0-front.png')
+    report = client.get(ROUTE + '/inputs/f0/front').json()
+    assert not report['ready_to_run']
+    check = next(v for v in report['checks'] if v['key']==failure)
+    assert check['status'] == 'missing' and check['action']
+
+
+def test_pjlab_input_check_rejects_unknown_pair(calibration_api):
+    client, _, _ = calibration_api
+    assert client.get(ROUTE + '/inputs/f0/unknown').status_code == 404

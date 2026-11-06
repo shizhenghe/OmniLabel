@@ -2,6 +2,7 @@ import {useCallback, useEffect, useId, useRef, useState} from 'react';
 import {download, jsonRequest, request} from '../api';
 import type {Clip} from '../types';
 import './AutomaticCalibrationPanel.css';
+import {CalibrationInputChecklist} from './CalibrationInputChecklist';
 import {SAM2LineMaskPanel} from './SAM2LineMaskPanel';
 
 type EngineId = 'koide' | 'direct_nid' | 'pjlab';
@@ -15,6 +16,7 @@ interface CalibrationItem {
   reason?: string;
   metrics?: Record<string, unknown>;
   matrix?: number[][];
+  manual_applied?: boolean;
 }
 interface CalibrationJob {
   id: string;
@@ -84,6 +86,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
   const [filter, setFilter] = useState<'all' | 'attention' | 'passed'>('all');
   const [page, setPage] = useState(0);
   const [reload, setReload] = useState(0);
+  const [inputCheckReload, setInputCheckReload] = useState(0);
   const panel = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const latest = useRef({operation, onClose});
@@ -232,6 +235,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
       await request(`${endpoint}/masks/${encodeURIComponent(frameId)}/${encodeURIComponent(cameraId)}`, {
         method: 'PUT', headers: {'Content-Type': 'image/png'}, body: file,
       });
+      if (scope.current === startScope) setInputCheckReload(value => value + 1);
       if (scope.current === startScope) setStatus(`已保存 ${frameId} / ${cameraId} 的 PJLab 线特征掩码。未配置自动提取时，其他帧需分别上传对应掩码。`);
     } catch (cause) {if (scope.current === startScope) setError(`上传掩码失败：${errorText(cause)}`);}
     finally {if (scope.current === startScope) setOperation(null);}
@@ -252,9 +256,9 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
       </div>
       <div className="automatic-calibration-body">
         <p className="automatic-calibration-intro">逐帧、逐相机独立求解并保存外参，适用于震动引起的逐帧偏差，不会用一组结果覆盖整个 clip。保存后同步用于点云和三维标注投影。若数据包含同步单帧扫描，求解器优先使用它。自动结果需通过质量检查；请复核不同距离的静态物体与道路标线。</p>
-        {engine === 'pjlab' && <section className="automatic-calibration-help"><p>PJLab CRLF 需要道路标线/杆体的线特征掩码（原图尺寸 PNG、黑色背景），不可上传原图代替。可配置自动线特征提取，或使用下方 SAM2 生成并选择线区域；也可选中对应帧相机后上传。批量任务会逐项检查掩码。</p>
+        {engine === 'pjlab' && <section className="automatic-calibration-help">{frameId && cameraId && <CalibrationInputChecklist key={`${clip.id}/${frameId}/${cameraId}`} clipId={clip.id} frameId={frameId} cameraId={cameraId} disabled={locked || running} refreshKey={inputCheckReload}/>}<p>PJLab CRLF 需要道路标线/杆体的线特征掩码（原图尺寸 PNG、黑色背景），不可上传原图代替。可配置自动线特征提取，或使用下方 SAM2 生成并选择线区域；也可选中对应帧相机后上传。批量任务会逐项检查掩码。</p>
           <label>当前帧 {frameId} · 相机 {cameraId} 的线特征掩码<input type="file" accept="image/png" aria-label="上传当前帧PJLab线特征掩码" disabled={locked || running || !frameId || !cameraId} onChange={event => {const file = event.target.files?.[0]; event.target.value = ''; if (file) void uploadMask(file);}}/></label>
-          {frameId && cameraId && selectedCamera && <SAM2LineMaskPanel key={`${clip.id}/${frameId}/${cameraId}`} clip={clip} frameId={frameId} cameraId={cameraId} disabled={Boolean(disabled || loading || running || (operation && operation !== 'sam2mask'))} onBusy={maskBusy}/>}
+          {frameId && cameraId && selectedCamera && <SAM2LineMaskPanel key={`${clip.id}/${frameId}/${cameraId}`} clip={clip} frameId={frameId} cameraId={cameraId} disabled={Boolean(disabled || loading || running || (operation && operation !== 'sam2mask'))} onBusy={maskBusy} onSaved={() => setInputCheckReload(value => value + 1)}/>}
         </section>}
         {loading ? <p className="automatic-calibration-status" role="status">正在检查配准引擎与已有参数…</p> : overview && <>
           <div className="automatic-calibration-summary"><span>图像 / 点云组合<strong>{overview.total_pairs.toLocaleString()}</strong></span><span>已有参数<strong>{overview.saved_pairs.toLocaleString()}</strong></span><span>本次处理<strong>{selectionCount.toLocaleString()} 组</strong></span></div>
@@ -273,11 +277,12 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
         {job && <section className="automatic-calibration-job" aria-label="自动标定任务进度">
           <div className="automatic-calibration-job-heading"><h3>{job.cancel_requested && running ? '正在取消' : jobLabels[job.status]}</h3><span>{engineName(job.engine)} · {job.processed.toLocaleString()} / {job.total.toLocaleString()}</span>{running && <button className="button ghost" disabled={locked || job.cancel_requested} onClick={() => void cancel()}>{operation === 'cancel' || job.cancel_requested ? '正在取消…' : '取消任务'}</button>}</div>
           <div className="automatic-calibration-progress" role="progressbar" aria-label="图像点云配准进度" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}><span style={{width: `${progress}%`}}/></div>
-          <div className="automatic-calibration-counts" role="status"><span>通过 <strong>{job.accepted}</strong></span><span>已保存 <strong>{job.saved}</strong></span><span>未通过 <strong>{job.rejected}</strong></span><span>失败 <strong>{job.failed}</strong></span><span>跳过 <strong>{job.skipped}</strong></span></div>
+          <div className="automatic-calibration-counts" role="status"><span>通过 <strong>{job.accepted}</strong></span><span>已保存 <strong>{job.saved}</strong></span>{job.items.some(item => item.manual_applied) && <span>人工应用 <strong>{job.items.filter(item => item.manual_applied).length}</strong></span>}<span>未通过 <strong>{job.rejected}</strong></span><span>失败 <strong>{job.failed}</strong></span><span>跳过 <strong>{job.skipped}</strong></span></div>
           <div className="automatic-calibration-results-heading"><label>逐项结果<select aria-label="筛选自动标定结果" value={filter} onChange={event => {setFilter(event.target.value as typeof filter); setPage(0);}}><option value="all">全部（{job.items.length}）</option><option value="attention">未通过 / 失败 / 跳过</option><option value="passed">通过 / 已保存</option></select></label><span>帧 / 相机</span></div>
           <ol className="automatic-calibration-results" aria-label="逐帧逐相机标定结果">{visibleItems.map(item => <li key={`${item.frame_id}/${item.camera_id}`} className={`automatic-calibration-item ${item.status}`}>
             <div><strong>{item.frame_id}</strong><span>{clip.cameras.find(value => value.id === item.camera_id)?.name ?? item.camera_id}</span><em>{itemLabels[item.status]}</em></div>
             <p>{item.reason || (item.status === 'accepted' ? '质量检查通过，等待保存。' : item.status === 'saved' ? '已保存并用于投影。' : item.status === 'pending' ? '等待处理。' : item.status === 'running' ? '正在求解与验证。' : '未返回详细原因。')}</p>
+            {item.manual_applied && <p>已按人工确认应用到本帧本相机；原自动评估仍保留为未通过。</p>}
             {itemMetric(item) && <small>{itemMetric(item)}</small>}
             {onInspect && <button className="automatic-calibration-inspect" disabled={locked || running} onClick={() => void inspect(item)}>{item.matrix && ['accepted', 'rejected', 'saved'].includes(item.status) ? '查看本次结果 / 手动校准' : '查看该帧 / 手动校准'}</button>}
           </li>)}</ol>

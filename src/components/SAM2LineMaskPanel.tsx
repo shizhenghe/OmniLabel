@@ -13,11 +13,12 @@ interface Props {
   cameraId: string;
   disabled: boolean;
   onBusy: (busy: boolean) => void;
+  onSaved?: () => void;
 }
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 /** Converts reviewed SAM2 regions to a calibration mask without editing annotations. */
-export function SAM2LineMaskPanel({clip, frameId, cameraId, disabled, onBusy}: Props) {
+export function SAM2LineMaskPanel({clip, frameId, cameraId, disabled, onBusy, onSaved}: Props) {
   const [available, setAvailable] = useState(false);
   const [readiness, setReadiness] = useState('正在检查 SAM2 服务…');
   const [mode, setMode] = useState<'auto' | 'points'>('auto');
@@ -90,6 +91,7 @@ export function SAM2LineMaskPanel({clip, frameId, cameraId, disabled, onBusy}: P
         method: 'POST', signal: abort.signal, headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({job_id: jobId, polygon_ids: [...selected]}),
       });
+      if (!abort.signal.aborted) onSaved?.();
       if (!abort.signal.aborted) setStatus(`已保存 ${frameId} / ${cameraId} 的原图尺寸线特征掩码，可直接运行 PJLab 标定。其他帧需分别生成对应掩码。`);
     } catch (cause) {if (!abort.signal.aborted) setError(`掩码未保存：${errorText(cause)}`);}
     finally {if (controller.current === abort && !abort.signal.aborted) {setBusy(false); onBusy(false);}}

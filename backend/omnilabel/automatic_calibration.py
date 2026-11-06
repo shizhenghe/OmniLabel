@@ -45,6 +45,11 @@ class AutomaticCalibrationRequest(Model):
     camera_ids: list[Identifier] | None = None
 
 
+class ReviewedCandidateApplyRequest(Model):
+    revision: str = Field(min_length=1, max_length=128)
+    acknowledge_rejected: bool = False
+
+
 class SAM2MaskRequest(Model):
     job_id: Identifier
     polygon_ids: list[Identifier] = Field(min_length=1, max_length=20000)
@@ -287,6 +292,16 @@ class AutomaticCalibrationManager:
             return {"engines": engines(), "latest_job": latest,
                     "total_pairs": len(clip.frames) * len(clip.cameras), "saved_pairs": saved_pairs}
 
+    def inspect_inputs(self, clip_id: str, frame_id: str, camera_id: str) -> dict:
+        from .calibration_readiness import inspect_pjlab_inputs
+        with self.store.lock:
+            clip = self.store.source_clip(clip_id)
+            frame = next((f for f in clip.frames if f.id == frame_id), None)
+            camera = next((c for c in clip.cameras if c.id == camera_id), None)
+            if frame is None or camera is None:
+                raise KeyError("未找到当前帧或相机。")
+        return inspect_pjlab_inputs(self.store, clip, frame, camera, self._mask_path(clip_id, frame_id, camera_id))
+
     def start(self, clip_id: str, request: AutomaticCalibrationRequest) -> dict:
         with self.store.lock:
             clip = self.store.source_clip(clip_id)
@@ -429,7 +444,7 @@ class AutomaticCalibrationManager:
             return job
 
     def preview(self, clip_id: str, job_id: str, frame_id: str, camera_id: str) -> dict:
-        """Read a fresh candidate for inspection; rejected results never publish."""
+        """Read a fresh candidate for inspection without publishing it."""
         with self.store.lock:
             job = self.get(clip_id, job_id)
             if job["status"] not in TERMINAL:
@@ -448,18 +463,62 @@ class AutomaticCalibrationManager:
             if self._pair_fingerprint(clip_id, frame, camera, job["engine"]) != item.get("input_fingerprint"):
                 raise ConflictError("源图像、点云或线特征掩码已变化，请重新运行标定后预览。")
             current = document_for(self.store, clip_id, frame_id, camera_id, context=(clip, frame, camera))
+            record = _read_record(self.store, clip_id, frame_id, camera_id) or {}
+            published = (record.get("source_job_id") == job_id
+                         and record.get("source_input_fingerprint") == item["input_fingerprint"]
+                         and current["saved_matrix"] == item["matrix"])
+            manually_applied = bool(published and (record.get("metrics") or {}).get("manual_override"))
             if item["status"] == "saved":
-                record = _read_record(self.store, clip_id, frame_id, camera_id) or {}
-                if record.get("source_job_id") != job_id or current["saved_matrix"] != item["matrix"]:
+                if not published:
                     raise ConflictError("此项保存后外参已变化，请重新运行标定。")
-            else:
+            elif not published:
                 _check_revision(current, item["revision"])
-            return {**current, "job_id": job_id, "candidate_status": item["status"], "read_only": True,
+            return {**current, "job_id": job_id, "candidate_status": item["status"], "read_only": True, "manual_applied": manually_applied, "already_applied": published,
                     "candidate_matrix": rigid_transform(item["matrix"]),
                     "comparison_matrix": rigid_transform(item.get("initial_matrix") or current["effective_matrix"]),
                     "comparison_source": "solver_initial" if item.get("initial_matrix") else "current_saved",
                     "usable": item["status"] in {"accepted", "saved"}, "method": job["engine"],
                     "metrics": item.get("metrics"), "rejection_reasons": [item["reason"]] if item.get("reason") else []}
+
+    def apply_reviewed(self, clip_id: str, job_id: str, frame_id: str, camera_id: str,
+                       value: ReviewedCandidateApplyRequest) -> dict:
+        """Apply exactly one inspected server candidate, with explicit manual override."""
+        with self.store.lock:
+            if self._active or self._applying:
+                raise ConflictError("标定任务运行或保存期间不能应用候选。")
+            preview = self.preview(clip_id, job_id, frame_id, camera_id)
+            _check_revision(preview, value.revision)
+            if not preview["usable"] and not value.acknowledge_rejected:
+                raise ValueError("此候选未通过自动检查，请先确认已人工复核并接受超限结果。")
+            job = self.get(clip_id, job_id)
+            item = next(item for item in job["items"] if item["frame_id"] == frame_id and item["camera_id"] == camera_id)
+            manual = not preview["usable"]
+            if preview.get("already_applied"):
+                document = document_for(self.store, clip_id, frame_id, camera_id)
+                if manual:
+                    item.update(manual_applied=True, manual_applied_at=document["updated_at"])
+                else:
+                    item.update(status="saved", saved_at=document["updated_at"])
+                self._save(job)
+                return document
+            review = {"job_id": job_id, "engine": job["engine"], "automatic_status": item["status"],
+                      "automatic_usable": preview["usable"], "rejection_reasons": preview["rejection_reasons"],
+                      "automatic_metrics": item.get("metrics"), "confirmed_at": _now()}
+            # Reuse the atomic projection commit (revision, backups, and source
+            # fingerprint). A manual override never changes the automatic verdict.
+            document = save_projection_calibration(self.store, clip_id, frame_id, camera_id,
+                ProjectionUpdate(revision=value.revision, matrix=preview["candidate_matrix"], scope="frame",
+                                 method="manual" if manual else job["engine"],
+                                 correspondences=preview["correspondences"]),
+                source_job_id=job_id, source_input_fingerprint=item["input_fingerprint"],
+                manual_review=review if manual else None)
+            if manual:
+                item.update(manual_applied_at=document["updated_at"], manual_applied=True)
+            else:
+                item.update(status="saved", saved_at=document["updated_at"])
+            self._save(job)
+            self._source_cache = None
+            return document
 
     def apply(self, clip_id: str, job_id: str) -> dict:
         with self.store.lock:
@@ -547,6 +606,10 @@ def mount_automatic_calibration_routes(app: FastAPI, manager: AutomaticCalibrati
     def read_status(clip_id: str):
         return respond(manager.status, clip_id)
 
+    @app.get(route + "/inputs/{frame_id}/{camera_id}")
+    def inspect_inputs(clip_id: str, frame_id: str, camera_id: str):
+        return respond(manager.inspect_inputs, clip_id, frame_id, camera_id)
+
     @app.post(route + "/jobs", status_code=202)
     def start_job(clip_id: str, value: AutomaticCalibrationRequest):
         return respond(manager.start, clip_id, value)
@@ -571,6 +634,10 @@ def mount_automatic_calibration_routes(app: FastAPI, manager: AutomaticCalibrati
     @app.get(route + "/jobs/{job_id}/preview/{frame_id}/{camera_id}")
     def preview_candidate(clip_id: str, job_id: str, frame_id: str, camera_id: str):
         return respond(manager.preview, clip_id, job_id, frame_id, camera_id)
+
+    @app.post(route + "/jobs/{job_id}/apply-reviewed/{frame_id}/{camera_id}")
+    def apply_reviewed_candidate(clip_id: str, job_id: str, frame_id: str, camera_id: str, value: ReviewedCandidateApplyRequest):
+        return respond(manager.apply_reviewed, clip_id, job_id, frame_id, camera_id, value)
 
     @app.post(route + "/jobs/{job_id}/cancel")
     def cancel_job(clip_id: str, job_id: str):
