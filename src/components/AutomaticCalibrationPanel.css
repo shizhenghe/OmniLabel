@@ -66,3 +66,13 @@
 .automatic-calibration-footer {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 25px;border-top:1px solid #2b4051;background:#0e1926}
 .automatic-calibration-footer>span {font-size:10px;color:#7f9bac}
 @media(max-width:650px) {.automatic-calibration-backdrop {padding:10px}.automatic-calibration-panel {max-height:calc(100dvh - 20px)}.automatic-calibration-heading {padding:17px 16px 13px}.automatic-calibration-heading h2 {font-size:18px}.automatic-calibration-body {padding:15px 16px}.automatic-calibration-footer {padding:12px 16px}.automatic-calibration-engines {grid-template-columns:1fr}.automatic-calibration-summary {gap:6px}.automatic-calibration-summary>span {padding:8px;font-size:9px}.automatic-calibration-summary strong {font-size:12px}.automatic-calibration-scope {grid-template-columns:1fr}.automatic-calibration-scope small {grid-column:1}.automatic-calibration-save {align-items:flex-start;flex-direction:column}.automatic-calibration-results-heading>span {display:none}.automatic-calibration-item>div {gap:7px}.automatic-calibration-counts {gap:11px}}
+.calibration-input-checklist {margin:12px 0;padding:12px;border:1px solid #355062;border-radius:6px}
+.calibration-input-checklist h3 {margin:0 0 8px}
+.calibration-input-checks {list-style:none;padding:0;display:grid;gap:8px;max-height:380px;overflow:auto}
+.calibration-input-checks li {padding:8px 10px;background:#0d1924;border-left:3px solid #4ca78d}
+.calibration-input-checks li[data-status="warning"] {border-left-color:#c8ae62}
+.calibration-input-checks li[data-status="missing"] {border-left-color:#d78582}
+.calibration-input-checks p {margin:5px 0;overflow-wrap:anywhere}
+.calibration-input-action {color:#c4dbe6}
+.calibration-input-checklist summary {cursor:pointer;margin-top:10px}
+.calibration-input-checklist details li {margin:7px 0}

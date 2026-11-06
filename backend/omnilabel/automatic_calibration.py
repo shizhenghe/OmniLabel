@@ -292,6 +292,16 @@ class AutomaticCalibrationManager:
             return {"engines": engines(), "latest_job": latest,
                     "total_pairs": len(clip.frames) * len(clip.cameras), "saved_pairs": saved_pairs}
 
+    def inspect_inputs(self, clip_id: str, frame_id: str, camera_id: str) -> dict:
+        from .calibration_readiness import inspect_pjlab_inputs
+        with self.store.lock:
+            clip = self.store.source_clip(clip_id)
+            frame = next((f for f in clip.frames if f.id == frame_id), None)
+            camera = next((c for c in clip.cameras if c.id == camera_id), None)
+            if frame is None or camera is None:
+                raise KeyError("未找到当前帧或相机。")
+        return inspect_pjlab_inputs(self.store, clip, frame, camera, self._mask_path(clip_id, frame_id, camera_id))
+
     def start(self, clip_id: str, request: AutomaticCalibrationRequest) -> dict:
         with self.store.lock:
             clip = self.store.source_clip(clip_id)
@@ -595,6 +605,10 @@ def mount_automatic_calibration_routes(app: FastAPI, manager: AutomaticCalibrati
     @app.get(route)
     def read_status(clip_id: str):
         return respond(manager.status, clip_id)
+
+    @app.get(route + "/inputs/{frame_id}/{camera_id}")
+    def inspect_inputs(clip_id: str, frame_id: str, camera_id: str):
+        return respond(manager.inspect_inputs, clip_id, frame_id, camera_id)
 
     @app.post(route + "/jobs", status_code=202)
     def start_job(clip_id: str, value: AutomaticCalibrationRequest):

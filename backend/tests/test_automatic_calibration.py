@@ -747,3 +747,69 @@ def test_reviewed_apply_cannot_bypass_source_or_operation_checks(calibration_api
     assert response.status_code == expected, response.text
     assert client.get('/api/clips/batch/frames/f0/projection-calibration/front').json()['saved_matrix'] is None
     manager._active.clear()
+
+
+def test_pjlab_input_check_reports_real_sources_missing_mask_and_unverified_sync(calibration_api, monkeypatch):
+    from omnilabel import calibration_readiness
+    client, store, _ = calibration_api
+    monkeypatch.setattr(calibration_readiness, 'pjlab_status', lambda: {'available': True, 'detail': 'CLI fixture'})
+    monkeypatch.setattr(calibration_readiness, 'mask_command', lambda: None)
+    original = store.annotations('batch', 'f0').model_dump()
+    response = client.get(ROUTE + '/inputs/f0/front')
+    assert response.status_code == 200, response.text
+    report = response.json(); checks = {v['key']: v for v in report['checks']}
+    assert report['input_source'] == 'primary_point_cloud' and report['point_count'] == 2
+    assert checks['image']['status'] == 'ready' and checks['intrinsics']['status'] == 'ready'
+    assert checks['distortion']['status'] == 'warning'
+    assert checks['scan']['status'] == 'warning' and checks['intensity']['status'] == 'ready'
+    assert checks['mask']['status'] == 'missing' and not report['ready_to_run']
+    assert checks['synchronization']['status'] == 'warning'
+    assert store.annotations('batch', 'f0').model_dump() == original
+
+
+def test_pjlab_input_check_sync_scan_and_uploaded_mask_still_do_not_certify_physical_sync(calibration_api, monkeypatch):
+    from io import BytesIO
+    from omnilabel import calibration_readiness
+    client, store, _ = calibration_api
+    monkeypatch.setattr(calibration_readiness, 'pjlab_status', lambda: {'available': True, 'detail': 'CLI fixture'})
+    raw = store.root / 'pointclouds/batch/raw.npy'
+    np.save(raw, np.array([[0, 0, 5, .1], [1, 0, 6, .9]], dtype=np.float32))
+    clip = store.source_clip('batch')
+    clip.frames[0].calibration_pointcloud_file = 'batch/raw.npy'
+    clip.frames[0].calibration_point_count = 2
+    clip.frames[0].calibration_lidar_to_ego = np.eye(4).tolist()
+    clip.frames[0].calibration_timestamp = clip.frames[0].timestamp
+    atomic_json(store.root / 'clips/batch.json', clip.model_dump())
+    pixels = np.zeros((100, 100), dtype=np.uint8); pixels[20:24, 10:80] = 255
+    content = BytesIO(); Image.fromarray(pixels).save(content, format='PNG')
+    assert client.put(ROUTE + '/masks/f0/front', content=content.getvalue()).status_code == 200
+    report = client.get(ROUTE + '/inputs/f0/front').json(); checks = {v['key']: v for v in report['checks']}
+    assert report['ready_to_run'] and report['input_source'] == 'synchronized_sensor_scan'
+    assert report['nominal_time_delta_ms'] == 0
+    assert checks['scan']['status'] == 'ready' and checks['mask']['status'] == 'ready'
+    assert checks['initial']['status'] == 'warning' and checks['synchronization']['status'] == 'warning'
+    assert '不能证明物理同步' in checks['synchronization']['action']
+    # A new original image invalidates its existing mask immediately.
+    image = store.root / 'assets/batch/f0-front.png'; image.write_bytes(image.read_bytes())
+    current = client.get(ROUTE + '/inputs/f0/front').json()
+    assert next(v for v in current['checks'] if v['key']=='mask')['status'] == 'missing'
+
+
+@pytest.mark.parametrize('failure', ['intensity', 'image', 'runtime'])
+def test_pjlab_input_check_explains_blocking_inputs(calibration_api, monkeypatch, failure):
+    from omnilabel import calibration_readiness
+    client, store, _ = calibration_api
+    monkeypatch.setattr(calibration_readiness, 'pjlab_status', lambda: {'available': failure!='runtime', 'detail': 'runtime fixture'})
+    if failure == 'intensity':
+        np.save(store.root / 'pointclouds/batch/f0.npy', np.array([[0,0,5,.5],[1,0,6,.5]],dtype=np.float32))
+    elif failure == 'image':
+        Image.new('RGB', (80, 60)).save(store.root / 'assets/batch/f0-front.png')
+    report = client.get(ROUTE + '/inputs/f0/front').json()
+    assert not report['ready_to_run']
+    check = next(v for v in report['checks'] if v['key']==failure)
+    assert check['status'] == 'missing' and check['action']
+
+
+def test_pjlab_input_check_rejects_unknown_pair(calibration_api):
+    client, _, _ = calibration_api
+    assert client.get(ROUTE + '/inputs/f0/unknown').status_code == 404

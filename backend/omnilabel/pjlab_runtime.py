@@ -36,7 +36,7 @@ def pjlab_status() -> dict:
     try:
         _executable()
         automatic_masks = mask_command() is not None
-        masks = "已配置逐帧自动线特征提取。" if automatic_masks else "每组图像需上传同尺寸线特征掩码。"
+        masks = "已配置逐帧自动线特征提取。" if automatic_masks else "每组图像需准备同尺寸线特征掩码，可在平台用 SAM2 生成保存或手动上传。"
         return {"available": True, "detail": f"PJLab 已配置；{masks}实际运行验证原生依赖与输出，结果需审核。"}
     except ValueError as exc:
         return {"available": False, "detail": str(exc)}
