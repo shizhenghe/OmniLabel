@@ -54,3 +54,5 @@ tests/e2e/*
 !tests/e2e/lane-calibration.spec.ts
 !tests/e2e/point-snap.spec.ts
 !tests/e2e/api-errors.spec.ts
+
+!tests/e2e/camera-focus.spec.ts
