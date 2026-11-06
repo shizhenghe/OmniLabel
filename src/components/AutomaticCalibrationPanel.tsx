@@ -46,7 +46,7 @@ export interface AutomaticCalibrationPanelProps {
   cameraId?: string;
   disabled?: boolean;
   onSaved: () => Promise<void> | void;
-  onInspect?: (frameId: string, cameraId: string) => Promise<void> | void;
+  onInspect?: (frameId: string, cameraId: string, jobId?: string) => Promise<void> | void;
   onClose: () => void;
 }
 
@@ -59,7 +59,7 @@ const metricValue = (value: unknown) => typeof value === 'number' && Number.isFi
 function itemMetric(item: CalibrationItem): string {
   const source = item.metrics?.input_source === 'synchronized_sensor_scan' ? '同步单帧点云' : '';
   const lineBefore = metricValue(item.metrics?.line_overlap_before), lineAfter = metricValue(item.metrics?.line_overlap_after);
-  if (lineBefore !== null && lineAfter !== null) return `${source ? source + ' · ' : ''}线特征匹配 ${lineBefore} → ${lineAfter}（需人工复核）`;
+  if (lineBefore !== null && lineAfter !== null) return `${source ? source + ' · ' : ''}线特征匹配 ${lineBefore} → ${lineAfter}（需人工复核）${typeof item.metrics?.translation_delta_m === 'number' ? ` · 位移 ${item.metrics.translation_delta_m.toFixed(3)} 米` : ''}${typeof item.metrics?.rotation_delta_degrees === 'number' ? ` · 旋转 ${item.metrics.rotation_delta_degrees.toFixed(3)} 度` : ''}`;
   const before = item.metrics?.holdout_before as {nid?: number} | undefined;
   const after = item.metrics?.holdout_after as {nid?: number} | undefined;
   const first = metricValue(before?.nid), last = metricValue(after?.nid);
@@ -239,7 +239,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
   const inspect = async (item: CalibrationItem) => {
     if (!onInspect || locked || running) return;
     setOperation('inspect'); setError('');
-    try {await onInspect(item.frame_id, item.camera_id);}
+    try {await onInspect(item.frame_id, item.camera_id, item.matrix && ['accepted', 'rejected', 'saved'].includes(item.status) ? job?.id : undefined);}
     catch (cause) {setError(`打开逐帧校准失败：${errorText(cause)}`);}
     finally {setOperation(null);}
   };
@@ -279,7 +279,7 @@ export function AutomaticCalibrationPanel({clip, frameId, cameraId, disabled, on
             <div><strong>{item.frame_id}</strong><span>{clip.cameras.find(value => value.id === item.camera_id)?.name ?? item.camera_id}</span><em>{itemLabels[item.status]}</em></div>
             <p>{item.reason || (item.status === 'accepted' ? '质量检查通过，等待保存。' : item.status === 'saved' ? '已保存并用于投影。' : item.status === 'pending' ? '等待处理。' : item.status === 'running' ? '正在求解与验证。' : '未返回详细原因。')}</p>
             {itemMetric(item) && <small>{itemMetric(item)}</small>}
-            {onInspect && <button className="automatic-calibration-inspect" disabled={locked || running} onClick={() => void inspect(item)}>查看该帧 / 手动校准</button>}
+            {onInspect && <button className="automatic-calibration-inspect" disabled={locked || running} onClick={() => void inspect(item)}>{item.matrix && ['accepted', 'rejected', 'saved'].includes(item.status) ? '查看本次结果 / 手动校准' : '查看该帧 / 手动校准'}</button>}
           </li>)}</ol>
           {!filteredItems.length && <p className="automatic-calibration-help">当前筛选下没有结果。</p>}
           {pageCount > 1 && <div className="automatic-calibration-pagination"><button className="button ghost" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button><span>{currentPage + 1} / {pageCount} 页 · {filteredItems.length} 项</span><button className="button ghost" disabled={currentPage >= pageCount - 1} onClick={() => setPage(currentPage + 1)}>下一页</button></div>}

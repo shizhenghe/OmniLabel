@@ -61,12 +61,21 @@ export interface ProjectionCalibrationSolveResult extends ProjectionCalibrationD
   usable: boolean;
   rejection_reasons?: string[];
 }
+interface AutomaticCandidatePreview extends ProjectionCalibrationSolveResult {
+  job_id: string;
+  candidate_status: 'accepted' | 'rejected' | 'saved';
+  comparison_matrix: Matrix4;
+  comparison_source: 'solver_initial' | 'current_saved';
+}
 export interface ProjectionCalibrationEditorProps {
   clipId: string;
   frameId: string;
   cameras: Camera[];
   cameraId: string;
   disabled?: boolean;
+  automaticCandidate?: {jobId: string; frameId: string; cameraId: string};
+  onAutomaticCandidateExit?: () => void;
+  onReturnToAutomatic?: () => void;
   pickedPoint?: Vec3 | null;
   pickedPixel?: [number, number] | null;
   onCameraChange: (cameraId: string) => void;
@@ -99,6 +108,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const [pickMode, setPickMode] = useState<ProjectionPickMode>(null);
   const [pickingId, setPickingId] = useState<string | null>(null);
   const [candidate, setCandidate] = useState<Matrix4 | null>(null);
+  const [automaticReview, setAutomaticReview] = useState<AutomaticCandidatePreview | null>(null);
   const [candidateMethod, setCandidateMethod] = useState<string>('correspondences');
   const [metrics, setMetrics] = useState<ProjectionCalibrationMetrics | null>(null);
   const [metricsKind, setMetricsKind] = useState<'saved' | 'candidate' | 'rejected'>('saved');
@@ -121,28 +131,42 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
   const endpoint = `/clips/${encodeURIComponent(props.clipId)}/frames/${encodeURIComponent(props.frameId)}/projection-calibration/${encodeURIComponent(props.cameraId)}`;
   const camera = props.cameras.find(value => value.id === props.cameraId);
   const enabledCount = anchors.filter(anchor => anchor.enabled !== false).length;
-  const dirty = Boolean(baseline && (candidate || pendingPoint || !sameAnchors(anchors, baseline.correspondences)));
-  const locked = Boolean(props.disabled || loading || operation);
+  const dirty = Boolean(baseline && ((!automaticReview && candidate) || pendingPoint || !sameAnchors(anchors, baseline.correspondences)));
+  const previewLocked = Boolean(props.disabled || loading || operation);
+  const locked = previewLocked || Boolean(automaticReview);
+  const inspectionJobId = props.automaticCandidate?.frameId === props.frameId && props.automaticCandidate?.cameraId === props.cameraId
+    ? props.automaticCandidate.jobId : null;
   const unchangedScope = (token: number, startScope: string) => sequence.current === token && activeScope.current === startScope;
 
   useEffect(() => {
     const token = ++sequence.current;
     let active = true;
-    setLoading(true); setBaseline(null); setAnchors([]); setCandidate(null); setMetrics(null);
+    setLoading(true); setBaseline(null); setAnchors([]); setCandidate(null); setAutomaticReview(null); setMetrics(null);
     setPendingPoint(null); setPickMode(null); setPickingId(null); setSelectedId(null);
     setShowCandidate(false); setError(''); setStatus(''); setOperation(null);
     setSaveScope('frame');
     latest.current.onPreview(null); latest.current.onPickModeChange(null); latest.current.onConsumedPick();
-    request<ProjectionCalibrationDocument>(endpoint).then(value => {
+    request<ProjectionCalibrationDocument>(endpoint).then(async value => {
       if (!active || !unchangedScope(token, scope)) return;
       setBaseline(value); setAnchors(clone(value.correspondences ?? [])); setMetrics(value.metrics ?? null); setMetricsKind('saved');
       const ids = (value.correspondences ?? []).map(anchor => Number(anchor.id.match(/^anchor-(\d+)$/)?.[1] ?? 0));
       anchorNumber.current = Math.max(0, ...ids) + 1;
+      if (inspectionJobId) {
+        const result = await request<AutomaticCandidatePreview>(`/clips/${encodeURIComponent(props.clipId)}/automatic-calibration/jobs/${encodeURIComponent(inspectionJobId)}/preview/${encodeURIComponent(props.frameId)}/${encodeURIComponent(props.cameraId)}`);
+        if (!active || !unchangedScope(token, scope)) return;
+        if (result.revision !== value.revision || !validMatrix(result.candidate_matrix) || !validMatrix(result.comparison_matrix)) {
+          throw new Error('标定版本已变化或候选矩阵无效，请重新读取任务。');
+        }
+        setAutomaticReview(result); setCandidate(clone(result.candidate_matrix)); setCandidateMethod(result.method ?? 'manual');
+        setMetrics(result.metrics ?? null); setMetricsKind(result.usable ? 'candidate' : 'rejected');
+        setShowCandidate(true); latest.current.onPreview(result.candidate_matrix);
+        setStatus(result.candidate_status === 'saved' ? '正在对比已保存的任务结果与求解初值，预览不改写标定。' : '正在预览本次任务的实际求解结果，尚未保存。');
+      }
     }).catch(cause => {
       if (active && unchangedScope(token, scope)) setError(`读取当前帧修正失败：${errorMessage(cause)}`);
     }).finally(() => {if (active && unchangedScope(token, scope)) setLoading(false);});
     return () => {active = false;};
-  }, [scope, endpoint, reload]);
+  }, [scope, endpoint, reload, inspectionJobId]);
 
   useEffect(() => {latest.current.onDirtyChange?.(dirty);}, [dirty]);
   useEffect(() => {latest.current.onBusyChange?.(loading || Boolean(operation));}, [loading, operation]);
@@ -235,7 +259,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     finally {if (unchangedScope(token, startScope)) setOperation(null);}
   };
   const preview = (next: boolean) => {
-    setShowCandidate(next); props.onPreview(next ? candidate : null);
+    setShowCandidate(next); props.onPreview(next ? candidate : automaticReview?.comparison_matrix ?? null);
   };
   const nudge = (kind: 'translation' | 'rotation', axis: number, direction: number) => {
     if (!baseline || locked) return;
@@ -248,6 +272,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     setStatus('正在手动微调当前帧相机外参。请检查近远处投影，确认后保存；未进行自动质量验证。');
   };
   const discardCandidate = () => {
+    setAutomaticReview(null); props.onAutomaticCandidateExit?.();
     setCandidate(null); setShowCandidate(false); setMetrics(sameAnchors(anchors, baseline?.correspondences ?? []) ? baseline?.metrics ?? null : null);
     setMetricsKind('saved');
     props.onPreview(null); setError(''); setStatus('已丢弃候选修正，对应点保留。');
@@ -288,6 +313,7 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
     download(`${props.clipId}-${props.frameId}-${props.cameraId}-projection${dirty ? '-draft' : ''}.json`, JSON.stringify({
       ...baseline, correspondences: anchors, ...(candidate ? {candidate_matrix: candidate, candidate_method: candidateMethod, candidate_metrics: metrics} : {}),
       ...(pendingPoint ? {pending_point: pendingPoint} : {}), draft: dirty,
+      ...(automaticReview ? {read_only: true, source_job_id: automaticReview.job_id, usable: automaticReview.usable, rejection_reasons: automaticReview.rejection_reasons, comparison_matrix: automaticReview.comparison_matrix} : {}),
     }, null, 2));
   };
   const errors = new Map((metrics?.point_errors ?? []).map(value => [value.id, value]));
@@ -301,6 +327,17 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
       {props.cameras.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}
     </select></label>
     {loading ? <p className="projection-progress" role="status">正在读取当前帧投影…</p> : baseline && <>
+      {automaticReview && <section className="projection-calibration-section" data-testid="automatic-candidate-review" data-candidate-status={automaticReview.candidate_status}>
+        <h3>本次自动标定结果 · {automaticReview.candidate_status === 'saved' ? '已保存' : automaticReview.usable ? '通过' : '未通过'} · 只读预览</h3>
+        <p className="projection-help">{automaticReview.candidate_status === 'saved' ? '此结果已保存。当前仅对比任务结果与初值，不会再次写入标定。' : automaticReview.usable ? '检查修正前后投影，返回自动标定任务保存通过结果。' : '此候选未通过自动质量检查，可以查看实际投影，但不能直接保存或作为手动微调初值。'}</p>
+        {automaticReview.rejection_reasons?.map((reason, i) => <p className="projection-calibration-notice" key={i}>{reason}</p>)}
+        <p>位移 {score(automaticReview.metrics?.translation_delta_m as number)} 米 · 旋转 {score(automaticReview.metrics?.rotation_delta_degrees as number)} 度</p>
+        {typeof automaticReview.metrics?.line_overlap_before === 'number' && <p>线特征匹配 {score(automaticReview.metrics.line_overlap_before)} → {score(automaticReview.metrics.line_overlap_after as number)}（拟合评分，需人工复核）</p>}
+        <div className="projection-preview-toggle" role="group" aria-label="修正前后预览"><button className={!showCandidate ? 'active' : ''} aria-pressed={!showCandidate} disabled={previewLocked} onClick={() => preview(false)}>修正前</button><button className={showCandidate ? 'active' : ''} aria-pressed={showCandidate} disabled={previewLocked} onClick={() => preview(true)}>候选修正</button></div>
+        <p className="projection-help">当前显示：{showCandidate ? '本次求解候选' : automaticReview.comparison_source === 'solver_initial' ? '本次求解初值' : '当前已保存外参'}。图像上的点云和三维标注投影同步切换，标注坐标不变。</p>
+        <button className="button subtle full-width" aria-label="退出候选预览并手动校准" disabled={previewLocked} onClick={discardCandidate}>退出预览，手动调整已保存初值</button>
+        {props.onReturnToAutomatic && <button className="button ghost full-width" disabled={previewLocked} onClick={props.onReturnToAutomatic}>返回自动标定任务</button>}
+      </section>}
       <label className="field-label">应用范围<select aria-label="投影修正应用范围" value={saveScope} disabled={locked} onChange={event => setSaveScope(event.target.value as 'frame' | 'clip')}>
         <option value="frame">仅当前帧 · 当前相机（震动数据推荐）</option><option value="clip" disabled={candidateMethod === 'manual' && Boolean(candidate)}>整个 clip · 当前相机</option>
       </select></label>
@@ -344,11 +381,11 @@ export function ProjectionCalibrationEditor(props: ProjectionCalibrationEditorPr
         }
         {candidateMethod === 'direct_nid' && candidate && <p className="projection-help">自动配准质量取决于点云与图像的共同结构。请检查近远处静态物体是否同时对齐。</p>}
       </section>}
-      {candidate && <section className="projection-calibration-section"><h3>预览与保存</h3><div className="projection-preview-toggle" role="group" aria-label="修正前后预览"><button className={!showCandidate ? 'active' : ''} aria-pressed={!showCandidate} disabled={locked} onClick={() => preview(false)}>修正前</button><button className={showCandidate ? 'active' : ''} aria-pressed={showCandidate} disabled={locked} onClick={() => preview(true)}>候选修正</button></div>
+      {candidate && !automaticReview && <section className="projection-calibration-section"><h3>预览与保存</h3><div className="projection-preview-toggle" role="group" aria-label="修正前后预览"><button className={!showCandidate ? 'active' : ''} aria-pressed={!showCandidate} disabled={locked} onClick={() => preview(false)}>修正前</button><button className={showCandidate ? 'active' : ''} aria-pressed={showCandidate} disabled={locked} onClick={() => preview(true)}>候选修正</button></div>
         <p className="projection-help">修正前为当前已保存的投影。保存后同时应用于点云与三维标注的图像投影。</p>
         <div className="projection-calibration-actions"><button className="button primary full-width" aria-label={saveScope === 'clip' ? '保存整个clip当前相机投影修正' : '保存本帧本相机投影修正'} disabled={locked} onClick={() => void save()}>{operation === 'save' ? '正在保存…' : saveScope === 'clip' ? '保存整个 clip · 当前相机' : '保存本帧本相机'}</button><button className="button ghost" disabled={locked} onClick={discardCandidate}>丢弃候选</button></div>
       </section>}
-      <div className="projection-calibration-actions"><button className="button subtle" disabled={locked} onClick={exportDocument}>导出校正 JSON</button><button className="button ghost" aria-label={saveScope === 'clip' ? '清除整个clip投影修正' : '清除当前帧投影修正'} disabled={locked || !(saveScope === 'clip' ? baseline.clip_scope_active : baseline.saved_matrix) || Boolean(candidate) || Boolean(pendingPoint)} onClick={() => void save(true)}>{operation === 'reset' ? '正在清除…' : saveScope === 'clip' ? '清除整个 clip 修正' : '清除已保存修正'}</button></div>
+      <div className="projection-calibration-actions"><button className="button subtle" disabled={previewLocked} onClick={exportDocument}>导出校正 JSON</button><button className="button ghost" aria-label={saveScope === 'clip' ? '清除整个clip投影修正' : '清除当前帧投影修正'} disabled={locked || !(saveScope === 'clip' ? baseline.clip_scope_active : baseline.saved_matrix) || Boolean(candidate) || Boolean(pendingPoint)} onClick={() => void save(true)}>{operation === 'reset' ? '正在清除…' : saveScope === 'clip' ? '清除整个 clip 修正' : '清除已保存修正'}</button></div>
     </>}
     {operation === 'auto' && <p className="projection-progress" role="status">正在比较图像与点云结构，通常需要数十秒。完成后仍需检查候选投影。</p>}
     {error && <div className="projection-calibration-error" role="alert"><p>{error}</p>{!locked && <button className="button ghost" onClick={() => {if (!dirty || window.confirm('重新读取会丢弃未保存的对应点和候选修正，确定继续？')) setReload(value => value + 1);}}>重新读取</button>}</div>}

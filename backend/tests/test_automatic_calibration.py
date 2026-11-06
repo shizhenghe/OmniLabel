@@ -594,3 +594,82 @@ def test_sam2_job_records_source_version_and_new_regions_without_loading_cloud(c
     assert job['result']['source_image_token']
     saved = client.post(ROUTE + '/masks/f0/front/from-sam2', json={'job_id': job['id'], 'polygon_ids': ['generated']})
     assert saved.status_code == 200, saved.text
+
+
+def test_rejected_candidate_preview_is_read_only_and_preserves_failed_quality(calibration_api, monkeypatch):
+    client, store, _ = calibration_api
+    def solve(*args, **kwargs):
+        result = accepted(args[4], usable=False)
+        result['matrix'][0][3] += 1
+        result['rejection_reasons'] = ['修正超过 0.75 米或 3 度，请先手动校准初值并检查同步情况。']
+        result['metrics'].update(line_overlap_before=.8321, line_overlap_after=.8841,
+                                 translation_delta_m=1.1, rotation_delta_degrees=0)
+        return result
+    monkeypatch.setattr(batch, 'solve_pair', solve)
+    original = client.get('/api/clips/batch/frames/f0/projection-calibration/front').json()
+    labels = store.annotations('batch', 'f0').model_dump()
+    job = finished(client, start(client, frame_ids=['f0'], camera_ids=['front'])['id'])
+    assert job['rejected'] == 1
+    path = ROUTE + f"/jobs/{job['id']}/preview/f0/front"
+    response = client.get(path)
+    assert response.status_code == 200, response.text
+    value = response.json()
+    assert value['read_only'] and not value['usable'] and value['candidate_status'] == 'rejected'
+    assert value['candidate_matrix'] == job['items'][0]['matrix']
+    assert value['comparison_matrix'] == original['effective_matrix']
+    assert value['comparison_source'] == 'solver_initial'
+    assert value['candidate_matrix'] != value['comparison_matrix']
+    assert value['metrics']['line_overlap_after'] == .8841
+    assert value['rejection_reasons']
+    assert client.get('/api/clips/batch/frames/f0/projection-calibration/front').json() == original
+    assert store.annotations('batch', 'f0').model_dump() == labels
+    # Preview never converts a rejected result into a publishable one.
+    saved = client.post(ROUTE + f"/jobs/{job['id']}/apply").json()
+    assert saved['saved'] == 0 and saved['rejected'] == 1
+    assert client.get('/api/clips/batch/frames/f0/projection-calibration/front').json() == original
+
+
+@pytest.mark.parametrize('change', ['image', 'projection', 'missing_pair', 'other_clip', 'no_matrix', 'invalid_matrix', 'running'])
+def test_candidate_preview_rejects_stale_or_invalid_context(calibration_api, change):
+    client, store, manager = calibration_api
+    job = finished(client, start(client, frame_ids=['f0'], camera_ids=['front'])['id'])
+    path = ROUTE + f"/jobs/{job['id']}/preview/f0/front"
+    expected = 409
+    if change == 'image':
+        image = store.root / 'assets/batch/f0-front.png'
+        image.write_bytes(image.read_bytes())
+    elif change == 'projection':
+        route = '/api/clips/batch/frames/f0/projection-calibration/front'
+        doc = client.get(route).json()
+        matrix = np.asarray(doc['effective_matrix']); matrix[0, 3] += .01
+        assert client.put(route, json={'revision': doc['revision'], 'matrix': matrix.tolist(), 'method': 'manual'}).status_code == 200
+    elif change == 'missing_pair': path = ROUTE + f"/jobs/{job['id']}/preview/f0/side"; expected = 404
+    elif change == 'other_clip': path = '/api/clips/other/automatic-calibration' + f"/jobs/{job['id']}/preview/f0/front"; expected = 404
+    elif change == 'no_matrix': job['items'][0]['matrix'] = None; expected = 422
+    elif change == 'invalid_matrix': job['items'][0]['matrix'] = [[0]*4]*4; expected = 422
+    elif change == 'running': job['status'] = 'running'
+    atomic_json(manager._path(job['id']), job)
+    response = client.get(path)
+    assert response.status_code == expected, response.text
+
+
+def test_saved_preview_compares_to_original_solver_initial(calibration_api):
+    client, _, _ = calibration_api
+    job = finished(client, start(client, frame_ids=['f0'], camera_ids=['front'])['id'])
+    assert client.post(ROUTE + f"/jobs/{job['id']}/apply").json()['saved'] == 1
+    value = client.get(ROUTE + f"/jobs/{job['id']}/preview/f0/front").json()
+    assert value['candidate_status'] == 'saved' and value['usable']
+    assert value['candidate_matrix'] != value['comparison_matrix']
+    assert value['candidate_matrix'] == value['saved_matrix']
+
+
+def test_older_task_without_initial_matrix_can_preview_current_saved_baseline(calibration_api):
+    client, _, manager = calibration_api
+    job = finished(client, start(client, frame_ids=['f0'], camera_ids=['front'])['id'])
+    del job['items'][0]['initial_matrix']
+    atomic_json(manager._path(job['id']), job)
+    response = client.get(ROUTE + f"/jobs/{job['id']}/preview/f0/front")
+    assert response.status_code == 200, response.text
+    value = response.json()
+    assert value['comparison_source'] == 'current_saved'
+    assert value['comparison_matrix'] == value['effective_matrix']

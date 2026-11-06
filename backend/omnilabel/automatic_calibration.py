@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw
 from pydantic import Field
 
 from .calibration_input import calibration_input
-from .models import Annotations, Identifier, Model
+from .models import Annotations, Identifier, Model, rigid_transform
 from .projection_calibration import (
     ProjectionUpdate, _check_revision, _fingerprint, _image_path, _read_record,
     document_for, save_projection_calibration,
@@ -368,7 +368,8 @@ class AutomaticCalibrationManager:
                         token = self._pair_fingerprint(clip_id, frame, camera, job["engine"])
                         registration = calibration_input(
                             self.store, frame, np.asarray(document["effective_matrix"], dtype=float))
-                        item.update(status="running", revision=document["revision"], input_fingerprint=token)
+                        item.update(status="running", revision=document["revision"], input_fingerprint=token,
+                                    initial_matrix=document["effective_matrix"])
                         self._save(job)
                     work_dir = self.store.root / "automatic_calibration_artifacts" / job_id / frame.id / camera.id
                     result = solve_pair(job["engine"], registration.points, image_path, camera,
@@ -426,6 +427,39 @@ class AutomaticCalibrationManager:
                 job["cancel_requested"] = True
                 self._save(job)
             return job
+
+    def preview(self, clip_id: str, job_id: str, frame_id: str, camera_id: str) -> dict:
+        """Read a fresh candidate for inspection; rejected results never publish."""
+        with self.store.lock:
+            job = self.get(clip_id, job_id)
+            if job["status"] not in TERMINAL:
+                raise ConflictError("请等待标定任务结束再预览结果。")
+            item = next((value for value in job["items"]
+                         if value["frame_id"] == frame_id and value["camera_id"] == camera_id), None)
+            if item is None:
+                raise KeyError("该任务未处理选定帧和相机。")
+            if item["status"] not in {"accepted", "rejected", "saved"} or not item.get("matrix"):
+                raise ValueError("此项没有可预览的有效候选外参，请查看失败原因。")
+            clip = self._source(clip_id)
+            frame = next((f for f in clip.frames if f.id == frame_id), None)
+            camera = next((c for c in clip.cameras if c.id == camera_id), None)
+            if frame is None or camera is None:
+                raise KeyError("该帧或相机已不存在。")
+            if self._pair_fingerprint(clip_id, frame, camera, job["engine"]) != item.get("input_fingerprint"):
+                raise ConflictError("源图像、点云或线特征掩码已变化，请重新运行标定后预览。")
+            current = document_for(self.store, clip_id, frame_id, camera_id, context=(clip, frame, camera))
+            if item["status"] == "saved":
+                record = _read_record(self.store, clip_id, frame_id, camera_id) or {}
+                if record.get("source_job_id") != job_id or current["saved_matrix"] != item["matrix"]:
+                    raise ConflictError("此项保存后外参已变化，请重新运行标定。")
+            else:
+                _check_revision(current, item["revision"])
+            return {**current, "job_id": job_id, "candidate_status": item["status"], "read_only": True,
+                    "candidate_matrix": rigid_transform(item["matrix"]),
+                    "comparison_matrix": rigid_transform(item.get("initial_matrix") or current["effective_matrix"]),
+                    "comparison_source": "solver_initial" if item.get("initial_matrix") else "current_saved",
+                    "usable": item["status"] in {"accepted", "saved"}, "method": job["engine"],
+                    "metrics": item.get("metrics"), "rejection_reasons": [item["reason"]] if item.get("reason") else []}
 
     def apply(self, clip_id: str, job_id: str) -> dict:
         with self.store.lock:
@@ -533,6 +567,10 @@ def mount_automatic_calibration_routes(app: FastAPI, manager: AutomaticCalibrati
     @app.get(route + "/jobs/{job_id}")
     def read_job(clip_id: str, job_id: str):
         return respond(manager.get, clip_id, job_id)
+
+    @app.get(route + "/jobs/{job_id}/preview/{frame_id}/{camera_id}")
+    def preview_candidate(clip_id: str, job_id: str, frame_id: str, camera_id: str):
+        return respond(manager.preview, clip_id, job_id, frame_id, camera_id)
 
     @app.post(route + "/jobs/{job_id}/cancel")
     def cancel_job(clip_id: str, job_id: str):
