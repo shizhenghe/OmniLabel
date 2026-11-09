@@ -20,12 +20,12 @@ export function projectFramePoints(frame: Frame, cameras: Camera[]): Record<stri
   }));
 }
 
-/** A bounded image overlay for a full binary world map; never modifies the map.
- * Sampling is explicit here because expanding millions of projected points into
- * browser objects would block calibration. Source indices remain unchanged.
+/** Reference projection for a binary world map, complete by default.
+ * The interactive view uses a worker-composed raster to avoid millions of UI objects.
+ * An optional explicit preview budget is supported for external callers.
  */
 export function projectMapPreview(frame: Frame, camera: Camera, points: PointBuffer,
-  frameFromWorld: number[][], maxSamples = 60000): ProjectionPoint[] {
+  frameFromWorld: number[][], maxSamples = Infinity): ProjectionPoint[] {
   const frameMatrix = cameraFromLidar(camera, frame);
   const matrix = multiply(frameMatrix, frameFromWorld);
   const count = points.length / 4, step = Math.max(1, Math.ceil(count / maxSamples));

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Annotations, Camera, Frame, ProjectionPoint } from '../types';
+import type { Annotations, Camera, Frame, ProjectionPoint, ProjectionRaster } from '../types';
 import { labelColor } from './PointCloudView';
 import { cameraFromLidar, projectAnnotationResults, projectLidarPoint, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
 import type {LaneCalibrationOverlay} from './LaneCalibrationPanel';
@@ -13,6 +13,7 @@ export interface CameraViewProps {
   preparedImage?: HTMLImageElement | null;
   annotations: Annotations;
   projections?: ProjectionPoint[];
+  projectionRaster?: ProjectionRaster;
   selected?: boolean;
   tool?: 'select' | 'polygon';
   onAddPolygonPoint?: (point: [number, number]) => void;
@@ -163,7 +164,11 @@ export function CameraView(props: CameraViewProps) {
       ctx.font = '12px system-ui, sans-serif';
       ctx.fillText(imageState === 'loading' ? '加载图像…' : imageState === 'error' ? '图像加载失败' : '此帧未提供图像', displayWidth / 2, displayHeight / 2);
     }
-    if (props.showProjection === true) {
+    if (props.showProjection === true && props.projectionRaster) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(props.projectionRaster.bitmap, 0, 0, displayWidth, displayHeight);
+      ctx.imageSmoothingEnabled = true;
+    } else if (props.showProjection === true) {
       for (const point of props.projections ?? []) {
         const [x, y] = xy([point.u, point.v]);
         // Current annotations are authoritative, including erased labels; a
@@ -289,7 +294,7 @@ export function CameraView(props: CameraViewProps) {
     }
     ctx.restore();
   }, [imageState, displayImage, size, visibleResults, draftModelBox, viewport, projectionTransform, props.camera,
-    props.annotations.point_labels, props.showProjection, props.projections?.length ? props.projections : undefined, props.selectedId,
+    props.annotations.point_labels, props.showProjection, props.projectionRaster, props.projections?.length ? props.projections : undefined, props.selectedId,
     props.draftPolygon?.length ? props.draftPolygon : undefined, props.labelDraftPoints,
     props.calibrationAnchors?.length ? props.calibrationAnchors : undefined,
     props.laneCalibrationLines?.length ? props.laneCalibrationLines : undefined,
@@ -326,8 +331,11 @@ export function CameraView(props: CameraViewProps) {
     data-projected-box-count={visibleResults.boxes.length}
     data-projected-vector-count={visibleResults.vectors.length}
     data-projected-polygon-count={visibleResults.imagePolygons.length}
-    data-projected-point-count={props.showProjection ? props.projections?.length ?? 0 : 0}
-    data-raw-projection-signature={props.showProjection && props.projections?.length ? `${props.projections.length}:${props.projections[0].index}:${props.projections[0].u.toFixed(4)},${props.projections[0].v.toFixed(4)}` : ''}
+    data-projected-point-count={props.showProjection ? props.projectionRaster?.pointCount ?? props.projections?.length ?? 0 : 0}
+    data-raw-projection-signature={props.showProjection && props.projections?.length ? `${props.projectionRaster?.pointCount ?? props.projections.length}:${props.projections[0].index}:${props.projections[0].u.toFixed(4)},${props.projections[0].v.toFixed(4)}` : ''}
+    data-projection-source-count={props.projectionRaster?.sourceCount ?? props.frame?.points.length ?? 0}
+    data-projection-pixel-count={props.projectionRaster?.pixelCount ?? ''}
+    data-projection-mode={props.projectionRaster ? 'full-map-raster' : 'source-points'}
     data-projection-signature={signature}
     data-model-point-count={props.modelPoints?.length ?? 0}
     data-model-box={props.modelBox?.join(',') ?? ''}

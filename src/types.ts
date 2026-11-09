@@ -158,3 +158,12 @@ export interface SceneMap {
   registration?: Record<string, unknown>;
 }
 export interface ModelConnection {model_id: string; endpoint: string; configured?: boolean; source?: string;}
+
+/** Full-map overlay composed in a worker; counts refer to original source points. */
+export interface ProjectionRaster {
+  bitmap: ImageBitmap;
+  pointCount: number;
+  pixelCount: number;
+  sourceCount: number;
+  first?: ProjectionPoint;
+}

@@ -1,16 +1,16 @@
-import {useEffect, useRef, useState} from 'react';
-import type {Camera, Frame, PointBuffer, ProjectionPoint} from './types';
+import {useEffect, useMemo, useRef, useState} from 'react';
+import type {Camera, Frame, PointBuffer, ProjectionPoint, ProjectionRaster} from './types';
 import {cameraFromLidar} from './geometry/cameraProjection';
 import {multiply} from './scene';
 
-type CameraRequest = {camera: Camera; matrix: number[][]; key: string};
+type CameraRequest = {camera: Camera; matrix: number[][]; key: string; raster?: boolean; labels?: Record<string, string>};
 type Job = {type: 'project'; id: number; version: number; cameras: CameraRequest[]};
 type Source = {points?: number[][]; map?: PointBuffer; frameId?: string};
-type CachedProjection = {key: string; points: ProjectionPoint[]; source: Source};
+type CachedProjection = {key: string; points: ProjectionPoint[]; source: Source; raster?: ProjectionRaster};
 
 /** Keep coordinates in a worker and retain only the latest queued calibration. */
 export function useLiveProjection(frame: Frame | null, cameras: Camera[], map: PointBuffer | undefined,
-  frameFromWorld: number[][], enabled: boolean, focus?: string) {
+  frameFromWorld: number[][], enabled: boolean, focus?: string, labels?: Record<string, string>) {
   const worker = useRef<Worker | null>(null);
   const busy = useRef(false);
   const pending = useRef<Job | null>(null);
@@ -45,16 +45,16 @@ export function useLiveProjection(frame: Frame | null, cameras: Camera[], map: P
       // Source versions prevent results from a previous frame/map from leaking.
       if (data.version === version.current) {
         const updates: Record<string, CachedProjection> = {};
-        for (const item of data.output as {id: string; key: string; buffer: Float64Array}[]) {
-          if (expected.current.get(item.id) !== item.key) continue;
+        for (const item of data.output as {id: string; key: string; buffer: Float64Array; raster?: ProjectionRaster}[]) {
+          if (expected.current.get(item.id) !== item.key) {item.raster?.bitmap.close(); continue;}
           const points: ProjectionPoint[] = [];
           for (let i = 0; i < item.buffer.length; i += 4) {
             points.push({index: item.buffer[i], u: item.buffer[i+1], v: item.buffer[i+2], depth: item.buffer[i+3]});
           }
-          updates[item.id] = {key: item.key, points, source: source.current};
+          updates[item.id] = {key: item.key, points, source: source.current, raster: item.raster ? {...item.raster, first: points[0]} : undefined};
         }
         if (Object.keys(updates).length) setCache(old => ({...old, ...updates}));
-      }
+      } else for (const item of data.output) item.raster?.bitmap.close();
       if (pending.current) pump();
       else setUpdating(false);
     };
@@ -87,23 +87,28 @@ export function useLiveProjection(frame: Frame | null, cameras: Camera[], map: P
     setCache({});
     const currentVersion = ++version.current;
     const count = mapSource ? mapSource.length/4 : frame.points.length;
-    // Preserve the existing map image-overlay sampling, with original indices.
-    // Full source scans and the 3D map are never truncated here.
-    const step = mapSource ? Math.max(1, Math.ceil(count/60000)) : 1;
-    const coordinates = new Float64Array(Math.ceil(count/step)*3);
-    for (let index = 0, offset = 0; index < count; index += step, offset += 3) {
-      for (let axis = 0; axis < 3; axis++) {
-        coordinates[offset+axis] = mapSource ? mapSource[index*4+axis] : frame.points[index][axis];
-      }
+    if (mapSource) {
+      const coordinates = mapSource.slice();
+      worker.current.postMessage({type:'source',version:currentVersion,coordinates,stride:1,components:4},[coordinates.buffer]);
+    } else {
+      const coordinates = new Float64Array(count*3);
+      for (let index=0;index<count;index++) for (let axis=0;axis<3;axis++) coordinates[index*3+axis]=frame.points[index][axis];
+      worker.current.postMessage({type:'source',version:currentVersion,coordinates,stride:1,components:3},[coordinates.buffer]);
     }
-    worker.current.postMessage({type: 'source', version: currentVersion, coordinates, stride: step}, [coordinates.buffer]);
     pending.current = null;
   }, [frame?.points, frame?.id, mapSource, enabled]);
 
+  const labelsKey = useMemo(() => mapSource ? JSON.stringify(labels ?? {}) : '', [mapSource, labels]);
+  const previousCache = useRef(cache);
+  useEffect(() => {
+    for (const [id, old] of Object.entries(previousCache.current)) if (old.raster && old.raster.bitmap !== cache[id]?.raster?.bitmap) old.raster.bitmap.close();
+    previousCache.current = cache;
+  }, [cache]);
+  useEffect(() => () => {for (const entry of Object.values(cacheRef.current)) entry.raster?.bitmap.close();}, []);
   const selected = focus ? cameras.filter(camera => camera.id === focus) : cameras;
   const requests = frame ? selected.map(camera => {
     const matrix = mapSource ? multiply(cameraFromLidar(camera, frame), frameFromWorld) : cameraFromLidar(camera, frame);
-    return {camera, matrix, key: JSON.stringify([frame.id, camera, matrix])};
+    return {camera, matrix, key: JSON.stringify([frame.id, camera, matrix, labelsKey]), raster: Boolean(mapSource), labels: mapSource ? labels : undefined};
   }) : [];
   const requestKey = JSON.stringify(requests.map(item => item.key));
   useEffect(() => {
@@ -129,10 +134,11 @@ export function useLiveProjection(frame: Frame | null, cameras: Camera[], map: P
   }, [requestKey, enabled, frame?.points, mapSource]);
 
   const values: Record<string, ProjectionPoint[]> = {};
+  const rasters: Record<string, ProjectionRaster> = {};
   if (enabled) for (const item of requests) {
     const stored = cache[item.camera.id];
     if (stored?.key === item.key && stored.source.points === frame?.points
-        && stored.source.map === mapSource && stored.source.frameId === frame?.id) values[item.camera.id] = stored.points;
+        && stored.source.map === mapSource && stored.source.frameId === frame?.id) {values[item.camera.id] = stored.points; if(stored.raster)rasters[item.camera.id]=stored.raster;}
   }
-  return {projections: values, updating: enabled && updating, error: enabled ? error : ''};
+  return {projections: values, rasters, updating: enabled && updating, error: enabled ? error : ''};
 }

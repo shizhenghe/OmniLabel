@@ -68,3 +68,5 @@ tests/e2e/*
 !tests/e2e/calibration-inputs.spec.ts
 
 !tests/e2e/calibration-interaction.spec.ts
+
+!tests/e2e/dense-projection.spec.ts
