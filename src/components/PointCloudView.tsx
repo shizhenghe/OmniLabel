@@ -10,6 +10,7 @@ import {renderOriginForPoints, toRenderPoint} from '../geometry/renderCoordinate
 import {pointCloudSnapper} from '../geometry/pointSnap';
 
 export interface PointCloudViewProps {
+  suspended?: boolean;
   frame: Frame | null;
   cameraFocus?: CameraFocus | null;
   /** Flat XYZI rows loaded directly from NPY for very large clouds. */
@@ -272,6 +273,7 @@ export function PointCloudView(props: PointCloudViewProps) {
     let animation = 0;
     const render = () => {
       animation = requestAnimationFrame(render);
+      if (latest.current.suspended) return;
       const cameraChanged = rt.controls.update();
       // A supplied map can contain millions of points. Repeatedly drawing an
       // unchanged view saturates software GPUs and stalls image-pairing input.
@@ -297,7 +299,19 @@ export function PointCloudView(props: PointCloudViewProps) {
 
   // Geometry effects below complete before the next animation frame. This also
   // invalidates selection, draft, playback and display changes from React.
-  useEffect(() => {if (runtime.current) runtime.current.needsRender = true;});
+  // Repaint only when 3D content changes. Camera-extrinsic previews update the
+  // image overlay and must not redraw a multi-million-point scene each time.
+  useEffect(() => {if (runtime.current) runtime.current.needsRender = true;}, [
+    ready, origin, colorMode, visibleIndices, visibleCount, pointCount,
+    props.suspended, props.frame?.id, props.frame?.points, props.binaryPoints, props.intensityRangeHint,
+    props.cloudBounds, props.autoFitReference, props.sceneMode, props.view,
+    props.annotations.boxes, props.annotations.vectors, props.annotations.point_labels,
+    props.selectedId, props.draftVector, props.showBoxes, props.showVectors,
+    props.calibrationPoints, props.trajectory, props.activeFrameId, props.cameraFocus, props.focusSelection,
+    props.followPosition?.[0], props.followPosition?.[1], props.followPosition?.[2],
+    props.overlayPoints, props.overlayPointLabels, props.semantic, props.voxels, props.voxelSize,
+    props.voxelDimensions, props.showFree, props.groundZ,
+  ]);
 
   useEffect(() => {
     const rt = runtime.current;

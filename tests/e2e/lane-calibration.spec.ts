@@ -199,7 +199,7 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await panel.getByLabel('绘制优化图像车道线').click();
   await page.getByLabel(`放大 ${camera.name}`, {exact: true}).first().click();
   await clickPixel(pixels[0]);
-  await page.getByLabel(`放大 ${camera.name}`, {exact: true}).last().click();
+  await page.getByLabel('收起放大图像', {exact: true}).click();
   await expect(panel).toContainText('手绘图像线：1 点');
   await page.getByLabel('下一帧', {exact: true}).click();
   await expect(panel).toContainText('当前帧 f1');
@@ -234,7 +234,7 @@ test('two point-cloud lane selections drive a frozen image reference and real op
   await expect(expanded).toHaveAttribute('data-image-zoom', '1');
   await expect(expanded).toHaveAttribute('data-image-offset', '0,0');
   await expect(panel).toContainText('手绘图像线：2 点');
-  await page.getByLabel(`放大 ${camera.name}`, {exact: true}).last().click();
+  await page.getByLabel('收起放大图像', {exact: true}).click();
   await panel.getByLabel('添加车道线配对').click();
   await expect(panel).toContainText('#3 f0 / world-lane ↔ 图像手绘线');
   const zoomSaved = (await (await request.get(endpoint)).json()).pairing.pairs[2].image_points;
