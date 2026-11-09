@@ -66,3 +66,5 @@ tests/e2e/*
 !tests/e2e/automatic-preview.spec.ts
 
 !tests/e2e/calibration-inputs.spec.ts
+
+!tests/e2e/calibration-interaction.spec.ts

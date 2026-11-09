@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Annotations, Camera, Frame, ProjectionPoint } from '../types';
 import { labelColor } from './PointCloudView';
-import { projectAnnotationResults, projectLidarPoint, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
+import { cameraFromLidar, projectAnnotationResults, projectLidarPoint, projectionSignature, type Pixel, type PixelSegment } from '../geometry/cameraProjection';
 import type {LaneCalibrationOverlay} from './LaneCalibrationPanel';
 
 export { projectLidarPoint } from '../geometry/cameraProjection';
@@ -57,8 +57,10 @@ export function CameraView(props: CameraViewProps) {
   const displayImage = props.preparedImage !== undefined ? props.preparedImage : loadedSource.current === source ? imageRef.current : null;
   const imageState = props.preparedImage !== undefined ? props.preparedImage ? 'ready' : source ? 'error' : 'missing'
     : source && loadedSource.current !== source ? 'loading' : internalImageState;
+  const projectionTransform = useMemo(() => props.frame ? cameraFromLidar(props.camera, props.frame) : null,
+    [props.camera, props.frame?.lidar_to_ego, props.frame?.projection_camera_from_lidar?.[props.camera.id], props.frame?.annotation_camera_from_lidar?.[props.camera.id]]);
   const results = useMemo(() => props.frame ? projectAnnotationResults(props.annotations, props.camera, props.frame)
-    : { boxes: [], vectors: [], imagePolygons: [] }, [props.annotations, props.camera, props.frame]);
+    : { boxes: [], vectors: [], imagePolygons: [] }, [props.annotations, props.camera, props.frame?.id, projectionTransform]);
   const visibleResults = useMemo(() => ({
     boxes: props.showAnnotationProjection !== false && props.showBoxes !== false ? results.boxes : [],
     vectors: props.showAnnotationProjection !== false && props.showVectors !== false ? results.vectors : [],
@@ -130,11 +132,11 @@ export function CameraView(props: CameraViewProps) {
     if (!canvas.current || !size.width || !size.height) return;
     const element = canvas.current;
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
-    element.width = Math.round(size.width * ratio);
-    element.height = Math.round(size.height * ratio);
+    if (element.width !== Math.round(size.width * ratio)) element.width = Math.round(size.width * ratio);
+    if (element.height !== Math.round(size.height * ratio)) element.height = Math.round(size.height * ratio);
     const ctx = element.getContext('2d');
     if (!ctx) return;
-    ctx.scale(ratio, ratio);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.fillStyle = '#0b1420';
     ctx.fillRect(0, 0, size.width, size.height);
     const { width, height } = props.camera;
@@ -286,7 +288,12 @@ export function CameraView(props: CameraViewProps) {
       ctx.fillText(anchor.label, x + 7, y - 3);
     }
     ctx.restore();
-  }, [props, imageState, displayImage, size, visibleResults, draftModelBox, viewport]);
+  }, [imageState, displayImage, size, visibleResults, draftModelBox, viewport, projectionTransform, props.camera,
+    props.annotations.point_labels, props.showProjection, props.projections?.length ? props.projections : undefined, props.selectedId,
+    props.draftPolygon?.length ? props.draftPolygon : undefined, props.labelDraftPoints,
+    props.calibrationAnchors?.length ? props.calibrationAnchors : undefined,
+    props.laneCalibrationLines?.length ? props.laneCalibrationLines : undefined,
+    props.modelPoints?.length ? props.modelPoints : undefined, props.modelPointLabels?.length ? props.modelPointLabels : undefined, props.modelBox]);
 
   const originalPixel = (clientX: number, clientY: number, clamp = false): Pixel | null => {
     if (!canvas.current || !size.width || !size.height) return null;

@@ -51,3 +51,13 @@
 .projection-calibration-error .button {color:#ddbdc8;margin-top:5px;padding-left:0}
 .projection-calibration-status,.projection-progress {font-size:10px;line-height:1.8;color:#9cc7be;margin-top:10px;overflow-wrap:anywhere}
 @media(max-width:850px) {.projection-calibration-editor {max-height:530px}.projection-anchor-list {max-height:220px}}
+.projection-calibration-editor {font-size:13px;padding:18px}
+.projection-calibration-heading h2 {font-size:18px}
+.projection-calibration-heading p {font-size:12px}
+.projection-calibration-section h3 {font-size:14px}
+.projection-calibration-section>p {font-size:12px}
+.projection-calibration-editor .button {min-height:40px;font-size:12px;padding:9px 12px}
+.projection-calibration-editor .field-label select {min-height:40px;font-size:13px}
+.projection-pick-actions {gap:8px}
+.projection-pick-actions>span {display:flex;gap:7px}
+.projection-preview-toggle button {min-height:40px;font-size:13px}
